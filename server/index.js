@@ -117,7 +117,7 @@ app.post('/api/ingest-lead', async (req, res) => {
 
         console.log(`[API] Received lead | phone=${payload.phone_number} | fallback=${payload.bot_fallback}`);
 
-        const { data, action } = await ingestLead(payload);
+        const { data, action } = await ingestLead(supabaseAdmin, payload);
 
         console.log(`[DB] Lead ${action} | id=${data.id} | phone=${payload.phone_number} | params=${data.parameters_completed}`);
 
