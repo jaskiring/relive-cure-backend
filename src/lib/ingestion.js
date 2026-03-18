@@ -1,4 +1,4 @@
-import { supabase } from './supabase.js';
+import { supabaseAdmin } from '../../server/supabase-admin.js';
 
 /**
  * Calculates the number of completed qualification parameters.
@@ -19,7 +19,7 @@ export const checkDuplicate = async (phoneNumber) => {
 
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
         .from('leads_surgery')
         .select('id, remarks')
         .eq('phone_number', phoneNumber)
@@ -89,7 +89,7 @@ export const ingestLead = async (leadData) => {
 
     if (existingLead) {
         // Update existing lead
-        const { data, error } = await supabase
+        const { data, error } = await supabaseAdmin
             .from('leads_surgery')
             .update(payload)
             .eq('id', existingLead.id)
@@ -100,7 +100,7 @@ export const ingestLead = async (leadData) => {
         return { data, action: 'updated' };
     } else {
         // Insert new lead
-        const { data, error } = await supabase
+        const { data, error } = await supabaseAdmin
             .from('leads_surgery')
             .insert([payload])
             .select()
