@@ -1,0 +1,11 @@
+node_modules/
+.env
+lasik-whatsapp-bot-v2/
+session/
+*.png
+*.webp
+test-*.mjs
+inspect-schema.mjs
+verify_*.js
+dist/
+.venv/
