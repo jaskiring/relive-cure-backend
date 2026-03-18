@@ -1,5 +1,7 @@
 import { supabaseAdmin } from '../../server/supabase-admin.js';
 
+console.log("[DEBUG] Using supabaseAdmin client for DB operations");
+
 /**
  * Calculates the number of completed qualification parameters.
  * city, insurance, preferred_surgery_city, timeline
@@ -100,6 +102,7 @@ export const ingestLead = async (leadData) => {
         return { data, action: 'updated' };
     } else {
         // Insert new lead
+        console.log("[DEBUG] Attempting DB insert with supabaseAdmin");
         const { data, error } = await supabaseAdmin
             .from('leads_surgery')
             .insert([payload])
