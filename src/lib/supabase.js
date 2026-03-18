@@ -5,4 +5,6 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// EXPORT BOTH (IMPORTANT)
+export { supabase };
 export default supabase;
