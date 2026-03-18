@@ -1,7 +1,3 @@
-import { supabaseAdmin } from '../../server/supabase-admin.js';
-
-console.log("[DEBUG] Using supabaseAdmin client for DB operations");
-
 /**
  * Calculates the number of completed qualification parameters.
  * city, insurance, preferred_surgery_city, timeline
@@ -16,12 +12,12 @@ export const calculateParametersCompleted = (lead) => {
 /**
  * Checks for a lead with the same phone number created in the last 24 hours.
  */
-export const checkDuplicate = async (phoneNumber) => {
+export const checkDuplicate = async (supabaseClient, phoneNumber) => {
     if (!phoneNumber) return null;
 
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-    const { data, error } = await supabaseAdmin
+    const { data, error } = await supabaseClient
         .from('leads_surgery')
         .select('id, remarks')
         .eq('phone_number', phoneNumber)
@@ -42,7 +38,7 @@ export const checkDuplicate = async (phoneNumber) => {
  * Ingests a lead into the system. 
  * Handles duplicate checks, parameter counting, and fallback remarks.
  */
-export const ingestLead = async (leadData) => {
+export const ingestLead = async (supabaseClient, leadData) => {
     const {
         phone_number,
         contact_name,
@@ -69,7 +65,7 @@ export const ingestLead = async (leadData) => {
         remarks = remarks ? `${remarks}\n${fallbackMsg}` : fallbackMsg;
     }
 
-    const existingLead = await checkDuplicate(phone_number);
+    const existingLead = await checkDuplicate(supabaseClient, phone_number);
 
     const payload = {
         phone_number,
@@ -91,7 +87,7 @@ export const ingestLead = async (leadData) => {
 
     if (existingLead) {
         // Update existing lead
-        const { data, error } = await supabaseAdmin
+        const { data, error } = await supabaseClient
             .from('leads_surgery')
             .update(payload)
             .eq('id', existingLead.id)
@@ -102,8 +98,7 @@ export const ingestLead = async (leadData) => {
         return { data, action: 'updated' };
     } else {
         // Insert new lead
-        console.log("[DEBUG] Attempting DB insert with supabaseAdmin");
-        const { data, error } = await supabaseAdmin
+        const { data, error } = await supabaseClient
             .from('leads_surgery')
             .insert([payload])
             .select()

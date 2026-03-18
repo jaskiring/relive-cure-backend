@@ -80,10 +80,14 @@ function App() {
   }, []);
 
   async function fetchData() {
+    console.log("[FRONTEND] Fetching leads from 'leads_surgery'...");
     const [leadsRes, metricsRes] = await Promise.all([
       supabase.from('leads_surgery').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('dashboard_metrics').select('*')
     ]);
+
+    console.log("[FRONTEND] leads data:", leadsRes.data, leadsRes.error);
+    console.log("[FRONTEND] metrics data:", metricsRes.data, metricsRes.error);
 
     if (!leadsRes.error) setLeads(leadsRes.data);
     if (!metricsRes.error) setMetricsData(metricsRes.data);
@@ -339,7 +343,7 @@ function App() {
 
     try {
       setLoading(true);
-      await ingestLead(leadData);
+      await ingestLead(supabase, leadData);
       fetchData();
     } catch (err) {
       alert('Simulation failed: ' + err.message);
