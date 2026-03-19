@@ -89,20 +89,35 @@ export async function pushToCRM(lead, options = {}) {
   console.log(`\n[CRM] ──────────────────────────────────`);
   console.log(`[CRM] Processing lead: ${lead.id}`);
 
-  console.log("[CRM] Chrome path:", process.env.PUPPETEER_EXECUTABLE_PATH);
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || "/opt/render/.cache/puppeteer/chrome/linux-/chrome-linux/chrome";
+  console.log("[CRM] Using Chrome path:", executablePath);
+  console.log("PUPPETEER CACHE:", process.env.PUPPETEER_CACHE_DIR);
 
-  const browser = await puppeteer.launch({
-    headless: "new",
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    userDataDir: USER_DATA_DIR,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--window-size=1280,900'
-    ]
-  });
+  let browser;
+
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      executablePath,
+      userDataDir: USER_DATA_DIR,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--window-size=1280,900'
+      ],
+      timeout: 60000
+    });
+  } catch (err) {
+    console.log("[CRM] Primary launch failed, trying fallback:", err.message);
+    browser = await puppeteer.launch({
+      executablePath: "/usr/bin/chromium-browser",
+      headless: true,
+      userDataDir: USER_DATA_DIR,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,900']
+    });
+  }
 
   try {
     const page = await browser.newPage();
