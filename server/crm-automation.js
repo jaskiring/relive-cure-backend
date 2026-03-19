@@ -2,23 +2,24 @@ import puppeteer from 'puppeteer';
 import crypto from 'crypto';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
-const USER_DATA_DIR = process.env.USER_DATA_DIR || '/opt/render/.cache/puppeteer-session';
+const USER_DATA_DIR = "./puppeteer-session";
 
 let browserInstance = null;
 
 async function getBrowser() {
   if (!browserInstance) {
-    const executablePath = puppeteer.executablePath();
+    console.log("Using session dir:", USER_DATA_DIR);
     browserInstance = await puppeteer.launch({
       headless: true,
       slowMo: 0,
-      executablePath,
+      executablePath: puppeteer.executablePath(),
       userDataDir: USER_DATA_DIR,
+      defaultViewport: null,
       args: [
+        "--start-maximized", 
         "--no-sandbox",
         "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--window-size=1280,900"
+        "--disable-dev-shm-usage"
       ],
       timeout: 60000
     });
@@ -33,11 +34,7 @@ const SEL = {
   subject:      'input[name="subject"]',
   details:      'textarea[name="details"]',
   submit:       'button[type="submit"]',
-  orgInput:     '#react-select-3-input',
-
   vPhoneNumber:  'input[name="vendorFields.1.value"]',
-  vTimeline:     'input[name="vendorFields.2.value"]',
-  vPrefCity:     'input[name="vendorFields.4.value"]',
 };
 
 async function fillField(page, selector, value) {
@@ -56,22 +53,41 @@ export async function pushToCRM(lead) {
   if (!lead.id) lead.id = crypto.randomUUID();
 
   const browser = await getBrowser();
-  const page = await browser.newPage();
+  const pages = await browser.pages();
+  const page = pages.length ? pages[0] : await browser.newPage();
   
   try {
-    await page.setViewport({ width: 1280, height: 900 });
+    // Reset page before use
+    await page.goto("about:blank");
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 2000));
+    console.log("STEP: Page opened");
 
-    if (page.url().includes('login') || page.url().includes('signin')) {
-      console.error('[CRM] ❌ SESSION EXPIRED');
-      await page.close();
-      return { success: false, id: lead.id, error: 'Session expired' };
+    // Hard session check
+    if (page.url().includes("login") || page.url().includes("signin")) {
+      throw new Error("Session expired - login required");
     }
+    console.log("crm opened without login");
+
+    await new Promise(r => setTimeout(r, 2500));
 
     console.log('[CRM] Selecting Organisation...');
-    await page.waitForSelector(SEL.orgInput, { timeout: 10000 });
-    await page.click(SEL.orgInput);
+    const orgInputHandle = await page.evaluateHandle(() => {
+      const labels = Array.from(document.querySelectorAll('label'));
+      const label = labels.find(l => l.innerText.includes('Prospect Organisation'));
+      if (!label) return null;
+
+      // Row-based traversal: Find the row container and the 2nd column
+      const row = label.closest('.css-rxk9pl');
+      const inputCol = row ? row.children[1] : null;
+      return inputCol ? inputCol.querySelector('.disco-select__control input') : null;
+    });
+
+    const orgInput = orgInputHandle.asElement();
+    if (!orgInput) {
+      throw new Error("Could not find Prospect Organisation input via label");
+    }
+
+    await orgInput.click();
     
     await page.keyboard.down('Control');
     await page.keyboard.press('A');
@@ -79,43 +95,49 @@ export async function pushToCRM(lead) {
     await page.keyboard.press('Backspace');
     await new Promise(r => setTimeout(r, 300));
     
-    await page.type(SEL.orgInput, 'a');
+    await page.keyboard.type('r');
     await new Promise(r => setTimeout(r, 1200));
     
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1500)); // Delay after major step
     
-    const selectedOrg = await page.evaluate(() => {
-      return document.querySelector('.disco-select__single-value')?.innerText || '';
-    });
+    const selectedOrgHandle = await page.evaluateHandle((input) => {
+      const container = input.closest('.disco-select');
+      return container ? container.querySelector('.disco-select__single-value')?.innerText : '';
+    }, orgInput);
     
-    if (!selectedOrg || selectedOrg.length < 2) {
+    const orgValue = await selectedOrgHandle.jsonValue();
+    if (!orgValue || orgValue.length < 2) {
       throw new Error("Organisation not selected");
     }
-    console.log(`[CRM] ✅ Org verified: "${selectedOrg}"`);
+    console.log("STEP: Organisation selected");
+    console.log("Selected Organisation:", orgValue);
 
-    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Test Lead');
+    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
     await fillField(page, SEL.contactPhone, lead.phone_number);
-    await fillField(page, SEL.customerCity, lead.city || 'Mumbai');
-    await fillField(page, SEL.subject, `LASIK Test - ${lead.phone_number}`);
-    await fillField(page, SEL.details, `Test lead | phone=${lead.phone_number}`);
+    await fillField(page, SEL.customerCity, lead.city || 'Delhi');
+    await fillField(page, SEL.subject, `LASIK Session Test - ${lead.phone_number}`);
+    await fillField(page, SEL.details, `Session persistence test | phone=${lead.phone_number}`);
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
+    console.log("STEP: Fields filled");
+    await new Promise(r => setTimeout(r, 1500));
 
     console.log('[CRM] Clicking submit...');
     await page.click(SEL.submit);
+    console.log("STEP: Form submitted");
     
     await new Promise(r => setTimeout(r, 4000));
     const finalUrl = page.url();
     const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
     const isSuccess = bodyText.includes('lead') || finalUrl.includes('leads');
 
-    await page.close();
-    return { success: isSuccess, id: lead.id };
+    if (isSuccess) console.log("form submitted");
+
+    return { success: isSuccess, id: lead.id, selectedOrg: orgValue };
 
   } catch (error) {
     console.error("[CRM ERROR]", error.message);
-    await page.close();
     return { success: false, id: lead.id, error: error.message };
   }
 }
