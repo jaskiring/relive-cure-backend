@@ -2,7 +2,7 @@ import puppeteer from 'puppeteer';
 import crypto from 'crypto';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
-const USER_DATA_DIR = './session';
+const USER_DATA_DIR = './puppeteer-session';
 
 console.log('CRM automation loaded from:', import.meta.url);
 
@@ -80,13 +80,14 @@ async function fillField(page, selector, value, label, timeout = 6000) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN EXPORT
 // ─────────────────────────────────────────────────────────────────────────────
-export async function pushLeadToCRM(lead, options = {}) {
+export async function pushToCRM(lead, options = {}) {
+  console.log("[CRM] Starting push for:", lead.phone_number);
+  
   // Guard: ensure lead always has an id
   if (!lead.id) lead.id = crypto.randomUUID();
 
   console.log(`\n[CRM] ──────────────────────────────────`);
   console.log(`[CRM] Processing lead: ${lead.id}`);
-  console.log(`[CRM] Phone: ${lead.phone_number}`);
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -154,44 +155,51 @@ export async function pushLeadToCRM(lead, options = {}) {
       console.log('[CRM]   Org dropdown opened. Waiting for options...');
       await new Promise(r => setTimeout(r, 1500));
 
-      // Click "Relive cure" by text match — STRICT, THROW IF NOT FOUND
       const selectedResult = await page.evaluate((targetName) => {
-        const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"]'));
-        const target = opts.find(el => el.innerText.toLowerCase().includes(targetName.toLowerCase()));
+        const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"], .css-1n7v3ny-option'));
+        const target = opts.find(el => {
+          const txt = (el.innerText || '').toLowerCase();
+          return txt.includes(targetName.toLowerCase()) || txt.includes('relive');
+        });
         if (target) { 
           const text = target.innerText.trim();
           target.click(); 
           return { found: true, text }; 
         }
-        return { found: false };
+        return { found: false, count: opts.length, labels: opts.map(o => o.innerText) };
       }, 'Relive cure');
 
       if (!selectedResult.found) {
-        // Not in default list — search via the controlled input
-        console.log('[CRM] ⚠  "Relive cure" not in default list — typing to search...');
-        const searchInput = await page.$('.disco-select__control input');
+        console.log(`[CRM]   Org "Relive cure" not in default list (${selectedResult.count} seen).`);
+        console.log('[CRM]   Typing "Relive" to search...');
+        const searchInput = await page.$('.disco-select__control input, #react-select-3-input');
         if (searchInput) {
-          await searchInput.type('Relive cure', { delay: 80 });
-          await new Promise(r => setTimeout(r, 2000));
+          await searchInput.type('Relive', { delay: 150 });
+          // Wait for options to appear
+          await new Promise(r => setTimeout(r, 4000));
         }
         const afterSearch = await page.evaluate((targetName) => {
-          const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"]'));
-          const target = opts.find(el => el.innerText.toLowerCase().includes(targetName.toLowerCase()));
+          const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"], .css-1n7v3ny-option'));
+          const target = opts.find(el => {
+            const txt = (el.innerText || '').toLowerCase();
+            return txt.includes(targetName.toLowerCase()) || txt.includes('relive');
+          });
           if (target) { 
             const text = target.innerText.trim();
             target.click(); 
             return { found: true, text }; 
           }
-          return { found: false };
+          return { found: false, labels: opts.map(o => o.innerText) };
         }, 'Relive cure');
 
         if (afterSearch.found) {
-          console.log(`[ORG] ✅ Selected via search: "${afterSearch.text}"`);
+          console.log(`[CRM] ✅ Selected via search: "${afterSearch.text}"`);
         } else {
-          throw new Error('❌ Prospect Organisation "Relive cure" NOT FOUND in dropdown options');
+          console.log('[CRM] Final options seen after searching "Relive":', afterSearch.labels);
+          throw new Error('❌ Prospect Organisation "Relive cure" NOT FOUND even after searching "Relive"');
         }
       } else {
-        console.log(`[ORG] ✅ Selected: "${selectedResult.text}"`);
+        console.log(`[CRM] ✅ Selected: "${selectedResult.text}"`);
       }
       await new Promise(r => setTimeout(r, 500));
     } catch (e) {
@@ -257,6 +265,8 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     await fillField(page, SEL.vLeadType,    lead.lead_type || 'surgery',             'vendorFields.22 (lead_type)',           3000);
     await fillField(page, SEL.vParamsComp,  String(lead.parameters_completed ?? 0),  'vendorFields.23 (parameters_completed)', 3000);
 
+    console.log("[CRM] Form filled");
+
     await page.screenshot({ path: 'before-submit.png', fullPage: true });
 
     // ────────────────────────────────────────────────────────────────────────
@@ -266,10 +276,11 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     let submitted = false;
 
     try {
+      console.log("[CRM] Clicking submit");
       await page.waitForSelector(SEL.submit, { timeout: 5000 });
       await page.click(SEL.submit);
       submitted = true;
-      console.log('[CRM] ✓  Submit button clicked ("Add Lead")');
+      console.log("[CRM] Lead submitted");
     } catch (e) {
       console.log('[CRM] ⚠  Primary submit failed — trying text fallback...');
       try {
@@ -317,6 +328,7 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     await browser.close();
 
     if (hardSuccess) {
+      console.log("[CRM] Successfully pushed:", lead.phone_number);
       console.log(`[CRM] ✅ CRM VALIDATION PASSED — lead confirmed in Refrens`);
       return { success: true, id: lead.id, validated: true };
     } else {
@@ -325,7 +337,7 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     }
 
   } catch (error) {
-    console.error(`[CRM] ❌  Crash:`, error.message);
+    console.error("[CRM ERROR]", error.message);
     if (browser) await browser.close();
     return { success: false, id: lead.id, error: error.message };
   }
@@ -339,7 +351,7 @@ export async function processQueue(leads, concurrencyLimit = 2) {
   while (queue.length > 0 || active.length > 0) {
     while (active.length < concurrencyLimit && queue.length > 0) {
       const lead = queue.shift();
-      const promise = pushLeadToCRM(lead).then(result => {
+      const promise = pushToCRM(lead).then(result => {
         active.splice(active.indexOf(promise), 1);
         return result;
       });

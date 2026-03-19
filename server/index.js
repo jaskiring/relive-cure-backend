@@ -20,15 +20,6 @@ app.get('/health', (req, res) => {
 
 // Production Ingestion API — CRM Push with dedup guard
 app.post('/api/push-to-crm-form', async (req, res) => {
-    // ── SAFE MODE GUARD ──────────────────────────────────────────────────────
-    if (process.env.CRM_ENABLED !== "true") {
-        console.log("[CRM] Disabled — skipping CRM push");
-        return res.json({ 
-            status: 'success', 
-            processed: 0, 
-            message: 'CRM is disabled in Safe Testing Mode.' 
-        });
-    }
 
     const crmKey = req.headers['x-crm-key'];
     if (crmKey !== CRM_API_KEY) {
@@ -48,32 +39,10 @@ app.post('/api/push-to-crm-form', async (req, res) => {
         });
     }
 
-    // ── CRM DEDUP GUARD ──────────────────────────────────────────────────────
-    // Never push a lead to CRM twice. pushed_to_crm=true means it was already
-    // confirmed in Refrens. Enforce this here as the final backend safeguard.
-    const alreadyPushed = leads.filter(l => l.pushed_to_crm === true);
-    const toPush        = leads.filter(l => !l.pushed_to_crm);
-
-    if (alreadyPushed.length > 0) {
-        console.warn(`[CRM] ⚠  Skipping ${alreadyPushed.length} already-pushed lead(s):`,
-            alreadyPushed.map(l => l.id).join(', '));
-    }
-
-    if (toPush.length === 0) {
-        return res.json({
-            status: 'success',
-            processed: 0,
-            success_count: 0,
-            failed_count: 0,
-            skipped_already_pushed: alreadyPushed.length,
-            message: 'All selected leads were already pushed to CRM — nothing to do.'
-        });
-    }
-
-    console.log(`[CRM] Processing ${toPush.length} lead(s) | Skipping ${alreadyPushed.length} already-pushed`);
+    console.log(`[CRM] Processing ${leads.length} lead(s)`);
 
     try {
-        const results = await processQueue(toPush);
+        const results = await processQueue(leads);
 
         const successfulLeads = results.filter(r => r.success).map(r => r.id);
         const failedLeads     = results.filter(r => !r.success);
@@ -96,11 +65,10 @@ app.post('/api/push-to-crm-form', async (req, res) => {
             processed: results.length,
             success_count: successfulLeads.length,
             failed_count: failedLeads.length,
-            skipped_already_pushed: alreadyPushed.length,
             failed_leads: failedLeads
         });
     } catch (error) {
-        console.error('[CRM] Auto-Push error:', error);
+        console.error('[CRM ERROR]', error.message);
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
