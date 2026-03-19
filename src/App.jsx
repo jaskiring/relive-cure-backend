@@ -390,15 +390,33 @@ function App() {
     </div>
   );
 
-  const handleAutoPush = async () => {
-    if (filteredLeads.length === 0) return alert('No leads to push.');
-    if (!window.confirm(`You are about to push ${filteredLeads.length} leads to CRM. Continue?`)) return;
+  const handleAutoPush = async (leadToPush = null) => {
+    const leadsToProcess = leadToPush ? [leadToPush] : filteredLeads;
+    
+    if (leadsToProcess.length === 0) return alert('No leads to push.');
+    
+    const count = leadsToProcess.length;
+    const confirmMsg = count === 1 
+      ? `Push lead for ${leadsToProcess[0].contact_name || leadsToProcess[0].phone_number} to CRM?`
+      : `You are about to push ${count} leads to CRM. Continue?`;
+      
+    if (!window.confirm(confirmMsg)) return;
 
     setIsAutoPushing(true);
-    setAutoPushStatus({ total: filteredLeads.length, success: 0, failed: 0, processing: true });
+    setAutoPushStatus({ total: count, success: 0, failed: 0, processing: true });
 
     try {
-      const apiUrl = import.meta.env.VITE_CRM_API_URL || 'http://localhost:3000';
+      // Robust API URL detection — fallback to current origin if env is localhost but we are on production
+      let apiUrl = import.meta.env.VITE_CRM_API_URL || '';
+      if (!apiUrl || apiUrl.includes('localhost')) {
+         // If we are on a non-localhost domain, use the known Render backend
+         if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+            apiUrl = 'https://relive-cure-backend.onrender.com';
+         } else {
+            apiUrl = 'http://localhost:3000';
+         }
+      }
+      
       const crmKey = import.meta.env.VITE_CRM_API_KEY || 'relive_crm_secure_key_2026';
 
       const response = await fetch(`${apiUrl}/api/push-to-crm-form`, {
@@ -407,7 +425,7 @@ function App() {
           'Content-Type': 'application/json',
           'x-crm-key': crmKey
         },
-        body: JSON.stringify({ leads: filteredLeads })
+        body: JSON.stringify({ leads: leadsToProcess })
       });
 
       const data = await response.json();
@@ -424,7 +442,7 @@ function App() {
       }
     } catch (err) {
       console.error(err);
-      alert('Automatic push failed: ' + err.message);
+      alert('CRM push failed: ' + err.message);
       setAutoPushStatus(prev => ({ ...prev, processing: false }));
     } finally {
       setIsAutoPushing(false);
@@ -851,7 +869,7 @@ function App() {
                         <div style={{ display: 'flex', gap: '8px' }} onClick={e => e.stopPropagation()}>
                           <button className="btn-icon" title="Call Now" onClick={() => window.open(`tel:${l.phone_number}`)} style={{ color: 'var(--success)' }}><Phone size={14} /></button>
                           <button className="btn-icon" title="WhatsApp" onClick={() => window.open(`https://wa.me/${l.phone_number.replace(/\+/g, '')}`)} style={{ color: '#25D366' }}><MessageSquare size={14} /></button>
-                          <button className="btn-icon" title="Sync to CRM" onClick={() => handleAutoPush()} style={{ color: 'var(--accent)' }}><Zap size={14} /></button>
+                          <button className="btn-icon" title="Sync to CRM" onClick={() => handleAutoPush(l)} style={{ color: 'var(--accent)' }}><Zap size={14} /></button>
                           <button className="btn-icon" title="Archive Lead" onClick={() => { if(window.confirm('Archive this lead?')) handleUpdateLead(l.id, { status: 'lost' }); }} style={{ color: 'var(--danger)' }}><Trash2 size={14} /></button>
                         </div>
                       </td>
@@ -979,7 +997,7 @@ function App() {
                 </div>
                 
                 <div style={{ display: 'flex', gap: '16px' }}>
-                  <button className="btn-primary" style={{ flex: 1, height: '52px', fontSize: '1.05rem' }} onClick={handleAutoPush}>
+                  <button className="btn-primary" style={{ flex: 1, height: '52px', fontSize: '1.05rem' }} onClick={() => handleAutoPush(selectedLead)}>
                     <Zap size={20} /> Sync with CRM
                   </button>
                   <button className="btn-primary" style={{ background: 'var(--glass-bg)', color: 'var(--danger)', border: '1px solid var(--danger)', flex: 1, height: '52px' }} onClick={() => { handleUpdateLead(selectedLead.id, { status: 'lost' }); setIsPanelOpen(false); }}>
