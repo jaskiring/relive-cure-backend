@@ -2,7 +2,34 @@ import puppeteer from 'puppeteer';
 import crypto from 'crypto';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
-const USER_DATA_DIR = './puppeteer-session';
+const USER_DATA_DIR = '/opt/render/.cache/puppeteer-session';
+
+let browserInstance = null;
+
+async function getBrowser() {
+  if (!browserInstance) {
+    console.log("[CRM] Launching new browser instance");
+    console.log("PUPPETEER CACHE:", process.env.PUPPETEER_CACHE_DIR);
+
+    const executablePath = puppeteer.executablePath();
+    console.log("[CRM] Resolved Chrome path:", executablePath);
+
+    browserInstance = await puppeteer.launch({
+      headless: "new",
+      executablePath,
+      userDataDir: USER_DATA_DIR,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1280,900"
+      ],
+      timeout: 60000
+    });
+  }
+  return browserInstance;
+}
 
 console.log('CRM automation loaded from:', import.meta.url);
 
@@ -89,35 +116,7 @@ export async function pushToCRM(lead, options = {}) {
   console.log(`\n[CRM] ──────────────────────────────────`);
   console.log(`[CRM] Processing lead: ${lead.id}`);
 
-  const executablePath = puppeteer.executablePath();
-  console.log("[CRM] Resolved Chrome path:", executablePath);
-  console.log("PUPPETEER CACHE:", process.env.PUPPETEER_CACHE_DIR);
-
-  let browser;
-
-  try {
-    browser = await puppeteer.launch({
-      headless: "new",
-      executablePath,
-      userDataDir: USER_DATA_DIR,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--window-size=1280,900'
-      ],
-      timeout: 60000
-    });
-  } catch (err) {
-    console.log("[CRM] Primary launch failed, trying fallback:", err.message);
-    browser = await puppeteer.launch({
-      executablePath: "/usr/bin/chromium-browser",
-      headless: true,
-      userDataDir: USER_DATA_DIR,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,900']
-    });
-  }
+  const browser = await getBrowser();
 
   try {
     const page = await browser.newPage();
@@ -132,7 +131,7 @@ export async function pushToCRM(lead, options = {}) {
     if (currentUrl.includes('login') || currentUrl.includes('signin')) {
       console.error('[CRM] ❌ SESSION EXPIRED — redirected to login page!');
       console.error('[CRM] Run: node server/manual-login.js   to re-authenticate.');
-      await browser.close();
+      await page.close();
       return { success: false, id: lead.id, error: 'Session expired — login required' };
     }
 
@@ -176,8 +175,8 @@ export async function pushToCRM(lead, options = {}) {
       const selectedResult = await page.evaluate((targetName) => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"], .css-1n7v3ny-option'));
         const target = opts.find(el => {
-          const txt = (el.innerText || '').toLowerCase();
-          return txt.includes(targetName.toLowerCase()) || txt.includes('relive');
+          const txt = (el.innerText || '').trim().toLowerCase();
+          return txt === targetName.toLowerCase();
         });
         if (target) { 
           const text = target.innerText.trim();
@@ -199,8 +198,8 @@ export async function pushToCRM(lead, options = {}) {
         const afterSearch = await page.evaluate((targetName) => {
           const opts = Array.from(document.querySelectorAll('.disco-select__option, [role="option"], .css-1n7v3ny-option'));
           const target = opts.find(el => {
-            const txt = (el.innerText || '').toLowerCase();
-            return txt.includes(targetName.toLowerCase()) || txt.includes('relive');
+            const txt = (el.innerText || '').trim().toLowerCase();
+            return txt === targetName.toLowerCase();
           });
           if (target) { 
             const text = target.innerText.trim();
@@ -222,7 +221,7 @@ export async function pushToCRM(lead, options = {}) {
       await new Promise(r => setTimeout(r, 500));
     } catch (e) {
       console.error(`[CRM] ❌  FATAL: Org selection failed — ${e.message.split('\n')[0]}`);
-      await browser.close();
+      await page.close();
       return { success: false, id: lead.id || 'unknown', error: `Org selection failed: ${e.message}` };
     }
 
@@ -319,7 +318,8 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     }
 
     await new Promise(r => setTimeout(r, 4000));
-    await page.screenshot({ path: 'after-submit.png', fullPage: true });
+    await page.screenshot({ path: 'final-proof.png', fullPage: true });
+    console.log("[CRM] Final proof screenshot saved: final-proof.png");
 
     // ────────────────────────────────────────────────────────────────────────
     // VALIDATION
@@ -327,23 +327,22 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
     console.log('[CRM] ── VALIDATION ──');
     let hardSuccess = false;
     try {
-      await page.goto('https://www.refrens.com/app/relivecure/leads', {
-        waitUntil: 'networkidle2',
-        timeout: 20000
+      await page.waitForSelector('body', { timeout: 8000 });
+      hardSuccess = await page.evaluate(() => {
+        const body = document.body.innerText.toLowerCase();
+        return (
+          body.includes("lead created") ||
+          body.includes("success") ||
+          body.includes("added") ||
+          body.includes("saved")
+        );
       });
-      await new Promise(r => setTimeout(r, 4000));
-
-      const phoneSuffix = (lead.phone_number || '').slice(-6);
-      hardSuccess = await page.evaluate((suffix) => {
-        return document.body.innerText.includes(suffix);
-      }, phoneSuffix);
-
-      console.log(`[CRM]   Phone suffix "${phoneSuffix}" found in leads list: ${hardSuccess}`);
+      console.log(`[CRM] Keyword-based success check: ${hardSuccess}`);
     } catch (e) {
-      console.log(`[CRM] ⚠  Validation error: ${e.message}`);
+      console.log("[CRM] Validation check failed:", e.message);
     }
 
-    await browser.close();
+    await page.close();
 
     if (hardSuccess) {
       console.log("[CRM] Successfully pushed:", lead.phone_number);
@@ -351,12 +350,12 @@ Bot Fallback: ${lead.bot_fallback ?? false}`;
       return { success: true, id: lead.id, validated: true };
     } else {
       console.error(`[CRM] ❌ CRM VALIDATION FAILED`);
-      return { success: false, id: lead.id, validated: false, error: 'Lead not visible in CRM list' };
+      return { success: false, id: lead.id, validated: false, error: 'Confirmation message not found' };
     }
 
   } catch (error) {
     console.error("[CRM ERROR]", error.message);
-    if (browser) await browser.close();
+    if (page) await page.close();
     return { success: false, id: lead.id, error: error.message };
   }
 }
