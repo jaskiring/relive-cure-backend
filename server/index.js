@@ -20,6 +20,16 @@ app.get('/health', (req, res) => {
 
 // Production Ingestion API — CRM Push with dedup guard
 app.post('/api/push-to-crm-form', async (req, res) => {
+    // ── SAFE MODE GUARD ──────────────────────────────────────────────────────
+    if (process.env.CRM_ENABLED !== "true") {
+        console.log("[CRM] Disabled — skipping CRM push");
+        return res.json({ 
+            status: 'success', 
+            processed: 0, 
+            message: 'CRM is disabled in Safe Testing Mode.' 
+        });
+    }
+
     const crmKey = req.headers['x-crm-key'];
     if (crmKey !== CRM_API_KEY) {
         return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid x-crm-key' });
@@ -99,43 +109,61 @@ app.post('/api/ingest-lead', async (req, res) => {
     const botKey = req.headers['x-bot-key'];
 
     if (botKey !== BOT_SECRET) {
-        return res.status(401).json({
-            status: 'error',
-            message: 'Unauthorized: Invalid x-bot-key'
-        });
+        console.warn(`[API] 🔐 Unauthorized access attempt from IP: ${req.ip}`);
+        return res.status(401).json({ status: 'error', message: 'Unauthorized' });
     }
 
     try {
+        console.log("[API] Incoming request");
         const payload = req.body;
 
         if (!payload.phone_number) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Missing required field: phone_number'
-            });
+            return res.status(400).json({ status: 'error', message: 'Missing phone_number' });
         }
 
-        console.log(`[API] Received lead | phone=${payload.phone_number} | fallback=${payload.bot_fallback}`);
+        // Basic Sanitize
+        if (payload.phone_number.length > 20) {
+            return res.status(400).json({ status: 'error', message: 'Invalid phone number format' });
+        }
 
+        console.log(`[API] Ingesting | phone=${payload.phone_number} | trigger=${payload.ingestion_trigger || 'unknown'}`);
+        console.log("[DB INSERT]", payload);
+        
         const { data, action } = await ingestLead(supabaseAdmin, payload);
 
-        console.log(`[DB] Lead ${action} | id=${data.id} | phone=${payload.phone_number} | params=${data.parameters_completed}`);
+        console.log(`[DB] ${action.toUpperCase()} | id=${data.id} | phone=${payload.phone_number}`);
 
-        res.json({
-            status: 'success',
-            action,
-            lead_id: data.id
-        });
+        res.json({ status: 'success', action, lead_id: data.id });
     } catch (error) {
-        console.error('[API] Ingestion error:', error);
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+        console.error('[API] ❌ Ingestion error:', error.message);
+        res.status(500).json({ status: 'error', message: 'Internal server error' });
+    }
+});
+
+// New: Check if lead exists for returning user logic
+app.get('/api/check-lead/:phone', async (req, res) => {
+    const botKey = req.headers['x-bot-key'];
+    if (botKey !== BOT_SECRET) {
+        return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+    }
+
+    const { phone } = req.params;
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('leads_surgery')
+            .select('id, contact_name, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, urgency_level')
+            .eq('phone_number', phone)
+            .maybeSingle();
+
+        if (error) throw error;
+        
+        res.json({ status: 'success', exists: !!data, lead: data });
+    } catch (error) {
+        console.error('[API] ❌ Check-lead error:', error.message);
+        res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Production Ingestion API running on port ${PORT}`);
-    console.log("Server entry point:", import.meta.url);
+    console.log(`[API] Production Server running on port ${PORT}`);
 });
