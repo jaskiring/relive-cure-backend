@@ -49,6 +49,7 @@ const getSLAStyle = (createdAt) => {
 };
 
 function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [leads, setLeads] = useState([]);
   const [loading, setLoading] = useState(true);
   const [theme, setTheme] = useState('dark');
@@ -65,10 +66,18 @@ function App() {
   const [isAutoPushing, setIsAutoPushing] = useState(false);
   const [autoPushStatus, setAutoPushStatus] = useState(null);
   const [dashboardFilter, setDashboardFilter] = useState(null); // { type: 'priority' | 'intent' | 'action' | 'funnel', value: string, label: string }
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
-  // --- Auth Handlers ---
+  // --- Auth Logic ---
+  useEffect(() => {
+    const auth = localStorage.getItem("auth");
+    if (auth === "true") setIsAuthenticated(true);
+  }, []);
+
   const handleLogin = (username, password) => {
+    if (!import.meta.env.VITE_ADMIN_USERNAME || !import.meta.env.VITE_ADMIN_PASSWORD) {
+      alert("Login not configured properly");
+      return;
+    }
     if (
       username === import.meta.env.VITE_ADMIN_USERNAME &&
       password === import.meta.env.VITE_ADMIN_PASSWORD
@@ -80,10 +89,10 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    const auth = localStorage.getItem("auth");
-    if (auth === "true") setIsAuthenticated(true);
-  }, []);
+  const handleLogout = () => {
+    localStorage.removeItem("auth");
+    setIsAuthenticated(false);
+  };
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -478,50 +487,6 @@ function App() {
   };
 
 
-  if (!isAuthenticated) {
-    return (
-      <div style={{ 
-        display: 'flex', 
-        justifyContent: 'center', 
-        alignItems: 'center', 
-        height: '100vh', 
-        background: 'var(--bg-dark)',
-        fontFamily: 'system-ui, -apple-system, sans-serif'
-      }}>
-        <div className="glass-panel" style={{ padding: '48px', width: '100%', maxWidth: '400px', textAlign: 'center' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', color: 'var(--primary)', marginBottom: '12px' }}>
-            <Zap size={24} fill="currentColor" />
-            <span style={{ fontWeight: '800', letterSpacing: '0.1em', fontSize: '0.75rem', textTransform: 'uppercase' }}>Admin Portal</span>
-          </div>
-          <h2 style={{ fontSize: '1.75rem', fontWeight: '900', marginBottom: '32px', color: 'var(--text-main)' }}>Sign In</h2>
-          
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ textAlign: 'left' }}>
-              <label style={{ fontSize: '0.7rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '8px', display: 'block' }}>Username</label>
-              <input id="username" placeholder="Enter username" className="search-field" style={{ width: '100%', height: '48px' }} />
-            </div>
-            <div style={{ textAlign: 'left' }}>
-              <label style={{ fontSize: '0.7rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '8px', display: 'block' }}>Password</label>
-              <input id="password" type="password" placeholder="••••••••" className="search-field" style={{ width: '100%', height: '48px' }} />
-            </div>
-            <button
-              className="btn-primary"
-              style={{ height: '48px', marginTop: '12px', fontSize: '1rem' }}
-              onClick={() =>
-                handleLogin(
-                  document.getElementById("username").value,
-                  document.getElementById("password").value
-                )
-              }
-            >
-              Login to Dashboard
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   if (loading) return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', justifyContent: 'center', alignItems: 'center', height: '100vh', background: 'var(--bg-dark)' }}>
       <RefreshCcw size={48} className="spin" color="var(--primary)" />
@@ -529,6 +494,80 @@ function App() {
     </div>
   );
 
+
+  if (!isAuthenticated) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-slate-900" style={{ 
+        height: '100vh', 
+        display: 'flex', 
+        alignItems: 'center', 
+        justifyContent: 'center',
+        background: 'radial-gradient(circle at top right, #1e293b, #0f172a)'
+      }}>
+        <div className="glass-panel" style={{ 
+          padding: '40px', 
+          width: '400px', 
+          background: 'rgba(30, 41, 59, 0.7)',
+          backdropFilter: 'blur(20px)',
+          border: '1px solid rgba(255, 255, 255, 0.1)',
+          borderRadius: '24px',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)'
+        }}>
+          <div style={{ textAlign: 'center', marginBottom: '32px' }}>
+            <div style={{ 
+              width: '64px', 
+              height: '64px', 
+              background: 'rgba(99, 102, 241, 0.1)', 
+              borderRadius: '20px', 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center',
+              margin: '0 auto 16px',
+              border: '1px solid rgba(99, 102, 241, 0.2)'
+            }}>
+              <LayoutDashboard size={32} color="#6366f1" />
+            </div>
+            <h2 style={{ fontSize: '1.5rem', fontWeight: '800', color: '#f8fafc', letterSpacing: '-0.025em' }}>Admin Login</h2>
+            <p style={{ color: '#94a3b8', fontSize: '0.875rem', marginTop: '4px' }}>Secure access to Relive Cure Portal</p>
+          </div>
+          
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: '8px', letterSpacing: '0.05em' }}>Username</label>
+              <input 
+                id="login-username" 
+                placeholder="Enter username" 
+                className="search-field"
+                style={{ width: '100%', height: '48px', background: 'rgba(15, 23, 42, 0.5)', padding: '0 16px' }} 
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: '8px', letterSpacing: '0.05em' }}>Password</label>
+              <input 
+                id="login-password" 
+                type="password" 
+                placeholder="••••••••" 
+                className="search-field"
+                style={{ width: '100%', height: '48px', background: 'rgba(15, 23, 42, 0.5)', padding: '0 16px' }} 
+              />
+            </div>
+            <button
+              className="btn-primary"
+              style={{ width: '100%', height: '48px', marginTop: '12px', fontSize: '1rem', justifyContent: 'center' }}
+              onClick={() =>
+                handleLogin(
+                  document.getElementById("login-username").value,
+                  document.getElementById("login-password").value
+                )
+              }
+            >
+              Sign In
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="command-center fade-in" style={{ padding: '40px' }}>
@@ -556,6 +595,21 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           <button className="btn-icon" onClick={toggleTheme} style={{ width: '40px', height: '40px' }}>
             {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
+          </button>
+
+          <button 
+            className="btn-primary" 
+            style={{ 
+              background: 'rgba(239, 68, 68, 0.1)', 
+              color: '#ef4444', 
+              border: '1px solid rgba(239, 68, 68, 0.2)', 
+              padding: '0 16px',
+              height: '40px',
+              fontSize: '0.85rem'
+            }} 
+            onClick={handleLogout}
+          >
+             <X size={16} /> Logout
           </button>
           
           <div className="glass-panel" style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: '8px', height: '40px' }}>
