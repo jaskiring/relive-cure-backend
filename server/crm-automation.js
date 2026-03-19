@@ -1,29 +1,30 @@
 import puppeteer from 'puppeteer';
 import crypto from 'crypto';
 import fs from 'fs';
+import { execSync } from 'child_process';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
 const USER_DATA_DIR = "./puppeteer-session";
 
 let browserInstance = null;
 
-function getChromePath() {
-  // Try the puppeteer-managed path first
+async function ensureChrome() {
+  // Check if puppeteer Chrome is already present
   try {
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
-      console.log('[CRM] Using puppeteer Chrome:', path);
+      console.log('[CRM] Chrome found at:', path);
       return path;
     }
-    console.warn('[CRM] puppeteer.executablePath() not found:', path);
+    console.warn('[CRM] Chrome not found at expected path:', path);
   } catch (e) {
-    console.warn('[CRM] puppeteer.executablePath() failed:', e.message);
+    console.warn('[CRM] executablePath() error:', e.message);
   }
 
-  // Fallback to system Chrome (available on Render Linux)
+  // Try system Chrome first (faster)
   const systemPaths = [
-    '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
   ];
@@ -34,15 +35,30 @@ function getChromePath() {
     }
   }
 
-  // Last resort: let Puppeteer try to figure it out
-  console.warn('[CRM] No Chrome found, letting puppeteer auto-detect');
+  // Install Chrome at runtime — handles Render container restarts wiping the build cache
+  console.log('[CRM] Chrome missing — installing now...');
+  try {
+    execSync('npx puppeteer browsers install chrome', {
+      stdio: 'inherit',
+      timeout: 120000
+    });
+    const path = puppeteer.executablePath();
+    if (fs.existsSync(path)) {
+      console.log('[CRM] Chrome installed successfully:', path);
+      return path;
+    }
+  } catch (err) {
+    console.error('[CRM] Chrome install failed:', err.message);
+  }
+
+  console.warn('[CRM] Falling back to Puppeteer auto-detect');
   return undefined;
 }
 
 async function getBrowser() {
   if (!browserInstance) {
     console.log("Using session dir:", USER_DATA_DIR);
-    const executablePath = getChromePath();
+    const executablePath = await ensureChrome();
     browserInstance = await puppeteer.launch({
       headless: true,
       slowMo: 0,
