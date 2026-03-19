@@ -89,8 +89,8 @@ export async function pushToCRM(lead, options = {}) {
   console.log(`\n[CRM] ──────────────────────────────────`);
   console.log(`[CRM] Processing lead: ${lead.id}`);
 
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || "/opt/render/.cache/puppeteer/chrome/linux-/chrome-linux/chrome";
-  console.log("[CRM] Using Chrome path:", executablePath);
+  const executablePath = puppeteer.executablePath();
+  console.log("[CRM] Resolved Chrome path:", executablePath);
   console.log("PUPPETEER CACHE:", process.env.PUPPETEER_CACHE_DIR);
 
   let browser;
