@@ -33,7 +33,7 @@ const SEL = {
   subject:      'input[name="subject"]',
   details:      'textarea[name="details"]',
   submit:       'button[type="submit"]',
-  orgInput:     '.disco-select__control input',
+  orgInput:     '#react-select-3-input',
 
   vPhoneNumber:  'input[name="vendorFields.1.value"]',
   vTimeline:     'input[name="vendorFields.2.value"]',
