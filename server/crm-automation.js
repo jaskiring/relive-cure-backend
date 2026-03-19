@@ -1,18 +1,52 @@
 import puppeteer from 'puppeteer';
 import crypto from 'crypto';
+import fs from 'fs';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
 const USER_DATA_DIR = "./puppeteer-session";
 
 let browserInstance = null;
 
+function getChromePath() {
+  // Try the puppeteer-managed path first
+  try {
+    const path = puppeteer.executablePath();
+    if (fs.existsSync(path)) {
+      console.log('[CRM] Using puppeteer Chrome:', path);
+      return path;
+    }
+    console.warn('[CRM] puppeteer.executablePath() not found:', path);
+  } catch (e) {
+    console.warn('[CRM] puppeteer.executablePath() failed:', e.message);
+  }
+
+  // Fallback to system Chrome (available on Render Linux)
+  const systemPaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ];
+  for (const p of systemPaths) {
+    if (fs.existsSync(p)) {
+      console.log('[CRM] Using system Chrome:', p);
+      return p;
+    }
+  }
+
+  // Last resort: let Puppeteer try to figure it out
+  console.warn('[CRM] No Chrome found, letting puppeteer auto-detect');
+  return undefined;
+}
+
 async function getBrowser() {
   if (!browserInstance) {
     console.log("Using session dir:", USER_DATA_DIR);
+    const executablePath = getChromePath();
     browserInstance = await puppeteer.launch({
       headless: true,
       slowMo: 0,
-      executablePath: puppeteer.executablePath(),
+      ...(executablePath ? { executablePath } : {}),
       userDataDir: USER_DATA_DIR,
       defaultViewport: null,
       args: [
