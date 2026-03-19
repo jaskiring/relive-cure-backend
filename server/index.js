@@ -9,6 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const BOT_SECRET = 'RELIVE_BOT_SECRET';
 const CRM_API_KEY = process.env.CRM_API_KEY || 'relive_crm_secure_key_2026';
+console.log("EXPECTED CRM_API_KEY:", process.env.CRM_API_KEY || CRM_API_KEY);
 
 app.use(cors());
 app.use(express.json());
@@ -22,6 +23,8 @@ app.get('/health', (req, res) => {
 app.post('/api/push-to-crm-form', async (req, res) => {
 
     const crmKey = req.headers['x-crm-key'];
+    console.log("RECEIVED x-crm-key:", crmKey);
+
     if (crmKey !== CRM_API_KEY) {
         return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid x-crm-key' });
     }
