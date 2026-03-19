@@ -7,7 +7,7 @@ import { supabaseAdmin } from './supabase-admin.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BOT_SECRET = process.env.RELIVE_BOT_SECRET || 'RELIVE_BOT_SECRET';
+const BOT_SECRET = 'RELIVE_BOT_SECRET';
 const CRM_API_KEY = process.env.CRM_API_KEY || 'relive_crm_secure_key_2026';
 
 app.use(cors());
@@ -107,6 +107,7 @@ app.post('/api/push-to-crm-form', async (req, res) => {
 
 app.post('/api/ingest-lead', async (req, res) => {
     const botKey = req.headers['x-bot-key'];
+    console.log("🔐 RECEIVED KEY:", botKey);
 
     if (botKey !== BOT_SECRET) {
         console.warn(`[API] 🔐 Unauthorized access attempt from IP: ${req.ip}`);
@@ -143,7 +144,10 @@ app.post('/api/ingest-lead', async (req, res) => {
 // New: Check if lead exists for returning user logic
 app.get('/api/check-lead/:phone', async (req, res) => {
     const botKey = req.headers['x-bot-key'];
+    console.log("🔐 RECEIVED KEY:", botKey);
+
     if (botKey !== BOT_SECRET) {
+        console.warn(`[API] 🔐 Unauthorized access attempt from IP: ${req.ip}`);
         return res.status(401).json({ status: 'error', message: 'Unauthorized' });
     }
 
