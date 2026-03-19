@@ -89,8 +89,11 @@ export async function pushToCRM(lead, options = {}) {
   console.log(`\n[CRM] ──────────────────────────────────`);
   console.log(`[CRM] Processing lead: ${lead.id}`);
 
+  console.log("[CRM] Chrome path:", process.env.PUPPETEER_EXECUTABLE_PATH);
+
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: "new",
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     userDataDir: USER_DATA_DIR,
     args: [
       '--no-sandbox',

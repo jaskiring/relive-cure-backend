@@ -8,7 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "server": "node server/index.js"
+    "server": "node server/index.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.99.1",
