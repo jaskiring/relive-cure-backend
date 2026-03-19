@@ -115,7 +115,7 @@ app.post('/api/ingest-lead', async (req, res) => {
     }
 
     try {
-        console.log("[API] Incoming request");
+        console.log("[API] Incoming request body:", JSON.stringify(req.body, null, 2));
         const payload = req.body;
 
         if (!payload.phone_number) {
