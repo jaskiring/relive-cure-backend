@@ -14,19 +14,40 @@ async function getBrowser() {
     const executablePath = puppeteer.executablePath();
     console.log("[CRM] Resolved Chrome path:", executablePath);
 
-    browserInstance = await puppeteer.launch({
-      headless: "new",
-      executablePath,
-      userDataDir: USER_DATA_DIR,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-size=1280,900"
-      ],
-      timeout: 60000
-    });
+    try {
+      browserInstance = await puppeteer.launch({
+        headless: "new",
+        executablePath,
+        userDataDir: USER_DATA_DIR,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--window-size=1280,900"
+        ],
+        timeout: 60000
+      });
+      console.log("[CRM] Browser launched successfully with primary path");
+    } catch (err) {
+      console.warn("[CRM] Primary launch failed:", err.message);
+      console.log("[CRM] Attempting fallback to /usr/bin/chromium-browser");
+      
+      browserInstance = await puppeteer.launch({
+        headless: "new",
+        executablePath: "/usr/bin/chromium-browser",
+        userDataDir: USER_DATA_DIR,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--window-size=1280,900"
+        ],
+        timeout: 60000
+      });
+      console.log("[CRM] Browser launched successfully with fallback path");
+    }
   }
   return browserInstance;
 }
