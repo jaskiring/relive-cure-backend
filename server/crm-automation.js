@@ -9,7 +9,6 @@ const USER_DATA_DIR = "./puppeteer-session";
 let browserInstance = null;
 
 async function ensureChrome() {
-  // Check if puppeteer Chrome is already present
   try {
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
@@ -21,7 +20,6 @@ async function ensureChrome() {
     console.warn('[CRM] executablePath() error:', e.message);
   }
 
-  // Try system Chrome first (faster)
   const systemPaths = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
@@ -35,7 +33,6 @@ async function ensureChrome() {
     }
   }
 
-  // Install Chrome at runtime — handles Render container restarts wiping the build cache
   console.log('[CRM] Chrome missing — installing now...');
   try {
     execSync('npx puppeteer browsers install chrome', {
@@ -66,7 +63,7 @@ async function getBrowser() {
       userDataDir: USER_DATA_DIR,
       defaultViewport: null,
       args: [
-        "--start-maximized", 
+        "--start-maximized",
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage"
@@ -84,7 +81,7 @@ const SEL = {
   subject:      'input[name="subject"]',
   details:      'textarea[name="details"]',
   submit:       'button[type="submit"]',
-  vPhoneNumber:  'input[name="vendorFields.1.value"]',
+  vPhoneNumber: 'input[name="vendorFields.1.value"]',
 };
 
 async function fillField(page, selector, value) {
@@ -98,12 +95,76 @@ async function fillField(page, selector, value) {
   }
 }
 
+// ─── Parse REFRENS_COOKIES env var ───────────────────────────────────────────
+// Accepts either:
+//   - A JSON array of cookie objects (correct format)
+//   - A raw __rt JWT string (fallback — wraps it into a cookie object)
+function parseCookies(raw) {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+
+  // Try JSON array first
+  if (trimmed.startsWith('[')) {
+    try {
+      const cookies = JSON.parse(trimmed);
+      console.log(`[CRM] Parsed ${cookies.length} cookies from REFRENS_COOKIES`);
+      return cookies;
+    } catch (e) {
+      console.warn('[CRM] Failed to parse REFRENS_COOKIES as JSON array:', e.message);
+      return null;
+    }
+  }
+
+  // Fallback: treat as raw __rt JWT
+  if (trimmed.startsWith('eyJ')) {
+    console.warn('[CRM] REFRENS_COOKIES looks like a raw JWT — wrapping as __rt cookie');
+    return [
+      {
+        name: '__rt',
+        value: trimmed,
+        domain: '.refrens.com',
+        path: '/',
+        httpOnly: true,
+        secure: true,
+        sameSite: 'Strict',
+      }
+    ];
+  }
+
+  console.warn('[CRM] REFRENS_COOKIES format not recognised — skipping cookie injection');
+  return null;
+}
+
+// ─── Wait for Refrens to exchange __rt cookie → __at in sessionStorage ────────
+// Refrens JS performs a silent token refresh on app boot. This function
+// navigates to the Refrens homepage (not the CRM form) and waits for that
+// refresh to complete, so the CRM form navigation is already authenticated.
+async function waitForTokenRefresh(page, timeoutMs = 20000) {
+  console.log('[CRM] Navigating to Refrens homepage to trigger __rt → __at exchange...');
+  await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  try {
+    await page.waitForFunction(
+      () => {
+        const at = sessionStorage.getItem('__at');
+        return !!at && at.length > 20;
+      },
+      { timeout: timeoutMs, polling: 300 }
+    );
+    const at = await page.evaluate(() => sessionStorage.getItem('__at'));
+    console.log('[CRM] __at token acquired — length:', at.length);
+    return true;
+  } catch (_) {
+    console.warn('[CRM] __rt exchange timed out — __at not found in sessionStorage');
+    return false;
+  }
+}
+
 // Export current Puppeteer session cookies (called from /api/export-refrens-cookies)
 export async function getBrowserCookies() {
   const browser = await getBrowser();
   const pages = await browser.pages();
   const page = pages.length ? pages[0] : await browser.newPage();
-  // Navigate to refrens.com to get its cookies
   if (!page.url().includes('refrens.com')) {
     await page.goto('https://www.refrens.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
   }
@@ -119,36 +180,38 @@ export async function pushToCRM(lead) {
   const browser = await getBrowser();
   const pages = await browser.pages();
   const page = pages.length ? pages[0] : await browser.newPage();
-  
+
   try {
-    // Inject session cookies (activeBusiness, __rt_check etc)
-    const cookiesJson = process.env.REFRENS_COOKIES;
-    if (cookiesJson) {
-      try {
-        const cookies = JSON.parse(cookiesJson);
-        await page.setCookie(...cookies);
-        console.log('[CRM] Session cookies restored');
-      } catch (e) {
-        console.warn('[CRM] Failed to parse REFRENS_COOKIES:', e.message);
-      }
-    }
-
-    // Inject the __at JWT token into sessionStorage BEFORE the page loads
-    // Refrens reads auth from sessionStorage.__at on app boot
-    const refrensToken = process.env.REFRENS_TOKEN;
-    if (refrensToken) {
-      await page.evaluateOnNewDocument((token) => {
-        sessionStorage.setItem('__at', token);
-      }, refrensToken);
-      console.log('[CRM] Session token injected via evaluateOnNewDocument');
+    // ── 1. Inject cookies BEFORE any navigation ──────────────────────────────
+    // We must set cookies on the refrens.com domain first. Use a dummy URL
+    // that the browser hasn't visited yet — setCookie works by domain, not URL.
+    const cookies = parseCookies(process.env.REFRENS_COOKIES);
+    if (cookies && cookies.length > 0) {
+      const validCookies = cookies.filter(c => c.name && c.value && c.domain);
+      await page.setCookie(...validCookies);
+      console.log(`[CRM] Injected ${validCookies.length} cookies (incl. __rt refresh token)`);
     } else {
-      console.warn('[CRM] REFRENS_TOKEN not set — session will likely fail');
+      console.warn('[CRM] No cookies to inject — session will likely fail');
     }
 
+    // ── 2. Navigate to Refrens app root to trigger __rt → __at token exchange ─
+    // Refrens JS reads the __rt cookie on boot and silently fetches a fresh
+    // 15-min __at access token, storing it in sessionStorage. We MUST let this
+    // happen before navigating to the CRM form, otherwise the form page sees
+    // no valid session and redirects to login.
+    const tokenReady = await waitForTokenRefresh(page, 20000);
+    if (!tokenReady) {
+      throw new Error(
+        '__rt cookie did not produce a valid __at token. ' +
+        'Your REFRENS_COOKIES may be expired or missing the __rt cookie. ' +
+        'Please export fresh cookies from your browser and update REFRENS_COOKIES on Render.'
+      );
+    }
+
+    // ── 3. Now navigate to the CRM form (already authenticated) ─────────────
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
     console.log("STEP: Page opened");
 
-    // DEBUG: Log what page Puppeteer actually landed on
     const finalUrl = page.url();
     const pageTitle = await page.title();
     const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 300) || 'NO BODY');
@@ -156,126 +219,97 @@ export async function pushToCRM(lead) {
     console.log('[CRM DEBUG] Title:', pageTitle);
     console.log('[CRM DEBUG] Body sample:', pageText.replace(/\n/g, ' '));
 
-    // Detect login page — Refrens shows login at same URL without redirect
-    const isLoginPage = pageTitle.toLowerCase().includes('login') ||
-                        pageTitle.includes('401') ||
-                        pageText.toLowerCase().includes('sign in with google') ||
-                        finalUrl.includes('/login') || finalUrl.includes('/signin');
+    // ── 4. Sanity check — should not land on login page anymore ─────────────
+    const isLoginPage =
+      pageTitle.toLowerCase().includes('login') ||
+      pageTitle.includes('401') ||
+      pageText.toLowerCase().includes('sign in with google') ||
+      finalUrl.includes('/login') ||
+      finalUrl.includes('/signin');
 
     if (isLoginPage) {
-      console.log('[CRM] Login page detected — waiting for __rt_check auto-refresh...');
-      try {
-        // Refrens uses __rt_check cookie to silently refresh __at token.
-        // Wait up to 12s for the token refresh to complete.
-        await page.waitForFunction(
-          () => !!sessionStorage.getItem('__at'),
-          { timeout: 12000 }
-        );
-        console.log('[CRM] Session refreshed by __rt_check — reloading CRM form...');
-        await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
-        const newTitle = await page.title();
-        if (newTitle.toLowerCase().includes('login') || newTitle.includes('401')) {
-          throw new Error('Session refresh failed — update REFRENS_COOKIES with fresh __rt_check cookie');
-        }
-      } catch (e) {
-        if (e.message.includes('Session refresh failed') || e.message.includes('REFRENS_COOKIES')) throw e;
-        throw new Error('Session expired and __rt_check refresh timed out — re-run: copy(sessionStorage.getItem("__at")) and update REFRENS_TOKEN on Render');
-      }
+      throw new Error(
+        'Still on login page after token refresh. ' +
+        'The __rt cookie may be tied to a different browser session or IP. ' +
+        'Export fresh cookies from the browser currently logged into Refrens and update REFRENS_COOKIES.'
+      );
     }
 
-    console.log("crm opened without login");
+    console.log("CRM opened without login ✓");
 
     await new Promise(r => setTimeout(r, 2500));
 
+    // ── 5. Select Organisation ───────────────────────────────────────────────
     console.log('[CRM] Selecting Organisation...');
-    // Wait for React to finish rendering the dropdown inputs
     await page.waitForSelector('.disco-select__control input', { timeout: 30000 });
-    console.log('[CRM] Disco-selects are rendered');
+    console.log('[CRM] Disco-selects rendered');
 
     const orgInputHandle = await page.evaluateHandle(() => {
       const labels = Array.from(document.querySelectorAll('label'));
       const label = labels.find(l => l.innerText?.trim().includes('Prospect Organisation'));
-      if (!label) {
-        console.warn('[DOM] Prospect Organisation label not found');
-        return null;
-      }
+      if (!label) return null;
 
-      // Strategy 1: Navigate up to .css-rxk9pl row, then get the input in sibling column
       const row = label.closest('.css-rxk9pl');
       if (row) {
         const input = row.querySelector('.disco-select__control input');
         if (input) return input;
       }
 
-      // Strategy 2: Proximity via getBoundingClientRect — find closest disco-select to label
       const labelRect = label.getBoundingClientRect();
       const allControls = Array.from(document.querySelectorAll('.disco-select__control'));
-      let closest = null;
-      let minDist = Infinity;
+      let closest = null, minDist = Infinity;
       for (const ctrl of allControls) {
         const rect = ctrl.getBoundingClientRect();
         const dist = Math.abs(rect.top - labelRect.top) + Math.abs(rect.left - labelRect.left);
         if (dist < minDist) { minDist = dist; closest = ctrl; }
       }
-      if (closest) {
-        const input = closest.querySelector('input');
-        if (input) return input;
-      }
-
-      return null;
+      return closest ? closest.querySelector('input') : null;
     });
 
     const orgInput = orgInputHandle.asElement();
-    if (!orgInput) {
-      throw new Error("Could not find Prospect Organisation input via label");
-    }
+    if (!orgInput) throw new Error("Could not find Prospect Organisation input via label");
 
     await orgInput.click();
-    
     await page.keyboard.down('Control');
     await page.keyboard.press('A');
     await page.keyboard.up('Control');
     await page.keyboard.press('Backspace');
     await new Promise(r => setTimeout(r, 300));
-    
     await page.keyboard.type('r');
     await new Promise(r => setTimeout(r, 1200));
-    
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
-    await new Promise(r => setTimeout(r, 1500)); // Delay after major step
-    
+    await new Promise(r => setTimeout(r, 1500));
+
     const selectedOrgHandle = await page.evaluateHandle((input) => {
       const container = input.closest('.disco-select');
       return container ? container.querySelector('.disco-select__single-value')?.innerText : '';
     }, orgInput);
-    
-    const orgValue = await selectedOrgHandle.jsonValue();
-    if (!orgValue || orgValue.length < 2) {
-      throw new Error("Organisation not selected");
-    }
-    console.log("STEP: Organisation selected");
-    console.log("Selected Organisation:", orgValue);
 
-    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
+    const orgValue = await selectedOrgHandle.jsonValue();
+    if (!orgValue || orgValue.length < 2) throw new Error("Organisation not selected");
+    console.log("STEP: Organisation selected:", orgValue);
+
+    // ── 6. Fill fields ───────────────────────────────────────────────────────
+    await fillField(page, SEL.contactName,  lead.contact_name || lead.name || 'Session Test');
     await fillField(page, SEL.contactPhone, lead.phone_number);
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject, `LASIK Session Test - ${lead.phone_number}`);
-    await fillField(page, SEL.details, `Session persistence test | phone=${lead.phone_number}`);
+    await fillField(page, SEL.subject,      `LASIK Session Test - ${lead.phone_number}`);
+    await fillField(page, SEL.details,      `Session persistence test | phone=${lead.phone_number}`);
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
     console.log("STEP: Fields filled");
     await new Promise(r => setTimeout(r, 1500));
 
+    // ── 7. Submit ────────────────────────────────────────────────────────────
     console.log('[CRM] Clicking submit...');
     await page.click(SEL.submit);
     console.log("STEP: Form submitted");
-    
+
     await new Promise(r => setTimeout(r, 4000));
     const postSubmitUrl = page.url();
     const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
     const isSuccess = bodyText.includes('lead') || postSubmitUrl.includes('leads');
-
-    if (isSuccess) console.log("form submitted");
+    if (isSuccess) console.log("✓ Lead form submitted successfully");
 
     return { success: isSuccess, id: lead.id, selectedOrg: orgValue };
 
