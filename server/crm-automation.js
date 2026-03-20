@@ -111,8 +111,16 @@ export async function pushToCRM(lead) {
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
     console.log("STEP: Page opened");
 
+    // DEBUG: Log what page Puppeteer actually landed on
+    const finalUrl = page.url();
+    const pageTitle = await page.title();
+    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 300) || 'NO BODY');
+    console.log('[CRM DEBUG] URL:', finalUrl);
+    console.log('[CRM DEBUG] Title:', pageTitle);
+    console.log('[CRM DEBUG] Body sample:', pageText.replace(/\n/g, ' '));
+
     // Hard session check
-    if (page.url().includes("login") || page.url().includes("signin")) {
+    if (finalUrl.includes("login") || finalUrl.includes("signin") || finalUrl.includes("auth")) {
       throw new Error("Session expired - login required");
     }
     console.log("crm opened without login");
@@ -203,9 +211,9 @@ export async function pushToCRM(lead) {
     console.log("STEP: Form submitted");
     
     await new Promise(r => setTimeout(r, 4000));
-    const finalUrl = page.url();
+    const postSubmitUrl = page.url();
     const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
-    const isSuccess = bodyText.includes('lead') || finalUrl.includes('leads');
+    const isSuccess = bodyText.includes('lead') || postSubmitUrl.includes('leads');
 
     if (isSuccess) console.log("form submitted");
 
