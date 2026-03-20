@@ -108,8 +108,7 @@ export async function pushToCRM(lead) {
   
   try {
     // Reset page before use
-    await page.goto("about:blank");
-    await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
     console.log("STEP: Page opened");
 
     // Hard session check
@@ -122,7 +121,7 @@ export async function pushToCRM(lead) {
 
     console.log('[CRM] Selecting Organisation...');
     // Wait for React to finish rendering the dropdown inputs
-    await page.waitForSelector('.disco-select__control input', { timeout: 20000 });
+    await page.waitForSelector('.disco-select__control input', { timeout: 30000 });
     console.log('[CRM] Disco-selects are rendered');
 
     const orgInputHandle = await page.evaluateHandle(() => {
