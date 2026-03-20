@@ -141,7 +141,7 @@ function parseCookies(raw) {
 // refresh to complete, so the CRM form navigation is already authenticated.
 async function waitForTokenRefresh(page, timeoutMs = 20000) {
   console.log('[CRM] Navigating to Refrens homepage to trigger __rt → __at exchange...');
-  await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto('https://www.refrens.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   try {
     await page.waitForFunction(
@@ -209,7 +209,7 @@ export async function pushToCRM(lead) {
     }
 
     // ── 3. Now navigate to the CRM form (already authenticated) ─────────────
-    await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
+    await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     console.log("STEP: Page opened");
 
     const finalUrl = page.url();
