@@ -109,7 +109,7 @@ export async function pushToCRM(lead) {
   try {
     // Reset page before use
     await page.goto("about:blank");
-    await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     console.log("STEP: Page opened");
 
     // Hard session check
