@@ -19,6 +19,22 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok' });
 });
 
+// Export Refrens cookies from the current Puppeteer session
+// Use: curl https://relive-cure-backend.onrender.com/api/export-refrens-cookies -H "x-crm-key: ..."
+// Paste the output as REFRENS_COOKIES env var on Render
+app.get('/api/export-refrens-cookies', async (req, res) => {
+    if (req.headers['x-crm-key'] !== CRM_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+        const { getBrowserCookies } = await import('./crm-automation.js');
+        const cookies = await getBrowserCookies();
+        res.json({ cookies });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Production Ingestion API — CRM Push with dedup guard
 app.post('/api/push-to-crm-form', async (req, res) => {
 

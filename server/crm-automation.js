@@ -98,6 +98,20 @@ async function fillField(page, selector, value) {
   }
 }
 
+// Export current Puppeteer session cookies (called from /api/export-refrens-cookies)
+export async function getBrowserCookies() {
+  const browser = await getBrowser();
+  const pages = await browser.pages();
+  const page = pages.length ? pages[0] : await browser.newPage();
+  // Navigate to refrens.com to get its cookies
+  if (!page.url().includes('refrens.com')) {
+    await page.goto('https://www.refrens.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  }
+  const cookies = await page.cookies();
+  console.log('[CRM] Exported', cookies.length, 'cookies');
+  return cookies;
+}
+
 export async function pushToCRM(lead) {
   console.log("[CRM] Starting push for:", lead.phone_number);
   if (!lead.id) lead.id = crypto.randomUUID();
@@ -107,7 +121,20 @@ export async function pushToCRM(lead) {
   const page = pages.length ? pages[0] : await browser.newPage();
   
   try {
-    // Reset page before use
+    // Inject saved session cookies before navigating
+    const cookiesJson = process.env.REFRENS_COOKIES;
+    if (cookiesJson) {
+      try {
+        const cookies = JSON.parse(cookiesJson);
+        await page.setCookie(...cookies);
+        console.log('[CRM] Session cookies restored from env var');
+      } catch (e) {
+        console.warn('[CRM] Failed to parse REFRENS_COOKIES:', e.message);
+      }
+    } else {
+      console.warn('[CRM] REFRENS_COOKIES not set — will attempt without session');
+    }
+
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
     console.log("STEP: Page opened");
 
@@ -119,10 +146,16 @@ export async function pushToCRM(lead) {
     console.log('[CRM DEBUG] Title:', pageTitle);
     console.log('[CRM DEBUG] Body sample:', pageText.replace(/\n/g, ' '));
 
-    // Hard session check
-    if (finalUrl.includes("login") || finalUrl.includes("signin") || finalUrl.includes("auth")) {
-      throw new Error("Session expired - login required");
+    // Detect login page — Refrens shows login at same URL without redirect
+    const isLoginPage = pageTitle.toLowerCase().includes('login') ||
+                        pageTitle.includes('401') ||
+                        pageText.toLowerCase().includes('sign in with google') ||
+                        finalUrl.includes('/login') || finalUrl.includes('/signin');
+
+    if (isLoginPage) {
+      throw new Error('Session expired — update REFRENS_COOKIES env var on Render with fresh cookies');
     }
+
     console.log("crm opened without login");
 
     await new Promise(r => setTimeout(r, 2500));
