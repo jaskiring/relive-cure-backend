@@ -139,9 +139,9 @@ function parseCookies(raw) {
 // Refrens JS performs a silent token refresh on app boot. This function
 // navigates to the Refrens homepage (not the CRM form) and waits for that
 // refresh to complete, so the CRM form navigation is already authenticated.
-async function waitForTokenRefresh(page, timeoutMs = 20000) {
+async function waitForTokenRefresh(page, timeoutMs = 30000) {
   console.log('[CRM] Navigating to Refrens homepage to trigger __rt → __at exchange...');
-  await page.goto('https://www.refrens.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   try {
     await page.waitForFunction(
