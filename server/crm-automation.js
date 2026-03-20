@@ -163,7 +163,24 @@ export async function pushToCRM(lead) {
                         finalUrl.includes('/login') || finalUrl.includes('/signin');
 
     if (isLoginPage) {
-      throw new Error('Session expired — update REFRENS_COOKIES env var on Render with fresh cookies');
+      console.log('[CRM] Login page detected — waiting for __rt_check auto-refresh...');
+      try {
+        // Refrens uses __rt_check cookie to silently refresh __at token.
+        // Wait up to 12s for the token refresh to complete.
+        await page.waitForFunction(
+          () => !!sessionStorage.getItem('__at'),
+          { timeout: 12000 }
+        );
+        console.log('[CRM] Session refreshed by __rt_check — reloading CRM form...');
+        await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
+        const newTitle = await page.title();
+        if (newTitle.toLowerCase().includes('login') || newTitle.includes('401')) {
+          throw new Error('Session refresh failed — update REFRENS_COOKIES with fresh __rt_check cookie');
+        }
+      } catch (e) {
+        if (e.message.includes('Session refresh failed') || e.message.includes('REFRENS_COOKIES')) throw e;
+        throw new Error('Session expired and __rt_check refresh timed out — re-run: copy(sessionStorage.getItem("__at")) and update REFRENS_TOKEN on Render');
+      }
     }
 
     console.log("crm opened without login");
