@@ -123,13 +123,36 @@ export async function pushToCRM(lead) {
     console.log('[CRM] Selecting Organisation...');
     const orgInputHandle = await page.evaluateHandle(() => {
       const labels = Array.from(document.querySelectorAll('label'));
-      const label = labels.find(l => l.innerText.includes('Prospect Organisation'));
-      if (!label) return null;
+      const label = labels.find(l => l.innerText?.trim().includes('Prospect Organisation'));
+      if (!label) {
+        console.warn('[DOM] Prospect Organisation label not found');
+        return null;
+      }
 
-      // Row-based traversal: Find the row container and the 2nd column
-      const row = label.closest('.css-rxk9pl');
-      const inputCol = row ? row.children[1] : null;
-      return inputCol ? inputCol.querySelector('.disco-select__control input') : null;
+      // Strategy 1: Row-based traversal with any row container
+      const possibleRowSelectors = ['.css-rxk9pl', '[class*="row"]', '[class*="field"]', '[class*="form-group"]'];
+      for (const sel of possibleRowSelectors) {
+        const row = label.closest(sel);
+        if (row) {
+          const input = row.querySelector('.disco-select__control input, input[type="text"], input');
+          if (input) return input;
+        }
+      }
+
+      // Strategy 2: Walk up to the parent and find sibling with input
+      let node = label.parentElement;
+      for (let i = 0; i < 5; i++) {
+        if (!node) break;
+        const input = node.querySelector('.disco-select__control input');
+        if (input) return input;
+        node = node.parentElement;
+      }
+
+      // Strategy 3: Find the nearest react-select control after the label
+      const allInputs = Array.from(document.querySelectorAll('.disco-select__control input'));
+      if (allInputs.length > 0) return allInputs[0]; // First org dropdown
+
+      return null;
     });
 
     const orgInput = orgInputHandle.asElement();
