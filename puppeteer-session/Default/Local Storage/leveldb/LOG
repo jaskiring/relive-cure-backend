@@ -1,5 +1,3 @@
-2026/03/19-13:05:05.949 1d20bd Reusing MANIFEST /Users/jaskiring/Relive cure v2/puppeteer-session/Default/Local Storage/leveldb/MANIFEST-000001
-2026/03/19-13:05:05.955 1d20bd Recovering log #30
-2026/03/19-13:05:05.956 1d20bd Reusing old log /Users/jaskiring/Relive cure v2/puppeteer-session/Default/Local Storage/leveldb/000030.log 
-2026/03/19-13:05:21.555 1d20bd Level-0 table #33: started
-2026/03/19-13:05:21.580 1d20bd Level-0 table #33: 74579 bytes OK
+2026/03/19-23:58:45.997 2a5c21 Reusing MANIFEST /Users/jaskiring/Relive cure v2/puppeteer-session/Default/Local Storage/leveldb/MANIFEST-000001
+2026/03/19-23:58:45.998 2a5c21 Recovering log #42
+2026/03/19-23:58:45.999 2a5c21 Reusing old log /Users/jaskiring/Relive cure v2/puppeteer-session/Default/Local Storage/leveldb/000042.log 

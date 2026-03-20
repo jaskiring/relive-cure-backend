@@ -75,12 +75,12 @@ async function getBrowser() {
 }
 
 const SEL = {
-  contactName:  'input[name="contact.name"]',
+  contactName: 'input[name="contact.name"]',
   contactPhone: 'input[name="contact.phone"]',
   customerCity: 'input[name="customer.city"]',
-  subject:      'input[name="subject"]',
-  details:      'textarea[name="details"]',
-  submit:       'button[type="submit"]',
+  subject: 'input[name="subject"]',
+  details: 'textarea[name="details"]',
+  submit: 'button[type="submit"]',
   vPhoneNumber: 'input[name="vendorFields.1.value"]',
 };
 
@@ -285,17 +285,16 @@ export async function pushToCRM(lead) {
       const container = input.closest('.disco-select');
       return container ? container.querySelector('.disco-select__single-value')?.innerText : '';
     }, orgInput);
-
     const orgValue = await selectedOrgHandle.jsonValue();
     if (!orgValue || orgValue.length < 2) throw new Error("Organisation not selected");
     console.log("STEP: Organisation selected:", orgValue);
 
     // ── 6. Fill fields ───────────────────────────────────────────────────────
-    await fillField(page, SEL.contactName,  lead.contact_name || lead.name || 'Session Test');
+    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
     await fillField(page, SEL.contactPhone, lead.phone_number);
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject,      `LASIK Session Test - ${lead.phone_number}`);
-    await fillField(page, SEL.details,      `Session persistence test | phone=${lead.phone_number}`);
+    await fillField(page, SEL.subject, `LASIK Session Test - ${lead.phone_number}`);
+    await fillField(page, SEL.details, `Session persistence test | phone=${lead.phone_number}`);
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
     console.log("STEP: Fields filled");
     await new Promise(r => setTimeout(r, 1500));
