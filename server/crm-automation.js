@@ -121,18 +121,28 @@ export async function pushToCRM(lead) {
   const page = pages.length ? pages[0] : await browser.newPage();
   
   try {
-    // Inject saved session cookies before navigating
+    // Inject session cookies (activeBusiness, __rt_check etc)
     const cookiesJson = process.env.REFRENS_COOKIES;
     if (cookiesJson) {
       try {
         const cookies = JSON.parse(cookiesJson);
         await page.setCookie(...cookies);
-        console.log('[CRM] Session cookies restored from env var');
+        console.log('[CRM] Session cookies restored');
       } catch (e) {
         console.warn('[CRM] Failed to parse REFRENS_COOKIES:', e.message);
       }
+    }
+
+    // Inject the __at JWT token into sessionStorage BEFORE the page loads
+    // Refrens reads auth from sessionStorage.__at on app boot
+    const refrensToken = process.env.REFRENS_TOKEN;
+    if (refrensToken) {
+      await page.evaluateOnNewDocument((token) => {
+        sessionStorage.setItem('__at', token);
+      }, refrensToken);
+      console.log('[CRM] Session token injected via evaluateOnNewDocument');
     } else {
-      console.warn('[CRM] REFRENS_COOKIES not set — will attempt without session');
+      console.warn('[CRM] REFRENS_TOKEN not set — session will likely fail');
     }
 
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
