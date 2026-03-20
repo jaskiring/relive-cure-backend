@@ -9,3 +9,6 @@ inspect-schema.mjs
 verify_*.js
 dist/
 .venv/
+
+puppeteer-session/
+puppeteer-session-v2/
