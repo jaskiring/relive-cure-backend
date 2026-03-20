@@ -121,6 +121,10 @@ export async function pushToCRM(lead) {
     await new Promise(r => setTimeout(r, 2500));
 
     console.log('[CRM] Selecting Organisation...');
+    // Wait for React to finish rendering the dropdown inputs
+    await page.waitForSelector('.disco-select__control input', { timeout: 20000 });
+    console.log('[CRM] Disco-selects are rendered');
+
     const orgInputHandle = await page.evaluateHandle(() => {
       const labels = Array.from(document.querySelectorAll('label'));
       const label = labels.find(l => l.innerText?.trim().includes('Prospect Organisation'));
@@ -129,28 +133,27 @@ export async function pushToCRM(lead) {
         return null;
       }
 
-      // Strategy 1: Row-based traversal with any row container
-      const possibleRowSelectors = ['.css-rxk9pl', '[class*="row"]', '[class*="field"]', '[class*="form-group"]'];
-      for (const sel of possibleRowSelectors) {
-        const row = label.closest(sel);
-        if (row) {
-          const input = row.querySelector('.disco-select__control input, input[type="text"], input');
-          if (input) return input;
-        }
-      }
-
-      // Strategy 2: Walk up to the parent and find sibling with input
-      let node = label.parentElement;
-      for (let i = 0; i < 5; i++) {
-        if (!node) break;
-        const input = node.querySelector('.disco-select__control input');
+      // Strategy 1: Navigate up to .css-rxk9pl row, then get the input in sibling column
+      const row = label.closest('.css-rxk9pl');
+      if (row) {
+        const input = row.querySelector('.disco-select__control input');
         if (input) return input;
-        node = node.parentElement;
       }
 
-      // Strategy 3: Find the nearest react-select control after the label
-      const allInputs = Array.from(document.querySelectorAll('.disco-select__control input'));
-      if (allInputs.length > 0) return allInputs[0]; // First org dropdown
+      // Strategy 2: Proximity via getBoundingClientRect — find closest disco-select to label
+      const labelRect = label.getBoundingClientRect();
+      const allControls = Array.from(document.querySelectorAll('.disco-select__control'));
+      let closest = null;
+      let minDist = Infinity;
+      for (const ctrl of allControls) {
+        const rect = ctrl.getBoundingClientRect();
+        const dist = Math.abs(rect.top - labelRect.top) + Math.abs(rect.left - labelRect.left);
+        if (dist < minDist) { minDist = dist; closest = ctrl; }
+      }
+      if (closest) {
+        const input = closest.querySelector('input');
+        if (input) return input;
+      }
 
       return null;
     });
