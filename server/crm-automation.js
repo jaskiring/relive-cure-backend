@@ -9,21 +9,39 @@ const USER_DATA_DIR = process.env.PUPPETEER_SESSION_DIR || "./puppeteer-session"
 let browserInstance = null;
 
 async function ensureChrome() {
-  if (process.env.PUPPETEER_CACHE_DIR) {
-    process.env.PUPPETEER_CACHE_DIR = process.env.PUPPETEER_CACHE_DIR;
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.cache/puppeteer';
+  
+  // First check our custom cache directory directly
+  const customPaths = [
+    `${cacheDir}/chrome/linux-146.0.7680.76/chrome-linux64/chrome`,
+    `${cacheDir}/chrome/linux-*/chrome-linux64/chrome`,
+  ];
+  
+  // Use glob-style search in the cache dir
+  try {
+    const { execSync: exec } = await import('child_process');
+    const found = exec(`find ${cacheDir} -name "chrome" -type f 2>/dev/null | head -1`, { encoding: 'utf8' }).trim();
+    if (found && fs.existsSync(found)) {
+      console.log('[CRM] Chrome found in custom cache:', found);
+      return found;
+    }
+  } catch (e) {
+    console.warn('[CRM] Cache dir search failed:', e.message);
   }
 
+  // Try puppeteer's own executablePath
   try {
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
       console.log('[CRM] Chrome found at:', path);
       return path;
     }
-    console.warn('[CRM] Chrome not found at expected path:', path);
+    console.warn('[CRM] Chrome not found at puppeteer path:', path);
   } catch (e) {
     console.warn('[CRM] executablePath() error:', e.message);
   }
 
+  // Try system Chrome
   const systemPaths = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
@@ -37,6 +55,7 @@ async function ensureChrome() {
     }
   }
 
+  // Install Chrome as last resort
   console.log('[CRM] Chrome missing — installing now...');
   try {
     execSync('npx puppeteer browsers install chrome', {
@@ -44,9 +63,18 @@ async function ensureChrome() {
       timeout: 120000,
       env: {
         ...process.env,
-        PUPPETEER_CACHE_DIR: process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.cache/puppeteer'
+        PUPPETEER_CACHE_DIR: cacheDir
       }
     });
+    // Search again after install
+    try {
+      const { execSync: exec } = await import('child_process');
+      const found = exec(`find ${cacheDir} -name "chrome" -type f 2>/dev/null | head -1`, { encoding: 'utf8' }).trim();
+      if (found && fs.existsSync(found)) {
+        console.log('[CRM] Chrome installed and found at:', found);
+        return found;
+      }
+    } catch (e) {}
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
       console.log('[CRM] Chrome installed successfully:', path);
