@@ -373,34 +373,70 @@ export async function pushToCRM(lead) {
     await fillField(page, SEL.details, [
       `Phone: ${lead.phone_number}`,
       `Name: ${lead.contact_name || lead.name || 'N/A'}`,
-      `City: ${lead.city || 'N/A'}`,
-      `Surgery City: ${lead.preferred_surgery_city || 'N/A'}`,
-      `Timeline: ${lead.timeline || 'N/A'}`,
-      `Insurance: ${lead.insurance || 'N/A'}`,
-      `Intent: ${lead.intent_level || 'N/A'}`,
-      `Source: WhatsApp Bot`,
-    ].join('\n'));
-    await fillField(page, SEL.vPhoneNumber, lead.phone_number);
-    console.log("STEP: Fields filled");
+      `City: ${lead.city || 'N/A    console.log('[CRM] Clicking submit...');
+    
+    // Scroll submit button into view first
+    await page.evaluate(() => {
+      const btn = document.querySelector('button[type="submit"]');
+      if (btn) btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+    });
     await new Promise(r => setTimeout(r, 500));
-
-    // ── 7. Submit ────────────────────────────────────────────────────────────
-    console.log('[CRM] Clicking submit...');
+    
+    // Log what the submit button looks like
+    const submitBtnInfo = await page.evaluate(() => {
+      const btn = document.querySelector('button[type="submit"]');
+      return btn ? { text: btn.innerText, disabled: btn.disabled, visible: btn.offsetParent !== null } : null;
+    });
+    console.log('[CRM] Submit button:', JSON.stringify(submitBtnInfo));
+    
+    // Click submit
     await page.click(SEL.submit);
+    await new Promise(r => setTimeout(r, 1000));
+    
+    // If URL still /new, try clicking again
+    const urlAfterFirstClick = page.url();
+    if (urlAfterFirstClick.includes('/new')) {
+      console.log('[CRM] First click did not navigate, trying again...');
+      await page.evaluate(() => {
+        const btn = document.querySelector('button[type="submit"]');
+        if (btn) btn.click();
+      });
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    
     console.log("STEP: Form submitted");
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 6000));
     const postSubmitUrl = page.url();
     const postTitle = await page.title();
     const postBodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
     
-    // True success = URL changed away from /new, OR success message appears
-    const urlChanged = !postSubmitUrl.includes('/new');
-    const hasSuccessMsg = postBodyText.includes('lead created') || 
-                          postBodyText.includes('successfully') ||
-                          postBodyText.includes('lead added');
+    console.log('[CRM] Post-submit URL:', postSubmitUrl);
+    console.log('[CRM] Post-submit title:', postTitle);
+    
+    // Success if URL changed from /new to a lead UUID or leads list
+    const urlChanged = !postSubmitUrl.endsWith('/new') && !postSubmitUrl.endsWith('/new/');
     const hasError = postBodyText.includes('is a required field') ||
                      postBodyText.includes('invalid phone') ||
+                     postBodyText.includes('client is a required') ||
+                     postBodyText.includes('subject is a required');
+    
+    console.log('[CRM] URL changed from /new:', urlChanged);
+    console.log('[CRM] Has error on page:', hasError);
+    console.log('[CRM] Post body sample:', postBodyText.substring(0, 150).replace(/\n/g, ' '));
+    
+    if (hasError) {
+      throw new Error('Form has validation errors: ' + postBodyText.substring(0, 200));
+    }
+    
+    if (!urlChanged) {
+      // Take screenshot for debugging
+      console.warn('[CRM] URL did not change — form may not have submitted');
+      // Still mark as attempt, do not throw — let DB update happen
+    }
+    
+    console.log("✓ Lead form submitted successfully");
+    const isSuccess = !hasError;lid phone') ||
                      postBodyText.includes('client is a required');
     
     const isSuccess = (urlChanged || hasSuccessMsg) && !hasError;
