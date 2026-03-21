@@ -1,0 +1,4 @@
+puppeteer-session/
+puppeteer-session-v2/
+node_modules/
+.env
