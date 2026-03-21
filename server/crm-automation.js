@@ -9,6 +9,10 @@ const USER_DATA_DIR = "./puppeteer-session";
 let browserInstance = null;
 
 async function ensureChrome() {
+  if (process.env.PUPPETEER_CACHE_DIR) {
+    process.env.PUPPETEER_CACHE_DIR = process.env.PUPPETEER_CACHE_DIR;
+  }
+
   try {
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
@@ -37,7 +41,11 @@ async function ensureChrome() {
   try {
     execSync('npx puppeteer browsers install chrome', {
       stdio: 'inherit',
-      timeout: 120000
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PUPPETEER_CACHE_DIR: process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.cache/puppeteer'
+      }
     });
     const path = puppeteer.executablePath();
     if (fs.existsSync(path)) {
@@ -57,7 +65,7 @@ async function getBrowser() {
     console.log("Using session dir:", USER_DATA_DIR);
     const executablePath = await ensureChrome();
     browserInstance = await puppeteer.launch({
-      headless: true,
+      headless: false,
       slowMo: 0,
       ...(executablePath ? { executablePath } : {}),
       userDataDir: USER_DATA_DIR,
@@ -209,7 +217,8 @@ export async function pushToCRM(lead) {
     }
 
     // ── 3. Now navigate to the CRM form (already authenticated) ─────────────
-    await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
+    await new Promise(r => setTimeout(r, 3000)); // wait for React to fully hydrate
     console.log("STEP: Page opened");
 
     const finalUrl = page.url();
@@ -218,6 +227,14 @@ export async function pushToCRM(lead) {
     console.log('[CRM DEBUG] URL:', finalUrl);
     console.log('[CRM DEBUG] Title:', pageTitle);
     console.log('[CRM DEBUG] Body sample:', pageText.replace(/\n/g, ' '));
+
+    // Guard: if page is blank, React didn't hydrate — fail loudly instead of silently
+    if (!pageTitle || pageTitle.trim() === '' || pageText === 'NO BODY') {
+      throw new Error(
+        'CRM page loaded blank — React SPA did not hydrate on time. ' +
+        'Check if __at token is valid and Refrens is accessible from Render.'
+      );
+    }
 
     // ── 4. Sanity check — should not land on login page anymore ─────────────
     const isLoginPage =
@@ -241,60 +258,84 @@ export async function pushToCRM(lead) {
 
     // ── 5. Select Organisation ───────────────────────────────────────────────
     console.log('[CRM] Selecting Organisation...');
-    await page.waitForSelector('.disco-select__control input', { timeout: 30000 });
-    console.log('[CRM] Disco-selects rendered');
+    await page.waitForSelector('.disco-select__control', { timeout: 30000 });
+    await new Promise(r => setTimeout(r, 2000));
 
-    const orgInputHandle = await page.evaluateHandle(() => {
-      const labels = Array.from(document.querySelectorAll('label'));
-      const label = labels.find(l => l.innerText?.trim().includes('Prospect Organisation'));
-      if (!label) return null;
-
-      const row = label.closest('.css-rxk9pl');
-      if (row) {
-        const input = row.querySelector('.disco-select__control input');
-        if (input) return input;
-      }
-
-      const labelRect = label.getBoundingClientRect();
-      const allControls = Array.from(document.querySelectorAll('.disco-select__control'));
-      let closest = null, minDist = Infinity;
-      for (const ctrl of allControls) {
-        const rect = ctrl.getBoundingClientRect();
-        const dist = Math.abs(rect.top - labelRect.top) + Math.abs(rect.left - labelRect.left);
-        if (dist < minDist) { minDist = dist; closest = ctrl; }
-      }
-      return closest ? closest.querySelector('input') : null;
-    });
-
-    const orgInput = orgInputHandle.asElement();
-    if (!orgInput) throw new Error("Could not find Prospect Organisation input via label");
-
-    await orgInput.click();
-    await page.keyboard.down('Control');
-    await page.keyboard.press('A');
-    await page.keyboard.up('Control');
-    await page.keyboard.press('Backspace');
-    await new Promise(r => setTimeout(r, 300));
-    await page.keyboard.type('r');
-    await new Promise(r => setTimeout(r, 1200));
-    await page.keyboard.press('ArrowDown');
-    await page.keyboard.press('Enter');
+    // Prospect Organisation is confirmed as disco-select index 1
+    const controls = await page.$$('.disco-select__control');
+    if (controls.length < 2) throw new Error('Expected at least 2 disco-selects, found: ' + controls.length);
+    
+    const orgControl = controls[1]; // index 1 = Prospect Organisation
+    
+    // Click the control first
+    await orgControl.click();
+    await new Promise(r => setTimeout(r, 500));
+    
+    // Then click the input inside it
+    const orgInput = await orgControl.$('input');
+    if (orgInput) {
+      await orgInput.click();
+      await new Promise(r => setTimeout(r, 300));
+    }
+    
+    // Type to search
+    await page.keyboard.type('R', { delay: 200 });
     await new Promise(r => setTimeout(r, 1500));
-
-    const selectedOrgHandle = await page.evaluateHandle((input) => {
-      const container = input.closest('.disco-select');
-      return container ? container.querySelector('.disco-select__single-value')?.innerText : '';
-    }, orgInput);
-    const orgValue = await selectedOrgHandle.jsonValue();
-    if (!orgValue || orgValue.length < 2) throw new Error("Organisation not selected");
-    console.log("STEP: Organisation selected:", orgValue);
+    
+    // Check if options appeared
+    const options = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('.disco-select__option'))
+        .map(o => o.innerText?.trim());
+    });
+    console.log('[CRM] Options after typing R:', JSON.stringify(options));
+    
+    if (options.length > 0) {
+      // Click first option — any organisation is fine
+      await page.evaluate(() => {
+        const opt = document.querySelector('.disco-select__option');
+        if (opt) opt.click();
+      });
+    } else {
+      // Fallback: open dropdown and pick first option with ArrowDown
+      await page.keyboard.press('ArrowDown');
+      await new Promise(r => setTimeout(r, 500));
+      await page.keyboard.press('Enter');
+    }
+    
+    await new Promise(r => setTimeout(r, 1000));
+    
+    // Accept ANY selected value — organisation field just needs to be filled
+    const orgValue = await page.evaluate(() => {
+      const controls = Array.from(document.querySelectorAll('.disco-select__control'));
+      const orgCtrl = controls[1];
+      return orgCtrl?.querySelector('[class*="single-value"]')?.innerText?.trim() || '';
+    });
+    
+    console.log('[CRM] Organisation selected:', orgValue);
+    if (!orgValue || orgValue.length < 2) throw new Error('Organisation still empty after selection attempt');
+    console.log('STEP: Organisation selected:', orgValue);
 
     // ── 6. Fill fields ───────────────────────────────────────────────────────
     await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
-    await fillField(page, SEL.contactPhone, lead.phone_number);
+    const cleanPhone = (lead.phone_number || '')
+      .replace(/^\+91/, '')
+      .replace(/^91(?=\d{10})/, '')
+      .trim();
+    
+    await fillField(page, SEL.contactPhone, cleanPhone);
+    await page.waitForSelector(SEL.customerCity, { timeout: 8000 });
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject, `LASIK Session Test - ${lead.phone_number}`);
-    await fillField(page, SEL.details, `Session persistence test | phone=${lead.phone_number}`);
+    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
+    await fillField(page, SEL.details, [
+      `Phone: ${lead.phone_number}`,
+      `Name: ${lead.contact_name || lead.name || 'N/A'}`,
+      `City: ${lead.city || 'N/A'}`,
+      `Surgery City: ${lead.preferred_surgery_city || 'N/A'}`,
+      `Timeline: ${lead.timeline || 'N/A'}`,
+      `Insurance: ${lead.insurance || 'N/A'}`,
+      `Intent: ${lead.intent_level || 'N/A'}`,
+      `Source: WhatsApp Bot`,
+    ].join('\n'));
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
     console.log("STEP: Fields filled");
     await new Promise(r => setTimeout(r, 1500));
@@ -306,9 +347,29 @@ export async function pushToCRM(lead) {
 
     await new Promise(r => setTimeout(r, 4000));
     const postSubmitUrl = page.url();
-    const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
-    const isSuccess = bodyText.includes('lead') || postSubmitUrl.includes('leads');
-    if (isSuccess) console.log("✓ Lead form submitted successfully");
+    const postTitle = await page.title();
+    const postBodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
+    
+    // True success = URL changed away from /new, OR success message appears
+    const urlChanged = !postSubmitUrl.includes('/new');
+    const hasSuccessMsg = postBodyText.includes('lead created') || 
+                          postBodyText.includes('successfully') ||
+                          postBodyText.includes('lead added');
+    const hasError = postBodyText.includes('is a required field') ||
+                     postBodyText.includes('invalid phone') ||
+                     postBodyText.includes('client is a required');
+    
+    const isSuccess = (urlChanged || hasSuccessMsg) && !hasError;
+    
+    console.log('[CRM] Post-submit URL:', postSubmitUrl);
+    console.log('[CRM] Post-submit title:', postTitle);
+    console.log('[CRM] URL changed from /new:', urlChanged);
+    console.log('[CRM] Has error on page:', hasError);
+    
+    if (!isSuccess) {
+      throw new Error('Form submission failed — page still shows errors or URL did not change. Body: ' + postBodyText.substring(0, 200));
+    }
+    console.log("✓ Lead form submitted successfully");
 
     return { success: isSuccess, id: lead.id, selectedOrg: orgValue };
 
