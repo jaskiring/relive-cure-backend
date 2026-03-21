@@ -54,6 +54,7 @@ export const ingestLead = async (supabaseClient, leadData) => {
     }
 
     const parameters_completed = calculateParametersCompleted(leadData);
+    const intent_score = parameters_completed;
 
     let remarks = leadData.remarks || '';
     if (bot_fallback) {
@@ -71,6 +72,7 @@ export const ingestLead = async (supabaseClient, leadData) => {
         source: 'chatbot',
         lead_type,
         parameters_completed,
+        intent_score,
         last_user_message: (last_user_message || '').substring(0, 1000),
         user_questions,
         bot_fallback,
