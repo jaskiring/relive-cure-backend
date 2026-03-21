@@ -1,3 +1,12 @@
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chart-card {
+  animation: fadeInUp 0.5s ease-out;
+}
+
 .counter {
   font-size: 16px;
   padding: 5px 10px;
