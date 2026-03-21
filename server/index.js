@@ -155,6 +155,26 @@ app.get('/api/check-lead/:phone', async (req, res) => {
     }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[API] Production Server running on port ${PORT}`);
+app.delete('/api/leads/:id', async (req, res) => {
+  const apiKey = req.headers['x-crm-key'];
+  if (apiKey !== CRM_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const { id } = req.params;
+    const { error } = await supabaseAdmin
+      .from('leads_surgery')
+      .delete()
+      .eq('id', id);
+    
+    if (error) throw error;
+    res.json({ success: true, deleted: id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[API] Production Server running on port ${PORT}`);
+});
+
