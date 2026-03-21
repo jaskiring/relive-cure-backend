@@ -155,6 +155,6 @@ app.get('/api/check-lead/:phone', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`[API] Production Server running on port ${PORT}`);
 });
