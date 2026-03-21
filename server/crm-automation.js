@@ -99,10 +99,25 @@ async function getBrowser() {
       userDataDir: USER_DATA_DIR,
       defaultViewport: null,
       args: [
-        "--start-maximized",
         "--no-sandbox",
         "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--hide-scrollbars",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-first-run",
+        "--safebrowsing-disable-auto-update",
+        "--single-process",
+        "--memory-pressure-off",
+        "--js-flags=--max-old-space-size=256",
+        "--start-maximized"
       ],
       timeout: 60000
     });
@@ -281,13 +296,14 @@ export async function pushToCRM(lead) {
     }
 
     console.log("CRM opened without login ✓");
+    console.log('[CRM] Memory usage:', JSON.stringify(process.memoryUsage()));
 
-    await new Promise(r => setTimeout(r, 2500));
+    await new Promise(r => setTimeout(r, 1000));
 
     // ── 5. Select Organisation ───────────────────────────────────────────────
     console.log('[CRM] Selecting Organisation...');
     await page.waitForSelector('.disco-select__control', { timeout: 30000 });
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 800));
 
     // Prospect Organisation is confirmed as disco-select index 1
     const controls = await page.$$('.disco-select__control');
@@ -366,14 +382,14 @@ export async function pushToCRM(lead) {
     ].join('\n'));
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
     console.log("STEP: Fields filled");
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 500));
 
     // ── 7. Submit ────────────────────────────────────────────────────────────
     console.log('[CRM] Clicking submit...');
     await page.click(SEL.submit);
     console.log("STEP: Form submitted");
 
-    await new Promise(r => setTimeout(r, 4000));
+    await new Promise(r => setTimeout(r, 2000));
     const postSubmitUrl = page.url();
     const postTitle = await page.title();
     const postBodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
