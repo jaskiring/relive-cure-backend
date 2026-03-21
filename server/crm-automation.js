@@ -4,7 +4,7 @@ import fs from 'fs';
 import { execSync } from 'child_process';
 
 const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/relivecure/leads/new';
-const USER_DATA_DIR = "./puppeteer-session";
+const USER_DATA_DIR = process.env.PUPPETEER_SESSION_DIR || "./puppeteer-session";
 
 let browserInstance = null;
 
@@ -65,7 +65,7 @@ async function getBrowser() {
     console.log("Using session dir:", USER_DATA_DIR);
     const executablePath = await ensureChrome();
     browserInstance = await puppeteer.launch({
-      headless: false,
+      headless: true,
       slowMo: 0,
       ...(executablePath ? { executablePath } : {}),
       userDataDir: USER_DATA_DIR,
