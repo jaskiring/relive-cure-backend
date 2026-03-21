@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "chromium", "nss", "freetype", "harfbuzz", "ca-certificates", "wget"]
+nixPkgs = ["nodejs_20", "chromium", "nss", "freetype", "harfbuzz", "wget"]
 
 [phases.build]
 cmds = ["npm install", "npx puppeteer browsers install chrome"]
