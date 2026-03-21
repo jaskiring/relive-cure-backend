@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "start": "node server/index.js",
     "server": "node server/index.js",
-    "postinstall": "PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer npx puppeteer browsers install chrome"
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.99.1",
