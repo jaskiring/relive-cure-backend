@@ -2,10 +2,12 @@ services:
   - type: web
     name: relive-cure-backend
     env: node
-    buildCommand: npm install && npx puppeteer browsers install chrome
+    buildCommand: PUPPETEER_CACHE_DIR=/opt/render/project/src/.cache/puppeteer npm install && PUPPETEER_CACHE_DIR=/opt/render/project/src/.cache/puppeteer npx puppeteer browsers install chrome
     startCommand: node server/index.js
     envVars:
       - key: NODE_VERSION
         value: "20"
       - key: PUPPETEER_CACHE_DIR
-        value: "/opt/render/.cache/puppeteer"
+        value: "/opt/render/project/src/.cache/puppeteer"
+      - key: CRM_FORM_URL
+        value: "https://www.refrens.com/app/relivecure/leads/new"
