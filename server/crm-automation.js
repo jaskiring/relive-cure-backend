@@ -350,16 +350,17 @@ export async function pushToCRM(lead) {
     
     // Accept ANY selected value — organisation field just needs to be filled
     const orgValue = await page.evaluate(() => {
-      const controls = Array.from(document.querySelectorAll('.disco-select__control'));
-      const orgCtrl = controls[1];
-      return orgCtrl?.querySelector('[class*="single-value"]')?.innerText?.trim() || '';
-    });
+      const controls = Array.from(document.querySelectorAll('.disco-select__con    // ── 6. Fill fields ───────────────────────────────────────────────────────
+    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
+    const cleanPhone = (lead.phone_number || '')
+      .replace(/^\+91/, '')
+      .replace(/^91(?=\d{10})/, '')
+      .trim();
     
-    console.log('[CRM] Organisation selected:', orgValue);
-    if (!orgValue || orgValue.length < 2) throw new Error('Organisation still empty after selection attempt');
-    console.log('STEP: Organisation selected:', orgValue);
-
-    // ── 6. Fill fields ────────────────────────────────    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
+    await fillField(page, SEL.contactPhone, cleanPhone);
+    await page.waitForSelector(SEL.customerCity, { timeout: 8000 });
+    await fillField(page, SEL.customerCity, lead.city || 'Delhi');
+    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
     await fillField(page, SEL.details, [
       `Phone: ${lead.phone_number}`,
       `Name: ${lead.contact_name || lead.name || 'N/A'}`,
@@ -439,6 +440,8 @@ export async function pushToCRM(lead) {
     
     console.log("✓ Lead form submitted successfully");
     const isSuccess = !hasError;
+
+    return { success: isSuccess, id: lead.id, selectedOrg: orgValue };Error;
 
     return { success: isSuccess, id: lead.id, selectedOrg: orgValue };mit URL:', postSubmitUrl);
     console.log('[CRM] Post-submit title:', postTitle);
