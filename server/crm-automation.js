@@ -359,21 +359,23 @@ export async function pushToCRM(lead) {
     if (!orgValue || orgValue.length < 2) throw new Error('Organisation still empty after selection attempt');
     console.log('STEP: Organisation selected:', orgValue);
 
-    // ── 6. Fill fields ───────────────────────────────────────────────────────
-    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
-    const cleanPhone = (lead.phone_number || '')
-      .replace(/^\+91/, '')
-      .replace(/^91(?=\d{10})/, '')
-      .trim();
-    
-    await fillField(page, SEL.contactPhone, cleanPhone);
-    await page.waitForSelector(SEL.customerCity, { timeout: 8000 });
-    await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
+    // ── 6. Fill fields ────────────────────────────────    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
     await fillField(page, SEL.details, [
       `Phone: ${lead.phone_number}`,
       `Name: ${lead.contact_name || lead.name || 'N/A'}`,
-      `City: ${lead.city || 'N/A    console.log('[CRM] Clicking submit...');
+      `City: ${lead.city || 'N/A'}`,
+      `Surgery City: ${lead.preferred_surgery_city || 'N/A'}`,
+      `Timeline: ${lead.timeline || 'N/A'}`,
+      `Insurance: ${lead.insurance || 'N/A'}`,
+      `Intent: ${lead.intent_level || 'N/A'}`,
+      `Source: WhatsApp Bot`,
+    ].join('\n'));
+    await fillField(page, SEL.vPhoneNumber, lead.phone_number);
+    console.log("STEP: Fields filled");
+    await new Promise(r => setTimeout(r, 500));
+
+    // ── 7. Submit ────────────────────────────────────────────────────────────
+    console.log('[CRM] Clicking submit...');
     
     // Scroll submit button into view first
     await page.evaluate(() => {
@@ -436,12 +438,9 @@ export async function pushToCRM(lead) {
     }
     
     console.log("✓ Lead form submitted successfully");
-    const isSuccess = !hasError;lid phone') ||
-                     postBodyText.includes('client is a required');
-    
-    const isSuccess = (urlChanged || hasSuccessMsg) && !hasError;
-    
-    console.log('[CRM] Post-submit URL:', postSubmitUrl);
+    const isSuccess = !hasError;
+
+    return { success: isSuccess, id: lead.id, selectedOrg: orgValue };mit URL:', postSubmitUrl);
     console.log('[CRM] Post-submit title:', postTitle);
     console.log('[CRM] URL changed from /new:', urlChanged);
     console.log('[CRM] Has error on page:', hasError);
