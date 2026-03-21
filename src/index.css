@@ -44,9 +44,9 @@
 }
 
 body {
-  background: linear-gradient(135deg, #0f1117 0%, #0a0b0f 100%);
-  min-height: 100vh;
+  background-color: var(--bg-dark);
   color: var(--text-main);
+  min-height: 100vh;
   overflow-x: hidden;
   line-height: 1.5;
 }
@@ -58,12 +58,12 @@ body {
 }
 
 .glass-panel {
-  background: rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 20px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
 }
 
 .metric-card {
@@ -138,9 +138,9 @@ body {
 
 .lead-row td {
   padding: 20px 16px;
-  background: rgba(255, 255, 255, 0.06);
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
 .lead-row td:first-child {
@@ -305,12 +305,10 @@ body {
   align-items: center;
   margin-bottom: 40px;
   padding: 20px;
-  background: rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border-radius: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  background: var(--panel-bg);
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
 }
 
 .fade-in { animation: fadeIn 0.4s ease-out; }
@@ -424,12 +422,9 @@ body {
 
 .action-card {
   padding: 16px;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  border-radius: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--glass-border);
   display: flex;
   align-items: center;
   gap: 12px;
