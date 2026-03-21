@@ -337,7 +337,7 @@ function App() {
   );
 
   const CustomDonut = ({ data, title, colors, type }) => (
-    <div className="chart-card" style={{ display: 'flex', flex: 1, alignItems: 'center', gap: '16px' }}>
+    <div style={{ display: 'flex', flex: 1, alignItems: 'center', gap: '16px' }}>
       <div style={{ height: '140px', width: '140px', position: 'relative' }}>
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
@@ -348,10 +348,7 @@ function App() {
               paddingAngle={5}
               dataKey="value"
               stroke="none"
-              isAnimationActive={true}
-              animationBegin={0}
-              animationDuration={800}
-              animationEasing="ease-out"
+              animationDuration={1000}
               onClick={(e) => handleDashboardFilter(type, e.name, e.name)}
               style={{ cursor: 'pointer' }}
             >
