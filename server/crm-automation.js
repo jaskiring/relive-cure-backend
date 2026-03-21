@@ -255,14 +255,31 @@ export async function pushToCRM(lead) {
       throw new Error(
         '__rt cookie did not produce a valid __at token. ' +
         'Your REFRENS_COOKIES may be expired or missing the __rt cookie. ' +
-        'Please export fresh cookies from your browser and update REFRENS_COOKIES on Render.'
+        'Please export fresh cookies from your browser and update REFRENS_COOKIES.'
       );
     }
 
+    // Capture the token BEFORE navigating away — sessionStorage clears on navigation
+    const capturedToken = await page.evaluate(() => sessionStorage.getItem('__at'));
+    console.log('[CRM] Captured __at token for re-injection, length:', capturedToken?.length);
+
+    // Pre-inject token so it exists when CRM form page loads
+    await page.evaluateOnNewDocument((token) => {
+      try { sessionStorage.setItem('__at', token); } catch(e) {}
+    }, capturedToken);
+
     // ── 3. Now navigate to the CRM form (already authenticated) ─────────────
     await page.goto(CRM_FORM_URL, { waitUntil: 'networkidle2', timeout: 90000 });
-    await new Promise(r => setTimeout(r, 3000)); // wait for React to fully hydrate
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Re-inject token after navigation as well (belt and suspenders)
+    await page.evaluate((token) => {
+      try { sessionStorage.setItem('__at', token); } catch(e) {}
+    }, capturedToken);
+    
+    await new Promise(r => setTimeout(r, 1000));
     console.log("STEP: Page opened");
+
 
     const finalUrl = page.url();
     const pageTitle = await page.title();
