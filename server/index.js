@@ -1,9 +1,29 @@
+// ─── STEP 1: Polyfill fetch BEFORE any other import that uses it ─────────────
+import fetch from 'node-fetch';
+if (!globalThis.fetch) {
+    globalThis.fetch = fetch;
+    console.log('[BOOT] node-fetch polyfill applied');
+} else {
+    // Override anyway to be safe — Render native fetch can silently fail
+    globalThis.fetch = fetch;
+    console.log('[BOOT] node-fetch override applied (replacing native fetch)');
+}
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { ingestLead } from '../src/lib/ingestion.js';
 import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
+
+// ─── STEP 2: Startup env diagnostics ─────────────────────────────────────────
+console.log('═══════════════════════════════════════');
+console.log('[BOOT] ✅ Server starting...');
+console.log('[BOOT] SUPABASE_URL:', process.env.SUPABASE_URL || '❌ MISSING');
+console.log('[BOOT] SUPABASE_KEY LENGTH:', process.env.SUPABASE_SERVICE_ROLE_KEY?.length || '❌ MISSING');
+console.log('[BOOT] CRM_API_KEY SET:', !!process.env.CRM_API_KEY);
+console.log('[BOOT] NODE_VERSION:', process.version);
+console.log('═══════════════════════════════════════');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,14 +34,37 @@ console.log("EXPECTED CRM_API_KEY:", process.env.CRM_API_KEY || CRM_API_KEY);
 app.use(cors());
 app.use(express.json());
 
-// Health check
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', node: process.version, ts: new Date().toISOString() });
 });
 
-// Export Refrens cookies from the current Puppeteer session
-// Use: curl https://relive-cure-backend.onrender.com/api/export-refrens-cookies -H "x-crm-key: ..."
-// Paste the output as REFRENS_COOKIES env var on Render
+// ─── STEP 4: Debug DB connection endpoint ─────────────────────────────────────
+app.get('/test-db', async (req, res) => {
+    console.log('[TEST-DB] Testing Supabase connection...');
+    console.log('[TEST-DB] SUPABASE_URL:', process.env.SUPABASE_URL || 'MISSING');
+    console.log('[TEST-DB] KEY LENGTH:', process.env.SUPABASE_SERVICE_ROLE_KEY?.length || 'MISSING');
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('leads_surgery')
+            .select('id, phone_number, contact_name, created_at')
+            .limit(1);
+
+        if (error) {
+            console.error('[TEST-DB] ❌ DB ERROR:', error);
+            return res.status(500).json({ success: false, error: error.message, details: error });
+        }
+
+        console.log('[TEST-DB] ✅ Connected! Row count probe: ok. Sample:', JSON.stringify(data));
+        return res.json({ success: true, message: 'Supabase connected', sample: data });
+
+    } catch (err) {
+        console.error('[TEST-DB] ❌ FETCH/NETWORK ERROR:', err.message, err.cause || '');
+        return res.status(500).json({ success: false, error: err.message, cause: String(err.cause || '') });
+    }
+});
+
+// ─── Export Refrens cookies from the current Puppeteer session ────────────────
 app.get('/api/export-refrens-cookies', async (req, res) => {
     if (req.headers['x-crm-key'] !== CRM_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -35,7 +78,7 @@ app.get('/api/export-refrens-cookies', async (req, res) => {
     }
 });
 
-// Production Ingestion API — CRM Push with dedup guard
+// ─── CRM Push ─────────────────────────────────────────────────────────────────
 app.post('/api/push-to-crm-form', async (req, res) => {
 
     const crmKey = req.headers['x-crm-key'];
@@ -92,6 +135,7 @@ app.post('/api/push-to-crm-form', async (req, res) => {
     }
 });
 
+// ─── Lead Ingestion ───────────────────────────────────────────────────────────
 app.post('/api/ingest-lead', async (req, res) => {
     const botKey = req.headers['x-bot-key'];
     console.log("🔐 RECEIVED KEY:", botKey);
@@ -109,7 +153,6 @@ app.post('/api/ingest-lead', async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Missing phone_number' });
         }
 
-        // Basic Sanitize
         if (payload.phone_number.length > 20) {
             return res.status(400).json({ status: 'error', message: 'Invalid phone number format' });
         }
@@ -128,10 +171,9 @@ app.post('/api/ingest-lead', async (req, res) => {
     }
 });
 
-// New: Check if lead exists for returning user logic
+// ─── Check Lead (returning user) ──────────────────────────────────────────────
 app.get('/api/check-lead/:phone', async (req, res) => {
     const botKey = req.headers['x-bot-key'];
-    console.log("🔐 RECEIVED KEY:", botKey);
 
     if (botKey !== BOT_SECRET) {
         console.warn(`[API] 🔐 Unauthorized access attempt from IP: ${req.ip}`);
@@ -155,6 +197,7 @@ app.get('/api/check-lead/:phone', async (req, res) => {
     }
 });
 
+// ─── Delete Lead ──────────────────────────────────────────────────────────────
 app.delete('/api/leads/:id', async (req, res) => {
   const apiKey = req.headers['x-crm-key'];
   if (apiKey !== CRM_API_KEY) {
@@ -174,7 +217,8 @@ app.delete('/api/leads/:id', async (req, res) => {
   }
 });
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[API] Production Server running on port ${PORT}`);
+  console.log(`[API] ✅ Production Server running on port ${PORT}`);
+  console.log(`[API] Test DB: GET https://relive-cure-backend.onrender.com/test-db`);
 });
-
