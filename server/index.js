@@ -346,20 +346,34 @@ app.post('/webhook', async (req, res) => {
 
         console.log('[WEBHOOK] 📩 WhatsApp incoming | phone:', phone, '| text:', text, '| msgId:', msgId);
 
-        // ── Call chatbot ───────────────────────────────────────────────────────
+        // ── Call chatbot (safe: text-first parse, 10s timeout) ────────────────
         let reply = 'Got it 👍';
         try {
             console.log('[BOT] Calling chatbot service...');
-            const botRes  = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
+            const botController = new AbortController();
+            const botTimeout = setTimeout(() => botController.abort(), 10000);
+            const botRes = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({ phone, message: text })
+                body:    JSON.stringify({ phone, message: text }),
+                signal:  botController.signal
             });
-            const botData = await botRes.json();
-            reply = botData.reply || reply;
-            console.log('[BOT] 🤖 Reply received:', reply);
+            clearTimeout(botTimeout);
+            const botRaw = await botRes.text();
+            console.log('[BOT] Raw response (first 300):', botRaw.substring(0, 300));
+            if (botRaw.trim().startsWith('{') || botRaw.trim().startsWith('[')) {
+                const botData = JSON.parse(botRaw);
+                reply = botData.reply || reply;
+                console.log('[BOT] 🤖 Reply received:', reply);
+            } else {
+                console.warn('[BOT] ⚠️ Non-JSON response from chatbot (status', botRes.status, ') — using fallback');
+            }
         } catch (botErr) {
-            console.error('[BOT] ❌ Chatbot call failed:', botErr.message, '— using fallback reply');
+            if (botErr.name === 'AbortError') {
+                console.error('[BOT] ❌ Chatbot timed out after 10s — using fallback reply');
+            } else {
+                console.error('[BOT] ❌ Chatbot call failed:', botErr.message, '— using fallback reply');
+            }
         }
 
         // ── Send WhatsApp reply (exactly once, safe) ───────────────────────────
@@ -381,9 +395,19 @@ app.post('/webhook', async (req, res) => {
             console.error('[DB] ❌ Ingestion failed:', dbErr.message);
         }
 
-        // ── Push to Railway CRM (only if ingestion succeeded) ─────────────────
+        // ── CRM push: ONLY trigger if lead is COMPLETE (has name + city + timeline)
+        // Do NOT push on every message — CRM is for qualified leads only
         if (ingestedLead && !ingestedLead.pushed_to_crm) {
-            await pushLeadToCRM(ingestedLead);
+            const isQualified = ingestedLead.contact_name &&
+                                ingestedLead.contact_name !== 'WhatsApp Lead' &&
+                                ingestedLead.city &&
+                                ingestedLead.timeline;
+            if (isQualified) {
+                console.log('[CRM] Lead is qualified — triggering Railway CRM push');
+                await pushLeadToCRM(ingestedLead);
+            } else {
+                console.log('[CRM] Lead not yet qualified (missing name/city/timeline) — skipping CRM push');
+            }
         } else if (ingestedLead?.pushed_to_crm) {
             console.log('[CRM] Lead already pushed — skipping duplicate CRM push');
         }
