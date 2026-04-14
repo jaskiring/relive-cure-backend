@@ -289,12 +289,9 @@ export async function pushToCRM(lead) {
   console.log("[CRM] Starting push for:", lead.phone_number);
   if (!lead.id) lead.id = crypto.randomUUID();
 
-  // Guard: never push a lead with no real name — it produces garbage entries in Refrens
-  const realName = (lead.contact_name || lead.name || '').trim();
-  if (!realName || realName === 'WhatsApp Lead' || realName === 'Session Test') {
-    console.warn('[CRM] ⛔ Skipping CRM push — lead has no real contact name. Name:', realName);
-    return { success: false, id: lead.id, error: 'No real contact name — cannot push to CRM. Collect name first.' };
-  }
+  // Use best available name — phone number as last resort so dashboard sync always works
+  const realName = (lead.contact_name || lead.name || '').trim().replace(/^(WhatsApp Lead|Session Test)$/i, '').trim()
+    || `Lead-${(lead.phone_number || '').slice(-4)}`;
 
   const browser = await getBrowser();
   const pages = await browser.pages();
