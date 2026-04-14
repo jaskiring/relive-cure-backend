@@ -219,6 +219,79 @@ app.delete('/api/leads/:id', async (req, res) => {
   }
 });
 
+// ─── Deduplication store (in-memory, per process) ────────────────────────────
+const processedMessageIds = new Set();
+
+// ─── Safe WhatsApp send ───────────────────────────────────────────────────────
+async function sendWhatsAppReply(phone, reply) {
+    const url = `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`;
+    const payload = {
+        messaging_product: 'whatsapp',
+        to: phone,
+        text: { body: reply }
+    };
+
+    let rawText = '';
+    try {
+        console.log('[WA SEND] Sending reply to', phone);
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+
+        rawText = await res.text();
+
+        if (res.status === 429) {
+            console.warn('[WA SEND] ⚠️ Rate limited (429) — skipping retry');
+            return;
+        }
+
+        // Only parse as JSON if it looks like JSON
+        if (rawText.trim().startsWith('{') || rawText.trim().startsWith('[')) {
+            const data = JSON.parse(rawText);
+            console.log('[WA SEND] ✅ Success:', JSON.stringify(data));
+        } else {
+            console.warn('[WA SEND] ⚠️ Non-JSON response (status', res.status, '):', rawText.substring(0, 200));
+        }
+    } catch (err) {
+        console.error('[WA SEND] ❌ Error:', err.message);
+        console.error('[WA SEND] Raw response was:', rawText.substring(0, 300));
+    }
+}
+
+// ─── CRM push to Railway ──────────────────────────────────────────────────────
+async function pushLeadToCRM(lead) {
+    const CRM_URL = 'https://relive-cure-backend-production.up.railway.app/api/push-to-crm-form';
+    const key     = process.env.CRM_API_KEY || 'relive_crm_secure_key_2026';
+
+    try {
+        console.log('[CRM PUSH] Sending lead to Railway CRM:', lead.phone_number);
+        const res = await fetch(CRM_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-crm-key': key
+            },
+            body: JSON.stringify({ leads: [lead] })
+        });
+
+        const rawText = await res.text();
+        if (rawText.trim().startsWith('{') || rawText.trim().startsWith('[')) {
+            const data = JSON.parse(rawText);
+            console.log('[CRM PUSH] ✅ Success:', JSON.stringify(data));
+        } else {
+            console.warn('[CRM PUSH] ⚠️ Non-JSON response (status', res.status, '):', rawText.substring(0, 200));
+        }
+    } catch (err) {
+        console.error('[CRM PUSH] ❌ Failed (non-fatal):', err.message);
+        // Never crash the webhook — CRM push failure is non-fatal
+    }
+}
+
 // ─── WhatsApp Webhook Verification ───────────────────────────────────────────
 app.get('/webhook', (req, res) => {
     const VERIFY_TOKEN = 'relive_verify_token_123';
@@ -240,54 +313,83 @@ app.get('/webhook', (req, res) => {
 
 // ─── WhatsApp Incoming Messages ───────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
+    // Acknowledge Meta immediately — must respond <5s or Meta retries
+    res.sendStatus(200);
+
     try {
         const entry   = req.body.entry?.[0];
         const changes = entry?.changes?.[0];
-        const message = changes?.value?.messages?.[0];
+        const value   = changes?.value;
+        const message = value?.messages?.[0];
 
-        if (message) {
-            const phone = message.from;
-            const text  = message.text?.body;
-
-            console.log('📩 WhatsApp incoming:', phone, text);
-
-            // Forward to chatbot service
-            const botRes = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone, message: text })
-            });
-
-            const botData = await botRes.json();
-            const reply   = botData.reply || 'Got it 👍';
-
-            console.log('🤖 Bot reply:', reply);
-
-            // Send reply back via WhatsApp Graph API
-            const sendRes = await fetch(
-                `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
-                {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        messaging_product: 'whatsapp',
-                        to: phone,
-                        text: { body: reply }
-                    })
-                }
-            );
-
-            const sendData = await sendRes.json();
-            console.log('📤 WhatsApp send response:', JSON.stringify(sendData));
+        // Ignore status updates (delivered, read receipts)
+        if (!message) {
+            console.log('[WEBHOOK] No message in payload — likely a status update, skipping.');
+            return;
         }
 
-        return res.sendStatus(200);
+        // ── Deduplication ──────────────────────────────────────────────────────
+        const msgId = message.id;
+        if (processedMessageIds.has(msgId)) {
+            console.log('[WEBHOOK] 🔁 Duplicate message ID', msgId, '— skipping.');
+            return;
+        }
+        processedMessageIds.add(msgId);
+        // Evict old IDs to prevent unbounded memory growth (keep last 500)
+        if (processedMessageIds.size > 500) {
+            const first = processedMessageIds.values().next().value;
+            processedMessageIds.delete(first);
+        }
+
+        const phone = message.from;
+        const text  = message.text?.body || '';
+
+        console.log('[WEBHOOK] 📩 WhatsApp incoming | phone:', phone, '| text:', text, '| msgId:', msgId);
+
+        // ── Call chatbot ───────────────────────────────────────────────────────
+        let reply = 'Got it 👍';
+        try {
+            console.log('[BOT] Calling chatbot service...');
+            const botRes  = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ phone, message: text })
+            });
+            const botData = await botRes.json();
+            reply = botData.reply || reply;
+            console.log('[BOT] 🤖 Reply received:', reply);
+        } catch (botErr) {
+            console.error('[BOT] ❌ Chatbot call failed:', botErr.message, '— using fallback reply');
+        }
+
+        // ── Send WhatsApp reply (exactly once, safe) ───────────────────────────
+        await sendWhatsAppReply(phone, reply);
+
+        // ── Ingest lead into Supabase ──────────────────────────────────────────
+        let ingestedLead = null;
+        try {
+            console.log('[DB] Ingesting lead for phone:', phone);
+            const payload = {
+                phone_number:       phone,
+                last_user_message:  text,
+                ingestion_trigger:  'whatsapp_webhook',
+            };
+            const { data, action } = await ingestLead(supabaseAdmin, payload);
+            ingestedLead = data;
+            console.log(`[DB] ✅ ${action.toUpperCase()} | id=${data.id} | phone=${phone}`);
+        } catch (dbErr) {
+            console.error('[DB] ❌ Ingestion failed:', dbErr.message);
+        }
+
+        // ── Push to Railway CRM (only if ingestion succeeded) ─────────────────
+        if (ingestedLead && !ingestedLead.pushed_to_crm) {
+            await pushLeadToCRM(ingestedLead);
+        } else if (ingestedLead?.pushed_to_crm) {
+            console.log('[CRM] Lead already pushed — skipping duplicate CRM push');
+        }
+
     } catch (err) {
-        console.error('❌ Webhook error:', err.message);
-        return res.sendStatus(500);
+        console.error('[WEBHOOK] ❌ Unhandled error:', err.message);
     }
 });
 
