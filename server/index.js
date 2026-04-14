@@ -22,6 +22,8 @@ console.log('[BOOT] ✅ Server starting...');
 console.log('[BOOT] SUPABASE_URL:', process.env.SUPABASE_URL || '❌ MISSING');
 console.log('[BOOT] SUPABASE_KEY LENGTH:', process.env.SUPABASE_SERVICE_ROLE_KEY?.length || '❌ MISSING');
 console.log('[BOOT] CRM_API_KEY SET:', !!process.env.CRM_API_KEY);
+console.log('[BOOT] WHATSAPP_ACCESS_TOKEN SET:', !!process.env.WHATSAPP_ACCESS_TOKEN);
+console.log('[BOOT] PHONE_NUMBER_ID:', process.env.PHONE_NUMBER_ID || '❌ MISSING');
 console.log('[BOOT] NODE_VERSION:', process.version);
 console.log('═══════════════════════════════════════');
 
@@ -215,6 +217,78 @@ app.delete('/api/leads/:id', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── WhatsApp Webhook Verification ───────────────────────────────────────────
+app.get('/webhook', (req, res) => {
+    const VERIFY_TOKEN = 'relive_verify_token_123';
+
+    const mode      = req.query['hub.mode'];
+    const token     = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    console.log('[WEBHOOK] Verification request received:', { mode, token });
+
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+        console.log('[WEBHOOK] ✅ Verification passed');
+        return res.status(200).send(challenge);
+    }
+
+    console.warn('[WEBHOOK] ❌ Verification failed — bad token or mode');
+    return res.sendStatus(403);
+});
+
+// ─── WhatsApp Incoming Messages ───────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+    try {
+        const entry   = req.body.entry?.[0];
+        const changes = entry?.changes?.[0];
+        const message = changes?.value?.messages?.[0];
+
+        if (message) {
+            const phone = message.from;
+            const text  = message.text?.body;
+
+            console.log('📩 WhatsApp incoming:', phone, text);
+
+            // Forward to chatbot service
+            const botRes = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone, message: text })
+            });
+
+            const botData = await botRes.json();
+            const reply   = botData.reply || 'Got it 👍';
+
+            console.log('🤖 Bot reply:', reply);
+
+            // Send reply back via WhatsApp Graph API
+            const sendRes = await fetch(
+                `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
+                {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        messaging_product: 'whatsapp',
+                        to: phone,
+                        text: { body: reply }
+                    })
+                }
+            );
+
+            const sendData = await sendRes.json();
+            console.log('📤 WhatsApp send response:', JSON.stringify(sendData));
+        }
+
+        return res.sendStatus(200);
+    } catch (err) {
+        console.error('❌ Webhook error:', err.message);
+        return res.sendStatus(500);
+    }
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
