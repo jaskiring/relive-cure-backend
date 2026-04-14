@@ -211,6 +211,67 @@ async function waitForTokenRefresh(page, timeoutMs = 30000) {
   }
 }
 
+function getAssignedRep(lead) {
+  const city = (lead.city || "").toLowerCase();
+  if (city === "delhi") return "Delhi Sales";
+  if (lead.intent_level === "HOT" || lead.request_call === true) return "Senior Sales";
+  return "General Queue";
+}
+
+async function selectDropdownByLabel(page, keywords, value) {
+  try {
+    const controlHandle = await page.evaluateHandle((labels) => {
+      const elements = Array.from(document.querySelectorAll('label, div, span, p'));
+      let targetElement = null;
+      for (const el of elements) {
+        const text = (el.innerText || '').trim().toLowerCase();
+        if (labels.some(l => text === l.toLowerCase() || text.startsWith(l.toLowerCase() + ' '))) {
+          targetElement = el;
+          break;
+        }
+      }
+      if (!targetElement) return null;
+      
+      let container = targetElement;
+      for (let i = 0; i < 5 && container; i++) {
+        const select = container.querySelector('.disco-select__control');
+        if (select) return select;
+        container = container.parentElement;
+      }
+      return null;
+    }, keywords);
+
+    if (!controlHandle || !controlHandle.asElement()) {
+      return false;
+    }
+
+    await controlHandle.click();
+    await new Promise(r => setTimeout(r, 500));
+
+    if (value) {
+      await page.keyboard.type(String(value), { delay: 50 });
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    const clicked = await page.evaluate(() => {
+      const option = document.querySelector('.disco-select__option');
+      if (option) { option.click(); return true; }
+      return false;
+    });
+
+    if (!clicked) {
+      await page.keyboard.press('ArrowDown');
+      await new Promise(r => setTimeout(r, 300));
+      await page.keyboard.press('Enter');
+    }
+
+    return true;
+  } catch(e) {
+    console.warn(`[CRM] Dropdown fallback safely skipped. Keywords: ${keywords.join(', ')}`, e.message);
+    return false;
+  }
+}
+
 // Export current Puppeteer session cookies (called from /api/export-refrens-cookies)
 export async function getBrowserCookies() {
   const browser = await getBrowser();
@@ -227,6 +288,13 @@ export async function getBrowserCookies() {
 export async function pushToCRM(lead) {
   console.log("[CRM] Starting push for:", lead.phone_number);
   if (!lead.id) lead.id = crypto.randomUUID();
+
+  // Guard: never push a lead with no real name — it produces garbage entries in Refrens
+  const realName = (lead.contact_name || lead.name || '').trim();
+  if (!realName || realName === 'WhatsApp Lead' || realName === 'Session Test') {
+    console.warn('[CRM] ⛔ Skipping CRM push — lead has no real contact name. Name:', realName);
+    return { success: false, id: lead.id, error: 'No real contact name — cannot push to CRM. Collect name first.' };
+  }
 
   const browser = await getBrowser();
   const pages = await browser.pages();
@@ -376,8 +444,26 @@ export async function pushToCRM(lead) {
     if (!orgValue || orgValue.length < 2) throw new Error('Organisation still empty after selection attempt');
     console.log('STEP: Organisation selected:', orgValue);
 
-    // ── 6. Fill fields ───────────────────────────────────────────────────────
-    await fillField(page, SEL.contactName, lead.contact_name || lead.name || 'Session Test');
+    // ── 6. Set Dropdowns (Stage & Assignment) ───────────────────────────────
+    console.log('[CRM] Setting Lead Stage to New...');
+    const stageSet = await selectDropdownByLabel(page, ['stage', 'status', 'lead status', 'pipeline'], 'New');
+    if (stageSet) {
+      console.log('[CRM] Stage set: New');
+    } else {
+      console.log('[CRM] Stage field not found — fail safe continued');
+    }
+
+    const repToAssign = getAssignedRep(lead);
+    console.log(`[CRM] Assigning lead to: ${repToAssign}...`);
+    const assigneeSet = await selectDropdownByLabel(page, ['assign', 'owner', 'responsible'], repToAssign);
+    if (assigneeSet) {
+      console.log(`[CRM] Assigned to: ${repToAssign}`);
+    } else {
+      console.log('[CRM] Assignee field not found — fail safe continued');
+    }
+
+    // ── 7. Fill structured fields ────────────────────────────────────────────
+    await fillField(page, SEL.contactName, realName);
     const cleanPhone = (lead.phone_number || '')
       .replace(/^\+91/, '')
       .replace(/^91(?=\d{10})/, '')
@@ -386,22 +472,39 @@ export async function pushToCRM(lead) {
     await fillField(page, SEL.contactPhone, cleanPhone);
     await page.waitForSelector(SEL.customerCity, { timeout: 8000 });
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject, `LASIK Lead - ${lead.contact_name || lead.name || 'New Lead'} - ${lead.phone_number}`);
-    await fillField(page, SEL.details, [
-      `Phone: ${lead.phone_number}`,
-      `Name: ${lead.contact_name || lead.name || 'N/A'}`,
+    await fillField(page, SEL.subject, `LASIK Lead - ${realName} - ${lead.phone_number}`);
+    
+    const structuredDetails = [
+      `--- LEAD INFO ---`,
+      `Name: ${realName}`,
+      `Phone: ${lead.phone_number || 'N/A'}`,
       `City: ${lead.city || 'N/A'}`,
       `Surgery City: ${lead.preferred_surgery_city || 'N/A'}`,
       `Timeline: ${lead.timeline || 'N/A'}`,
       `Insurance: ${lead.insurance || 'N/A'}`,
-      `Intent: ${lead.intent_level || 'N/A'}`,
-      `Source: WhatsApp Bot`,
-    ].join('\n'));
+      ``,
+      `--- INTENT ---`,
+      `Intent Level: ${lead.intent_level || 'N/A'}`,
+      `Urgency: ${lead.urgency_level || 'N/A'}`,
+      `Requested Call: ${lead.request_call ? 'YES' : 'NO'}`,
+      ``,
+      `--- CONCERNS ---`,
+      `Cost: ${lead.interest_cost ? 'YES' : 'NO'}`,
+      `Recovery: ${lead.interest_recovery ? 'YES' : 'NO'}`,
+      `Pain: ${lead.concern_pain ? 'YES' : 'NO'}`,
+      `Safety: ${lead.concern_safety ? 'YES' : 'NO'}`,
+      `Power: ${lead.concern_power ? 'YES' : 'NO'}`,
+      ``,
+      `--- CONTEXT ---`,
+      `Last Message: ${lead.last_user_message || 'N/A'}`,
+    ].join('\n');
+    
+    await fillField(page, SEL.details, structuredDetails);
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
-    console.log("STEP: Fields filled");
+    console.log("[CRM] Structured data injected & fields filled");
     await new Promise(r => setTimeout(r, 500));
 
-    // ── 7. Submit ────────────────────────────────────────────────────────────
+    // ── 8. Submit ────────────────────────────────────────────────────────────
     console.log('[CRM] Clicking submit...');
     
     // Scroll submit button into view first
@@ -459,15 +562,33 @@ export async function pushToCRM(lead) {
     }
     
     if (!urlChanged) {
-      // Take screenshot for debugging
       console.warn('[CRM] URL did not change — form may not have submitted');
-      // Still mark as attempt, do not throw — let DB update happen
     }
     
-    console.log("✓ Lead form submitted successfully");
-    const isSuccess = !hasError;
+    if (!hasError) {
+      try {
+        console.log('[CRM] Validating lead creation in CRM list view...');
+        await page.goto('https://www.refrens.com/app/relivecure/leads', { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 2000));
+        
+        const phoneSuffix = cleanPhone.slice(-6);
+        const pageTextValidation = await page.evaluate(() => document.body.innerText.replace(/\s+/g, ''));
+        const isFound = pageTextValidation.includes(phoneSuffix);
+        
+        if (isFound) {
+          console.log(`[CRM] Successfully pushed: ${lead.phone_number} (Validation SUCCESS)`);
+          return { success: true, validated: true, id: lead.id, selectedOrg: orgValue };
+        } else {
+          console.warn(`[CRM] Validation WARNING: Could not find phone suffix ${phoneSuffix} in leads list`);
+          return { success: true, validated: false, id: lead.id, selectedOrg: orgValue };
+        }
+      } catch (e) {
+        console.warn(`[CRM] Validation check failed to execute safely:`, e.message);
+        return { success: true, validated: false, id: lead.id, selectedOrg: orgValue };
+      }
+    }
 
-    return { success: isSuccess, id: lead.id, selectedOrg: orgValue };
+    return { success: false, id: lead.id, selectedOrg: orgValue };
 
   } catch (error) {
     console.error("[CRM ERROR]", error.message);

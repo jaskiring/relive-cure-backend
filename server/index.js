@@ -395,22 +395,13 @@ app.post('/webhook', async (req, res) => {
             console.error('[DB] ❌ Ingestion failed:', dbErr.message);
         }
 
-        // ── CRM push: ONLY trigger if lead is COMPLETE (has name + city + timeline)
-        // Do NOT push on every message — CRM is for qualified leads only
-        if (ingestedLead && !ingestedLead.pushed_to_crm) {
-            const isQualified = ingestedLead.contact_name &&
-                                ingestedLead.contact_name !== 'WhatsApp Lead' &&
-                                ingestedLead.city &&
-                                ingestedLead.timeline;
-            if (isQualified) {
-                console.log('[CRM] Lead is qualified — triggering Railway CRM push');
-                await pushLeadToCRM(ingestedLead);
-            } else {
-                console.log('[CRM] Lead not yet qualified (missing name/city/timeline) — skipping CRM push');
-            }
-        } else if (ingestedLead?.pushed_to_crm) {
-            console.log('[CRM] Lead already pushed — skipping duplicate CRM push');
+        // ── CRM push is INTENTIONALLY NOT triggered here ────────────────────
+        // CRM push only happens via Dashboard → "Push to CRM" button (manual).
+        // Auto-pushing on every webhook message produces bad data (no name etc.)
+        if (ingestedLead) {
+            console.log(`[DB] ✅ Lead ${ingestedLead.id} saved. CRM push must be done via Dashboard.`);
         }
+
 
     } catch (err) {
         console.error('[WEBHOOK] ❌ Unhandled error:', err.message);
