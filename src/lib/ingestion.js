@@ -62,6 +62,15 @@ export const ingestLead = async (supabaseClient, leadData) => {
     if (leadData.request_call === true) score += 20;
     const intent_score = score;
 
+    // ── Intent Level: prioritize explicit input, else calculate ─────────────
+    const calculateIntent = (comp, time) => {
+        if (comp >= 3 && (time || '').toLowerCase().includes('immediately')) return 'hot';
+        if (comp >= 2) return 'warm';
+        return 'cold';
+    };
+
+    const finalIntentLevel = (leadData.intent_level || intent_band || calculateIntent(parameters_completed, timeline)).toLowerCase();
+
     let remarks = leadData.remarks || '';
     if (bot_fallback) {
         const fallbackMsg = "Bot could not understand user query.";
@@ -83,12 +92,13 @@ export const ingestLead = async (supabaseClient, leadData) => {
         user_questions,
         bot_fallback,
         remarks,
-        // PRIORITY: always use explicitly provided intent_level — never override
-        intent_level: leadData.intent_level || intent_band || null,
+        intent_level: finalIntentLevel,
         request_call: leadData.request_call || false,
         ingestion_trigger: leadData.ingestion_trigger || 'unknown',
         concern_power: !!leadData.concern_power
     };
+
+    console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
 
     // Only update these if value is provided — avoids resetting to false/null
     if (interest_cost !== undefined)     payload.interest_cost = interest_cost;
