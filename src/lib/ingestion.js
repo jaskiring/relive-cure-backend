@@ -54,7 +54,13 @@ export const ingestLead = async (supabaseClient, leadData) => {
     }
 
     const parameters_completed = calculateParametersCompleted(leadData);
-    const intent_score = parameters_completed;
+
+    // ── Intent scoring: base × 10 + bonuses ──────────────────────────────────
+    let score = parameters_completed * 10;
+    if ((leadData.intent_level || '').toUpperCase() === 'HOT') score += 50;
+    if ((leadData.urgency_level || '').toLowerCase() === 'high') score += 20;
+    if (leadData.request_call === true) score += 20;
+    const intent_score = score;
 
     let remarks = leadData.remarks || '';
     if (bot_fallback) {
@@ -77,7 +83,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
         user_questions,
         bot_fallback,
         remarks,
-        intent_level: leadData.intent_level || intent_band,
+        // PRIORITY: always use explicitly provided intent_level — never override
+        intent_level: leadData.intent_level || intent_band || null,
         request_call: leadData.request_call || false,
         ingestion_trigger: leadData.ingestion_trigger || 'unknown',
         concern_power: !!leadData.concern_power
