@@ -469,9 +469,12 @@ export async function pushToCRM(lead) {
     await fillField(page, SEL.contactPhone, cleanPhone);
     await page.waitForSelector(SEL.customerCity, { timeout: 8000 });
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
-    await fillField(page, SEL.subject, `LASIK Lead - ${realName} - ${lead.phone_number}`);
+    const isTestLead = !!(lead.is_test || (lead.contact_name || '').includes('TEST'));
+    const subjectPrefix = isTestLead ? '[TEST] ' : '';
+    await fillField(page, SEL.subject, `${subjectPrefix}LASIK Lead - ${realName} - ${lead.phone_number}`);
     
     const structuredDetails = [
+      ...(isTestLead ? [`🚨 TEST LEAD 🚨 — DO NOT COUNT IN PIPELINE`, ``, ] : []),
       `--- LEAD INFO ---`,
       `Name: ${realName}`,
       `Phone: ${lead.phone_number || 'N/A'}`,
@@ -479,6 +482,8 @@ export async function pushToCRM(lead) {
       `Surgery City: ${lead.preferred_surgery_city || 'N/A'}`,
       `Timeline: ${lead.timeline || 'N/A'}`,
       `Insurance: ${lead.insurance || 'N/A'}`,
+      `Source: ${lead.source || 'whatsapp_bot'}`,
+      `Trigger: ${lead.ingestion_trigger || 'N/A'}`,
       ``,
       `--- INTENT ---`,
       `Intent Level: ${lead.intent_level || 'N/A'}`,
