@@ -136,11 +136,38 @@ const SEL = {
 };
 
 async function fillField(page, selector, value) {
-  if (!value) return false;
+  if (!value && value !== 0) return false;
   try {
     await page.waitForSelector(selector, { timeout: 6000 });
+    // Clear existing value first
+    await page.$eval(selector, el => { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); });
     await page.type(selector, String(value));
     return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Fill a Refrens custom field by its label text (case-insensitive match)
+async function fillCustomField(page, labelText, value) {
+  if (!value && value !== 0) return false;
+  try {
+    const filled = await page.evaluate((label, val) => {
+      const labels = Array.from(document.querySelectorAll('label, .label, [class*="label"]'));
+      const match = labels.find(l => l.textContent.trim().toLowerCase().includes(label.toLowerCase()));
+      if (!match) return false;
+      // Try sibling or parent input/textarea
+      let el = match.nextElementSibling;
+      if (!el || !['INPUT','TEXTAREA'].includes(el.tagName)) {
+        el = match.parentElement?.querySelector('input, textarea');
+      }
+      if (!el) return false;
+      el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, labelText, String(value));
+    return filled;
   } catch (e) {
     return false;
   }
@@ -503,8 +530,17 @@ export async function pushToCRM(lead) {
     
     await fillField(page, SEL.details, structuredDetails);
     await fillField(page, SEL.vPhoneNumber, lead.phone_number);
-    console.log("[CRM] Structured data injected & fields filled");
+
+    // ── Fill Refrens custom fields (best-effort, fail silently) ──────────────
+    const intentBand = lead.intent_level || lead.intent_band || '';
+    const intentScore = lead.intent_score || lead.parameters_completed || '';
+    const lastMsg = (lead.last_user_message || '').substring(0, 200);
+    if (intentBand) await fillCustomField(page, 'intent band', intentBand);
+    if (intentScore) await fillCustomField(page, 'intent score', String(intentScore));
+    if (lastMsg) await fillCustomField(page, 'last_user_message', lastMsg);
+    console.log('[CRM] Structured data injected & fields filled');
     await new Promise(r => setTimeout(r, 500));
+
 
     // ── 8. Submit ────────────────────────────────────────────────────────────
     console.log('[CRM] Clicking submit...');

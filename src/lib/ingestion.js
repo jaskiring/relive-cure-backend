@@ -69,7 +69,7 @@ export const ingestLead = async (supabaseClient, leadData) => {
         insurance,
         preferred_surgery_city,
         timeline,
-        source: 'chatbot',
+        source: leadData.source || 'chatbot',
         lead_type,
         parameters_completed,
         intent_score,
