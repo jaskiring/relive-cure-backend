@@ -38,9 +38,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
         last_user_message,
         user_questions,
         bot_fallback,
-        intent_band,         // Bot metadata -> maps to intent_level
+        intent_band,
         lead_type = 'surgery',
-        // New Intelligence fields
         interest_cost,
         interest_recovery,
         concern_pain,
@@ -55,14 +54,12 @@ export const ingestLead = async (supabaseClient, leadData) => {
 
     const parameters_completed = calculateParametersCompleted(leadData);
 
-    // ── Intent scoring: base × 10 + bonuses ──────────────────────────────────
     let score = parameters_completed * 10;
     if ((leadData.intent_level || '').toUpperCase() === 'HOT') score += 50;
     if ((leadData.urgency_level || '').toLowerCase() === 'high') score += 20;
     if (leadData.request_call === true) score += 20;
     const intent_score = score;
 
-    // ── Intent Level: prioritize explicit input, else calculate ─────────────
     const calculateIntent = (comp, time) => {
         if (comp >= 3 && (time || '').toLowerCase().includes('immediately')) return 'hot';
         if (comp >= 2) return 'warm';
@@ -95,12 +92,12 @@ export const ingestLead = async (supabaseClient, leadData) => {
         intent_level: finalIntentLevel,
         request_call: leadData.request_call || false,
         ingestion_trigger: leadData.ingestion_trigger || 'unknown',
-        concern_power: !!leadData.concern_power
+        concern_power: !!leadData.concern_power,
+        last_activity_at: new Date().toISOString().replace('T', ' ').replace('Z', '')
     };
 
     console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
 
-    // Only update these if value is provided — avoids resetting to false/null
     if (interest_cost !== undefined)     payload.interest_cost = interest_cost;
     if (interest_recovery !== undefined) payload.interest_recovery = interest_recovery;
     if (concern_pain !== undefined)      payload.concern_pain = concern_pain;
