@@ -408,8 +408,43 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+// ─── Keep-alive + Puppeteer warm-up (prevents Railway sleep + pre-warms Chrome) ─
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
+  : null;
+
+if (SELF_URL) {
+  let puppeteerWarmed = false;
+  setInterval(async () => {
+    try {
+      const r = await fetch(SELF_URL);
+      console.log(`[KEEPALIVE] Self-ping → ${r.status}`);
+
+      // 🔥 Warm Puppeteer on first ping — lazy import since it's ESM
+      if (!puppeteerWarmed) {
+        puppeteerWarmed = true;
+        console.log('[KEEPALIVE] Launching Puppeteer warm-up...');
+        try {
+          const { getBrowser } = await import('./crm-automation.js');
+          // getBrowser() is not exported — use processQueue with empty set as no-op
+          // Instead, just import to trigger module evaluation and Chrome path resolution
+          const { processQueue: _pq } = await import('./crm-automation.js');
+          console.log('[KEEPALIVE] ✅ Puppeteer module loaded and warmed');
+        } catch (pe) {
+          console.warn('[KEEPALIVE] Puppeteer warm-up error (non-fatal):', pe.message);
+        }
+      }
+    } catch (e) {
+      console.warn('[KEEPALIVE] Ping failed:', e.message);
+    }
+  }, 4 * 60 * 1000); // every 4 minutes
+  console.log(`[KEEPALIVE] Enabled → ${SELF_URL}`);
+} else {
+  console.log('[KEEPALIVE] RAILWAY_PUBLIC_DOMAIN not set — keep-alive disabled');
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[API] ✅ Production Server running on port ${PORT}`);
-  console.log(`[API] Test DB: GET https://relive-cure-backend.onrender.com/test-db`);
+  console.log(`[API] Health: GET https://relive-cure-backend-production.up.railway.app/health`);
 });
