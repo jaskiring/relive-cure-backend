@@ -74,7 +74,7 @@ app.post('/api/auth/login', (req, res) => {
     const validPassword = process.env.VITE_ADMIN_PASSWORD || 'admin123';
 
     if (username === validUsername && password === validPassword) {
-        res.json({ success: true });
+        res.json({ success: true, token: CRM_API_KEY });
     } else {
         res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
