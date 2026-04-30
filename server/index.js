@@ -352,7 +352,7 @@ app.post('/webhook', async (req, res) => {
             console.log('[BOT] Calling chatbot service...');
             const botController = new AbortController();
             const botTimeout = setTimeout(() => botController.abort(), 10000);
-            const botRes = await fetch('https://lasik-whatsapp-bot.onrender.com/webhook', {
+            const botRes = await fetch('https://lasik-whatsapp-bot-production.up.railway.app/webhook', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body:    JSON.stringify({ phone, message: text }),
