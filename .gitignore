@@ -12,3 +12,5 @@ dist/
 
 puppeteer-session/
 puppeteer-session-v2/
+bundle.js
+*.js.map
