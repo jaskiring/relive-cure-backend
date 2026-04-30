@@ -66,6 +66,20 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
+// ─── Dashboard Auth Endpoint ──────────────────────────────────────────────────
+app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body;
+    // We are reading VITE_ADMIN_USERNAME and VITE_ADMIN_PASSWORD from process.env
+    const validUsername = process.env.VITE_ADMIN_USERNAME || 'admin';
+    const validPassword = process.env.VITE_ADMIN_PASSWORD || 'admin123';
+
+    if (username === validUsername && password === validPassword) {
+        res.json({ success: true });
+    } else {
+        res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+});
+
 // ─── Export Refrens cookies from the current Puppeteer session ────────────────
 app.get('/api/export-refrens-cookies', async (req, res) => {
     if (req.headers['x-crm-key'] !== CRM_API_KEY) {
