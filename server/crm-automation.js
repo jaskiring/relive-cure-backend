@@ -224,7 +224,7 @@ async function assertValue(page, selector, expected) {
 
 export async function getBrowserCookies() {
   const browser = await getBrowser();
-  const context = await browser.createIncognitoBrowserContext();
+  const context = await browser.createBrowserContext();
   const page = await context.newPage();
   try {
     await page.goto('https://www.refrens.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -243,7 +243,7 @@ async function processLead(lead) {
     || `Lead-${(lead.phone_number || '').slice(-4)}`;
 
   const browser = await getBrowser();
-  const context = await browser.createIncognitoBrowserContext();
+  const context = await browser.createBrowserContext();
   const page = await context.newPage();
 
   try {
