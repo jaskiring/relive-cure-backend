@@ -38,7 +38,7 @@ app.use(express.json());
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', node: process.version, ts: new Date().toISOString() });
+    res.json({ status: 'ok', node: process.version, ts: new Date().toISOString(), uptime: process.uptime() });
 });
 
 // ─── STEP 4: Debug DB connection endpoint ─────────────────────────────────────
