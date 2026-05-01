@@ -81,7 +81,7 @@ async function getBrowser() {
           "--disable-background-networking", "--disable-default-apps", "--disable-sync",
           "--disable-translate", "--hide-scrollbars", "--metrics-recording-only",
           "--mute-audio", "--no-first-run", "--safebrowsing-disable-auto-update",
-          "--single-process", "--memory-pressure-off", "--js-flags=--max-old-space-size=256",
+          "--memory-pressure-off", "--js-flags=--max-old-space-size=256",
           "--start-maximized"
         ],
         timeout: 60000
