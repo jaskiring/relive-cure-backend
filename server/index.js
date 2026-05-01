@@ -218,7 +218,7 @@ app.get('/api/check-lead/:phone', async (req, res) => {
     try {
         const { data, error } = await supabaseAdmin
             .from('leads_surgery')
-            .select('id, contact_name, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, urgency_level')
+            .select('id, contact_name, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, urgency_level, pushed_to_crm')
             .eq('phone_number', phone)
             .maybeSingle();
 
