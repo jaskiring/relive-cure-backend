@@ -407,20 +407,22 @@ function buildKnowledgeResponse(message, session) {
   const secondaryIntent = PRIORITY_ORDER.find(p => intents.includes(p) && p !== topIntent);
 
   if (session.last_intent_handled === topIntent) {
-    const baseReply = "I already shared that above 🙂";
     const followUps = [
-      "Would you like help checking your eligibility?",
-      "Want me to guide you based on your case?",
-      "I can help you take the next step if you'd like 👍",
+      "Want me to help you check if you're eligible?",
+      "I can guide you based on your case 👍",
+      "Would you like to take the next step?",
       "Should I connect you with a LASIK specialist?"
     ];
 
     const nextStep = getNextQuestion(session, "resume");
 
-    return baseReply + "\n\n" + 
-           followUps[Math.floor(Math.random() * followUps.length)] + 
-           "\n\n─────────────\n\n" + 
-           nextStep.text;
+    return (
+      (KB[topIntent] || "") +
+      "\n\n" +
+      followUps[Math.floor(Math.random() * followUps.length)] +
+      "\n\n─────────────\n\n" +
+      nextStep.text
+    );
   }
   
   session.last_intent_handled = topIntent;
