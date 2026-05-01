@@ -30,9 +30,7 @@ const BOT_SECRET    = process.env.BOT_SECRET;
 const VERIFY_TOKEN  = process.env.WEBHOOK_VERIFY_TOKEN;
 const SESSION_FILE  = path.join(__dirname, "sessions.json");
 
-// States in which knowledge responses are ALLOWED (TIMELINE, SURGERY_CITY, INSURANCE excluded — direct answer required)
-
-
+// ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // Fix 1 — DEBOUNCED SESSION PERSISTENCE (concurrency-safe)
 // In-memory sessions = single source of truth at runtime.
@@ -829,6 +827,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
       session.state = "COMPLETE";
       const name = session.data.contactName ? session.data.contactName.split(" ")[0] : "";
       setReply(`${name ? `Perfect, ${name}! 🎉` : "Perfect! 🎉"}\n\nOur LASIK specialist will contact you shortly.\n\nMeanwhile, I can help you with:\n• Cost\n• Recovery\n• Eligibility`);
+      return finalizeWithIngest(phone, session, "complete", finalize, isTestChat);
     }
     else if (state === "COMPLETE") {
       const knowledgeAgain = buildKnowledgeResponse(msgLow, session);
