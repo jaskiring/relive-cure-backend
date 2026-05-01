@@ -17,21 +17,26 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 
 // ─── STEP 2: Startup env diagnostics ─────────────────────────────────────────
+const REQUIRED_ENV = ["BOT_SECRET", "CRM_API_KEY", "WEBHOOK_VERIFY_TOKEN", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length > 0) {
+    console.error(`[FATAL] Missing required environment variables: ${missing.join(", ")}`);
+    process.exit(1);
+}
+
 console.log('═══════════════════════════════════════');
 console.log('[BOOT] ✅ Server starting...');
-console.log('[BOOT] SUPABASE_URL:', process.env.SUPABASE_URL || '❌ MISSING');
-console.log('[BOOT] SUPABASE_KEY LENGTH:', process.env.SUPABASE_SERVICE_ROLE_KEY?.length || '❌ MISSING');
 console.log('[BOOT] CRM_API_KEY SET:', !!process.env.CRM_API_KEY);
-console.log('[BOOT] WHATSAPP_ACCESS_TOKEN SET:', !!process.env.WHATSAPP_ACCESS_TOKEN);
-console.log('[BOOT] PHONE_NUMBER_ID:', process.env.PHONE_NUMBER_ID || '❌ MISSING');
+console.log('[BOOT] BOT_SECRET SET:', !!process.env.BOT_SECRET);
+console.log('[BOOT] WEBHOOK_VERIFY_TOKEN SET:', !!process.env.WEBHOOK_VERIFY_TOKEN);
 console.log('[BOOT] NODE_VERSION:', process.version);
 console.log('═══════════════════════════════════════');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BOT_SECRET = 'RELIVE_BOT_SECRET';
-const CRM_API_KEY = process.env.CRM_API_KEY || 'relive_crm_secure_key_2026';
-console.log("EXPECTED CRM_API_KEY:", process.env.CRM_API_KEY || CRM_API_KEY);
+const BOT_SECRET = process.env.BOT_SECRET;
+const CRM_API_KEY = process.env.CRM_API_KEY;
+const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
 app.use(cors());
 app.use(express.json());
@@ -110,17 +115,30 @@ app.post('/api/push-to-crm-form', async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'No leads provided' });
     }
 
-    if (leads.length > 20) {
-        return res.status(400).json({
-            status: "error",
-            message: "Too many leads selected. Please filter smaller batches (Max 20)."
+    // ── Task 3: Idempotency Guard ─────────────────────────────────────────────
+    const pendingLeads = leads.filter(l => !l.pushed_to_crm);
+    const alreadyPushedCount = leads.length - pendingLeads.length;
+
+    if (pendingLeads.length === 0) {
+        return res.json({
+            status: 'success',
+            message: 'All selected leads have already been pushed to CRM.',
+            processed: 0,
+            already_pushed: alreadyPushedCount
         });
     }
 
-    console.log(`[CRM] Processing ${leads.length} lead(s)`);
+    if (pendingLeads.length > 20) {
+        return res.status(400).json({
+            status: "error",
+            message: "Too many new leads selected. Please filter smaller batches (Max 20)."
+        });
+    }
+
+    console.log(`[CRM] Processing ${pendingLeads.length} lead(s) | Skipped ${alreadyPushedCount} already pushed`);
 
     try {
-        const results = await processQueue(leads);
+        const results = await processQueue(pendingLeads);
 
         const successfulLeads = results.filter(r => r.success).map(r => r.id);
         const failedLeads     = results.filter(r => !r.success);
@@ -308,20 +326,16 @@ async function pushLeadToCRM(lead) {
 
 // ─── WhatsApp Webhook Verification ───────────────────────────────────────────
 app.get('/webhook', (req, res) => {
-    const VERIFY_TOKEN = 'relive_verify_token_123';
-
     const mode      = req.query['hub.mode'];
     const token     = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
-    console.log('[WEBHOOK] Verification request received:', { mode, token });
-
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-        console.log('[WEBHOOK] ✅ Verification passed');
+        console.log('[WEBHOOK] ✅ Verification successful');
         return res.status(200).send(challenge);
     }
 
-    console.warn('[WEBHOOK] ❌ Verification failed — bad token or mode');
+    console.warn('[WEBHOOK] ❌ Verification failed');
     return res.sendStatus(403);
 });
 

@@ -65,6 +65,20 @@ async function ensureChrome() {
 let browserInstancePromise = null;
 
 async function getBrowser() {
+  if (browserInstancePromise) {
+    try {
+      const browser = await browserInstancePromise;
+      if (browser.isConnected()) {
+        return browser;
+      }
+      console.warn("[CRM] Browser disconnected. Re-launching...");
+      browserInstancePromise = null;
+    } catch (e) {
+      console.warn("[CRM] Browser health check failed. Re-launching...");
+      browserInstancePromise = null;
+    }
+  }
+
   if (!browserInstancePromise) {
     browserInstancePromise = (async () => {
       console.log("Using session dir:", USER_DATA_DIR);
@@ -366,12 +380,20 @@ export async function processQueue(leads, concurrencyLimit = 3) {
   
   for (const lead of leads) {
     console.log(`[QUEUE] Queueing lead ${lead.id}. pending=${queue.pending} size=${queue.size}`);
-    const promise = queue.add(() => 
-      withTimeout(processLead(lead), 10000).catch(finalErr => {
-        console.error(`[QUEUE] Lead ${lead.id} failed: ${finalErr.message}`);
-        return { success: false, id: lead.id, error: finalErr.message };
-      })
-    );
+    const promise = queue.add(async () => {
+      const start = Date.now();
+      try {
+        return await withTimeout(processLead(lead), 60000);
+      } catch (err) {
+        const elapsed = Date.now() - start;
+        if (err.message === 'Timeout') {
+          console.error(`[CRM_TIMEOUT] lead_id=${lead.id} elapsed=${elapsed}ms`);
+        } else {
+          console.error(`[QUEUE] Lead ${lead.id} failed: ${err.message}`);
+        }
+        return { success: false, id: lead.id, error: err.message };
+      }
+    });
     results.push(promise);
   }
 
