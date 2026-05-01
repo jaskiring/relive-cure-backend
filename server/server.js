@@ -711,7 +711,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
       console.log('[LOGIC_PATH] knowledge');
       setReply(knowledge);
       console.log(`[STATE_AFTER] phone=${phone} state=${session.state}`);
-      return finalizeWithIngest(phone, session, "knowledge", finalize, isTestChat);
+      return finalize(isTestChat);
     }
 
     // B. STRONG SALES INTENT (Fix 4)
@@ -732,7 +732,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
       const personalPrefix = name ? `Got it, ${name} 👍\n\n` : "Got it 👍\n\n";
       setReply(`${personalPrefix}Based on your eye power, you could be a good candidate for LASIK.\n\nWould you like me to check your eligibility quickly?`);
       console.log(`[STATE_AFTER] phone=${phone} state=${session.state}`);
-      return finalizeWithIngest(phone, session, "power_detected", finalize, isTestChat);
+      return finalize(isTestChat);
     }
 
     // D. STATE MACHINE (Requirement 1 & 3: Loops & Repeated Prompts)
@@ -790,20 +790,21 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
       }
     }
     else if (state === "NAME") {
-      // Requirement 2: Repeat Protection for Name
-      if (session.repeat_count["NAME"] > 2 && message.length < 2) {
-        session.data.contactName = "WhatsApp Lead";
-        const next = getNextQuestion(session);
-        setReply(`No problem, let's skip that for now.\n\n${next.text}`);
-        session.state = next.field;
-      } else if (message.length < 2) {
-        setReply("Could you please tell me your name?");
-      } else {
-        session.data.contactName = message;
-        const next = getNextQuestion(session);
-        setReply(next.text);
-        session.state = next.field;
+      if (!isValidName(message)) {
+        if (session.repeat_count["NAME"] > 2) {
+          session.data.contactName = "WhatsApp Lead";
+          const next = getNextQuestion(session);
+          setReply(`No problem, let's skip that for now.\n\n${next.text}`);
+          session.state = next.field;
+        } else {
+          setReply("Please enter your name (letters only).");
+        }
+        return finalize(isTestChat);
       }
+      session.data.contactName = message;
+      const next = getNextQuestion(session);
+      setReply(next.text);
+      session.state = next.field;
     }
     else if (state === "CITY") {
       session.data.city = message;
@@ -844,7 +845,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
     }
 
     console.log(`[STATE_AFTER] phone=${phone} state=${session.state}`);
-    return finalizeWithIngest(phone, session, "update", finalize, isTestChat);
+    return finalize(isTestChat);
 
   } catch (err) {
     console.error("Processing error:", err);
