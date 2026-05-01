@@ -62,29 +62,33 @@ async function ensureChrome() {
   return undefined;
 }
 
+let browserInstancePromise = null;
+
 async function getBrowser() {
-  if (!browserInstance) {
-    console.log("Using session dir:", USER_DATA_DIR);
-    const executablePath = await ensureChrome();
-    browserInstance = await puppeteer.launch({
-      headless: true,
-      slowMo: 0,
-      ...(executablePath ? { executablePath } : {}),
-      userDataDir: USER_DATA_DIR,
-      defaultViewport: null,
-      args: [
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-        "--disable-gpu", "--disable-software-rasterizer", "--disable-extensions",
-        "--disable-background-networking", "--disable-default-apps", "--disable-sync",
-        "--disable-translate", "--hide-scrollbars", "--metrics-recording-only",
-        "--mute-audio", "--no-first-run", "--safebrowsing-disable-auto-update",
-        "--single-process", "--memory-pressure-off", "--js-flags=--max-old-space-size=256",
-        "--start-maximized"
-      ],
-      timeout: 60000
-    });
+  if (!browserInstancePromise) {
+    browserInstancePromise = (async () => {
+      console.log("Using session dir:", USER_DATA_DIR);
+      const executablePath = await ensureChrome();
+      return await puppeteer.launch({
+        headless: true,
+        slowMo: 0,
+        ...(executablePath ? { executablePath } : {}),
+        userDataDir: USER_DATA_DIR,
+        defaultViewport: null,
+        args: [
+          "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+          "--disable-gpu", "--disable-software-rasterizer", "--disable-extensions",
+          "--disable-background-networking", "--disable-default-apps", "--disable-sync",
+          "--disable-translate", "--hide-scrollbars", "--metrics-recording-only",
+          "--mute-audio", "--no-first-run", "--safebrowsing-disable-auto-update",
+          "--single-process", "--memory-pressure-off", "--js-flags=--max-old-space-size=256",
+          "--start-maximized"
+        ],
+        timeout: 60000
+      });
+    })();
   }
-  return browserInstance;
+  return browserInstancePromise;
 }
 
 const SEL = {
