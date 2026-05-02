@@ -45,7 +45,13 @@ export const ingestLead = async (supabaseClient, leadData) => {
         concern_pain,
         concern_safety,
         urgency_level,
-        is_returning
+        is_returning,
+        bot_version,
+        language,
+        message_count,
+        first_message_at,
+        last_message_at,
+        current_flow_state
     } = leadData;
 
     if (!phone_number) {
@@ -93,7 +99,15 @@ export const ingestLead = async (supabaseClient, leadData) => {
         request_call: leadData.request_call || false,
         ingestion_trigger: leadData.ingestion_trigger || 'unknown',
         concern_power: !!leadData.concern_power,
-        last_activity_at: new Date().toISOString().replace('T', ' ').replace('Z', '')
+        last_activity_at: new Date().toISOString().replace('T', ' ').replace('Z', ''),
+        
+        // Trilingual Tracking Fields
+        bot_version: bot_version || leadData.bot_version || null,
+        language: language || leadData.language || 'EN',
+        message_count: message_count || leadData.message_count || null,
+        first_message_at: first_message_at || leadData.first_message_at || null,
+        last_message_at: last_message_at || leadData.last_message_at || null,
+        current_flow_state: current_flow_state || leadData.current_flow_state || null
     };
 
     console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
