@@ -59,13 +59,31 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
+function getSessionToken() {
+    const u = process.env.VITE_ADMIN_USERNAME || '';
+    const p = process.env.VITE_ADMIN_PASSWORD || '';
+    return require('crypto').createHmac('sha256', CRM_API_KEY || 'fallback').update(`${u}:${p}`).digest('hex');
+}
+
 app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
     const validUsername = process.env.VITE_ADMIN_USERNAME;
     const validPassword = process.env.VITE_ADMIN_PASSWORD;
     if (!validUsername || !validPassword) return res.status(503).json({ success: false, message: 'Auth not configured' });
-    if (username === validUsername && password === validPassword) res.json({ success: true, token: CRM_API_KEY });
-    else res.status(401).json({ success: false, message: 'Invalid credentials' });
+    if (username === validUsername && password === validPassword) {
+        res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken() });
+    } else {
+        res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+});
+
+app.get('/api/auth/verify', (req, res) => {
+    const sessionToken = req.headers['x-session-token'];
+    if (!sessionToken) return res.json({ valid: false });
+    const validUsername = process.env.VITE_ADMIN_USERNAME;
+    const validPassword = process.env.VITE_ADMIN_PASSWORD;
+    if (!validUsername || !validPassword) return res.json({ valid: false });
+    res.json({ valid: sessionToken === getSessionToken() });
 });
 
 // ─── Refrens cookies ──────────────────────────────────────────────────────────
