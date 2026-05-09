@@ -401,3 +401,6 @@ export async function processQueue(leads, concurrencyLimit = 3) {
 }
 
 export const pushToCRM = processLead;
+
+// Export shared browser instance so refrens-sync can reuse it (same userDataDir profile)
+export async function getBrowserInstance() { return getBrowser(); }
