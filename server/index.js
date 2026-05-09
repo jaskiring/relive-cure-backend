@@ -691,6 +691,74 @@ app.get('/api/sync-status', async (req, res) => {
     }
 });
 
+
+// ─── CSV Upload Sync ─────────────────────────────────────────────────────────
+app.post('/api/upload-refrens-csv', express.text({ type: 'text/csv', limit: '10mb' }), async (req, res) => {
+    const key = req.headers['x-api-key'];
+    if (key !== process.env.CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        const { parse } = await import('csv-parse/sync');
+        const rows = parse(req.body.replace(/^\uFEFF/, ''), { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
+
+        function normPhone(raw) {
+            if (!raw) return null;
+            const d = raw.replace(/[^\d]/g, '');
+            if (d.length < 7) return null;
+            if (d.startsWith('91') && d.length === 12) return d.slice(2);
+            return d;
+        }
+        function gf(row, ...keys) {
+            for (const k of keys) { const v = (row[k]||'').trim(); if (v && !['-','false','true','..'].includes(v)) return v; }
+            return null;
+        }
+        function pd(s) {
+            if (!s || ['-',''].includes(s.trim())) return null;
+            try { return new Date(s).toISOString(); } catch { return null; }
+        }
+
+        const seen = {};
+        for (const row of rows) {
+            const phone = normPhone(row['Phone']||'') || normPhone(row['phone_number']||'');
+            if (!phone) continue;
+            seen[phone] = {
+                id: phone, phone, contact_name: gf(row,'Contact Name'),
+                customer_city: gf(row,'Customer City'), state: gf(row,'State'),
+                refrens_created_at: pd(row['Created At']), status: gf(row,'Status'),
+                lead_source: gf(row,'Lead Source'), assignee: gf(row,'Assignee'),
+                follow_up_date: pd(row['Follow up date']), last_comment_by: gf(row,'Last comment by'),
+                first_response_time: gf(row,'First Response Time'), last_internal_note: gf(row,'Last Internal Note'),
+                next_activity: pd(row['Next Activity']), date_closed: pd(row['Date Closed']),
+                whatsapp_link: gf(row,'Whatsapp Link'), lead_description: gf(row,'Lead Description'),
+                labels: gf(row,'Labels'), duplicate: gf(row,'Duplicate'),
+                call_outcome: gf(row,'Call Outcome'), consultation_status: gf(row,'Consultation Status'),
+                lead_state: gf(row,'Lead State'), intent_band: gf(row,'Intent Band'),
+                intent_score: gf(row,'Intent Score'), objection_type: gf(row,'Objection Type'),
+                eye_power: gf(row,"what_is_your_current_eye_power?","what\'s_your_eye_power?"),
+                insurance: gf(row,"do_you_have_medical_insurance_","do_you_have_medical_insurance?","do_you_have_health_insurance_","do_you_have_insurance?"),
+                timeline: gf(row,"when_would_you_prefer_to_undergo_the_lasik_treatment?","when_are_you_planning_for_lasik?","when_are_you_looking_to_get_lasik_consultation?"),
+                city_preference: gf(row,"kindly_choose_the_city_where_you_wish_to_avail_the_treatment","which_city_would_you_prefer_for_treatment_"),
+                last_user_message: gf(row,'last_user_message'), lead_type: gf(row,'lead_type'),
+                parameters_completed: gf(row,'parameters_completed'),
+                reason_for_lasik: gf(row,"what_is_the_main_reason_you\'re_considering_lasik_surgery?"),
+                age: gf(row,"what\'s_your_age?"), synced_at: new Date().toISOString()
+            };
+        }
+
+        const mapped = Object.values(seen);
+        let upserted = 0;
+        for (let i = 0; i < mapped.length; i += 100) {
+            const { error } = await supabaseAdmin.from('refrens_leads').upsert(mapped.slice(i, i+100), { onConflict: 'id' });
+            if (!error) upserted += Math.min(100, mapped.length - i);
+            else console.error('[CSV UPLOAD] Batch error:', error.message);
+        }
+        console.log(`[CSV UPLOAD] ✅ ${upserted}/${mapped.length} upserted from uploaded CSV`);
+        res.json({ success: true, total_rows: rows.length, valid_rows: mapped.length, upserted, synced_at: new Date().toISOString() });
+    } catch (err) {
+        console.error('[CSV UPLOAD] Error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // ─── Keep-alive ───────────────────────────────────────────────────────────────
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health` : null;
 if (SELF_URL) {
@@ -718,5 +786,3 @@ app.listen(PORT, '0.0.0.0', () => {
     setInterval(runRefrensSync, 4 * 60 * 60 * 1000);
     console.log('[SCHEDULER] Refrens sync: first run in 3 min, then every 4h');
 });
-
-
