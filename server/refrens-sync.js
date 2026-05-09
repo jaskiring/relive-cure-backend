@@ -25,7 +25,7 @@ function getField(row, ...keys) {
 }
 
 function mapRow(row) {
-    const phone = normalizePhone(getField(row, 'Phone', 'phone_number') || '');
+    const phone = normalizePhone(getField(row, 'Phone', 'phone_number', 'phone') || '');
     if (!phone) return null;
     return {
         id: phone,
@@ -54,12 +54,11 @@ function mapRow(row) {
         intent_score: getField(row, 'Intent Score'),
         objection_type: getField(row, 'Objection Type'),
         eye_power: getField(row, "what_is_your_current_eye_power?", "what's_your_eye_power?"),
-        insurance: getField(row, "do_you_have_medical_insurance_", "do_you_have_medical_insurance?", "do_you_have_health_insurance_", "do_you_have_insurance?"),
+        insurance: getField(row, "do_you_have_medical_insurance_", "do_you_have_medical_insurance?", "do_you_have_health_insurance_"),
         timeline: getField(row,
             "when_would_you_prefer_to_undergo_the_lasik_treatment?",
             "when_are_you_planning_for_lasik?",
-            "when_are_you_looking_to_get_lasik_consultation?",
-            "when_are_you_planning_for_lasik_in_special_offer_of_₹24999/-_"
+            "when_are_you_looking_to_get_lasik_consultation?"
         ),
         city_preference: getField(row,
             "kindly_choose_the_city_where_you_wish_to_avail_the_treatment",
@@ -79,20 +78,8 @@ function mapRow(row) {
     };
 }
 
-function isCsvContent(str) {
-    if (!str || str.length < 10) return false;
-    // Strip BOM if present
-    const s = str.replace(/^﻿/, '').trimStart();
-    // CSV starts with a printable character (letter, quote, or digit)
-    return /^[\w"']/.test(s);
-}
-
-function isStaticAssetUrl(url) {
-    return /\.(woff2?|ttf|otf|eot|svg|png|jpg|jpeg|gif|ico|js|css|webp|mp4|mp3|pdf)(\?|$)/i.test(url);
-}
-
 export async function syncRefrensLeads(supabaseAdmin) {
-    console.log('[REFRENS SYNC] ▶ Starting...');
+    console.log('[REFRENS SYNC] ▶ Starting v4...');
     const startTime = Date.now();
     let browser = null;
 
@@ -108,6 +95,71 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         const page = await browser.newPage();
 
+        // ── STRATEGY 1: Intercept blob URL creation (handles JS-generated downloads) ──
+        // Inject BEFORE page loads so it catches the overridden function
+        await page.evaluateOnNewDocument(() => {
+            window.__refrens_csv = null;
+            window.__refrens_csv_status = 'waiting';
+
+            const origCreateObjectURL = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function(obj) {
+                const blobUrl = origCreateObjectURL(obj);
+                if (obj instanceof Blob && obj.size > 500) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const text = e.target.result || '';
+                        // Check if this looks like CSV data (has commas and newlines)
+                        if (text.includes(',') && (text.includes('\n') || text.includes('\r'))) {
+                            window.__refrens_csv = text;
+                            window.__refrens_csv_status = 'captured';
+                            console.log('[BLOB INTERCEPTOR] CSV captured, size:', text.length);
+                        }
+                    };
+                    reader.readAsText(obj);
+                }
+                return blobUrl;
+            };
+        });
+
+        // ── STRATEGY 2: Network response interception as backup ──
+        // Set flag BEFORE click to avoid race condition, but filter carefully
+        let networkCsvContent = null;
+        let networkListenActive = false;
+
+        page.on('response', async (response) => {
+            if (!networkListenActive) return;
+            const url = response.url();
+            const ct = response.headers()['content-type'] || '';
+            const cd = response.headers()['content-disposition'] || '';
+            const status = response.status();
+
+            if (status < 200 || status >= 300) return;
+            // Skip static assets
+            if (/\.(woff2?|ttf|otf|eot|svg|png|jpg|jpeg|gif|ico|webp|mp4|mp3|pdf)(\?|$)/i.test(url)) return;
+            // Skip HTML/scripts/styles
+            if (/text\/html|application\/javascript|text\/javascript|text\/css|image\//i.test(ct)) return;
+
+            // Only capture if it's clearly CSV or download
+            const isCsvLike = ct.includes('csv') || ct.includes('octet-stream') ||
+                              cd.includes('attachment') || cd.includes('.csv') ||
+                              url.toLowerCase().includes('export') || url.toLowerCase().includes('.csv');
+            if (!isCsvLike) return;
+
+            try {
+                const buf = await response.buffer();
+                const str = buf.toString('utf-8').replace(/^﻿/, '');
+                // Validate: must have commas + newlines in first 300 chars (real CSV structure)
+                const sample = str.slice(0, 300);
+                if (sample.includes(',') && (sample.includes('\n') || sample.includes('\r'))) {
+                    console.log(`[REFRENS SYNC] Network CSV captured: ${url.slice(0, 80)} (${str.length} chars)`);
+                    console.log(`[REFRENS SYNC] First 120 chars: ${str.slice(0, 120)}`);
+                    networkCsvContent = str;
+                }
+            } catch (e) {
+                console.warn('[REFRENS SYNC] Response buffer error:', e.message);
+            }
+        });
+
         // Apply cookies
         try {
             const cookies = JSON.parse(cookiesRaw);
@@ -117,103 +169,27 @@ export async function syncRefrensLeads(supabaseAdmin) {
             console.warn('[REFRENS SYNC] Cookie parse error:', e.message);
         }
 
-        // Navigate
-        console.log('[REFRENS SYNC] Navigating to Refrens leads page...');
+        console.log('[REFRENS SYNC] Navigating...');
         await page.goto(REFRENS_URL, { waitUntil: 'networkidle2', timeout: 45000 });
 
         const currentUrl = page.url();
         if (currentUrl.includes('/login') || currentUrl.includes('/signin')) {
             await browser.close();
-            return { success: false, error: 'Session expired — update REFRENS_COOKIES in Railway' };
+            return { success: false, error: 'Session expired — update REFRENS_COOKIES' };
         }
 
         await page.waitForSelector('table, [class*="lead"], [class*="Lead"]', { timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
-
         console.log(`[REFRENS SYNC] Page ready: "${await page.title()}"`);
 
-        // ── Intercept the XHR/fetch that the Download CSV button triggers ────
-        // We intercept AFTER navigation is complete — strictly filter out static assets
-        let csvContent = null;
+        // Enable network listener BEFORE click
+        networkListenActive = true;
 
-        const csvPromise = new Promise((resolve) => {
-            let done = false;
-
-            // Watch for new tabs (some apps open a blank page for download)
-            browser.on('targetcreated', async (target) => {
-                if (done || target.type() !== 'page') return;
-                try {
-                    const newPage = await target.page();
-                    if (!newPage) return;
-                    // Wait for any response on new page
-                    newPage.on('response', async (res) => {
-                        if (done) return;
-                        const ct = res.headers()['content-type'] || '';
-                        const cd = res.headers()['content-disposition'] || '';
-                        if ((ct.includes('csv') || cd.includes('attachment') || cd.includes('.csv')) && !isStaticAssetUrl(res.url())) {
-                            try {
-                                const str = (await res.buffer()).toString('utf-8');
-                                if (isCsvContent(str)) {
-                                    console.log(`[REFRENS SYNC] New-tab CSV ✅ (${str.length} chars)`);
-                                    done = true; resolve(str);
-                                }
-                            } catch {}
-                        }
-                    });
-                } catch {}
-            });
-
-            // Watch page responses — ONLY after button click (started below)
-            page._csvResolve = (str) => { if (!done) { done = true; resolve(str); } };
-        });
-
-        // Set up strict post-click response listener
-        const responseHandler = async (response) => {
-            if (!page._listenForCsv) return; // Only active after click
-            const url = response.url();
-            const ct = response.headers()['content-type'] || '';
-            const cd = response.headers()['content-disposition'] || '';
-            const status = response.status();
-
-            // Skip static assets
-            if (isStaticAssetUrl(url)) return;
-            // Skip non-2xx
-            if (status < 200 || status >= 300) return;
-            // Skip HTML, images, fonts, scripts
-            if (/text\/html|image\/|font\/|application\/javascript|text\/javascript|text\/css/.test(ct)) return;
-
-            // Accept if content-type or URL or content-disposition suggests CSV/download
-            const looksLikeCsv = ct.includes('csv') || ct.includes('octet-stream') || ct.includes('text/plain') ||
-                                  cd.includes('attachment') || cd.includes('.csv') ||
-                                  url.includes('.csv') || url.toLowerCase().includes('export') || url.toLowerCase().includes('download');
-
-            if (!looksLikeCsv) return;
-
-            try {
-                const buf = await response.buffer();
-                const str = buf.toString('utf-8');
-                if (isCsvContent(str)) {
-                    console.log(`[REFRENS SYNC] CSV intercepted: ${url.slice(0, 80)} (${str.length} chars)`);
-                    console.log(`[REFRENS SYNC] First 100 chars: ${str.slice(0, 100)}`);
-                    page._csvResolve(str);
-                } else {
-                    console.log(`[REFRENS SYNC] Skipped binary response from: ${url.slice(0, 80)}`);
-                }
-            } catch (e) {
-                console.warn('[REFRENS SYNC] Buffer error:', e.message);
-            }
-        };
-        page.on('response', responseHandler);
-
-        // Click the button
+        // Click the Download CSV button
         const clicked = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button,a,span,div,li')];
             let btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
-            if (!btn) btn = els.find(e => e.textContent?.trim().toLowerCase() === 'export csv');
-            if (!btn) btn = els.find(e => {
-                const t = (e.getAttribute('title') || '').toLowerCase();
-                return t === 'download csv' || t === 'export csv';
-            });
+            if (!btn) btn = els.find(e => (e.getAttribute('title') || '').toLowerCase() === 'download csv');
             if (btn) { btn.click(); return btn.textContent?.trim().slice(0, 40); }
             return null;
         });
@@ -222,47 +198,80 @@ export async function syncRefrensLeads(supabaseAdmin) {
             await browser.close();
             return { success: false, error: 'Download CSV button not found' };
         }
+        console.log(`[REFRENS SYNC] Clicked: "${clicked}"`);
 
-        console.log(`[REFRENS SYNC] Clicked: "${clicked}" — now listening for CSV response...`);
-        page._listenForCsv = true; // Enable listener NOW (after click)
+        // Poll for up to 60s — check both blob interceptor and network capture
+        let csvContent = null;
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 2000));
 
-        // Wait up to 90s
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('CSV response not received within 90s')), 90000)
-        );
+            // Check Strategy 1: blob interceptor
+            const blobResult = await page.evaluate(() => ({
+                csv: window.__refrens_csv,
+                status: window.__refrens_csv_status
+            })).catch(() => ({ csv: null, status: 'error' }));
 
-        try {
-            csvContent = await Promise.race([csvPromise, timeoutPromise]);
-        } catch (err) {
-            // Last resort: check if page navigated to a CSV URL
-            const finalUrl = page.url();
-            console.log('[REFRENS SYNC] Timeout — final URL:', finalUrl);
-            const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
-            if (isCsvContent(bodyText)) {
-                csvContent = bodyText;
-                console.log('[REFRENS SYNC] Got CSV from page body');
-            } else {
-                await browser.close();
-                return { success: false, error: err.message };
+            if (blobResult.csv && blobResult.csv.length > 100) {
+                console.log(`[REFRENS SYNC] ✅ Strategy 1 (blob): ${blobResult.csv.length} chars at poll ${i + 1}`);
+                csvContent = blobResult.csv;
+                break;
             }
+
+            // Check Strategy 2: network interception
+            if (networkCsvContent && networkCsvContent.length > 100) {
+                console.log(`[REFRENS SYNC] ✅ Strategy 2 (network): ${networkCsvContent.length} chars at poll ${i + 1}`);
+                csvContent = networkCsvContent;
+                break;
+            }
+
+            if ((i + 1) % 5 === 0) console.log(`[REFRENS SYNC] Polling... ${(i + 1) * 2}s`);
         }
 
         await browser.close();
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
-        // Parse
+        if (!csvContent) {
+            return { success: false, error: 'Could not capture CSV after 60s — both blob and network strategies failed' };
+        }
+
+        // Parse CSV
         const content = csvContent.replace(/^﻿/, '');
-        const rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
+        let rows;
+        try {
+            rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
+        } catch (parseErr) {
+            console.error('[REFRENS SYNC] Parse error:', parseErr.message);
+            console.log('[REFRENS SYNC] First 300 chars of content:', content.slice(0, 300));
+            return { success: false, error: `CSV parse error: ${parseErr.message}` };
+        }
+
         console.log(`[REFRENS SYNC] Parsed ${rows.length} rows`);
 
+        // Log column names from first row to help debug phone field
+        if (rows.length > 0) {
+            const cols = Object.keys(rows[0]);
+            console.log('[REFRENS SYNC] Columns:', JSON.stringify(cols));
+            console.log('[REFRENS SYNC] Sample row phone fields:', JSON.stringify({
+                Phone: rows[0]['Phone'],
+                phone: rows[0]['phone'],
+                phone_number: rows[0]['phone_number'],
+                'Contact Name': rows[0]['Contact Name']
+            }));
+        }
+
         const mapped = rows.map(mapRow).filter(Boolean);
-        console.log(`[REFRENS SYNC] ${mapped.length} valid rows (${rows.length - mapped.length} skipped)`);
+        console.log(`[REFRENS SYNC] ${mapped.length} valid rows (${rows.length - mapped.length} skipped — no phone)`);
+
+        if (mapped.length === 0 && rows.length > 0) {
+            // Log first row to diagnose phone issue
+            console.log('[REFRENS SYNC] First row full:', JSON.stringify(rows[0]).slice(0, 400));
+        }
 
         let upserted = 0, errors = 0;
         for (let i = 0; i < mapped.length; i += 100) {
             const { error } = await supabaseAdmin.from('refrens_leads').upsert(mapped.slice(i, i + 100), { onConflict: 'id' });
-            if (error) { console.error(`[REFRENS SYNC] Batch error:`, error.message); errors++; }
+            if (error) { console.error(`[REFRENS SYNC] Upsert error:`, error.message); errors++; }
             else upserted += Math.min(100, mapped.length - i);
         }
 
