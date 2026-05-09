@@ -1,14 +1,8 @@
 import puppeteer from 'puppeteer';
-import fs from 'fs';
-import path from 'path';
 import { parse } from 'csv-parse/sync';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const DOWNLOAD_DIR = path.join(__dirname, '../tmp_refrens');
 const REFRENS_URL = 'https://www.refrens.com/app/relivecure/leads';
 
 function normalizePhone(raw) {
@@ -91,17 +85,13 @@ export async function syncRefrensLeads(supabaseAdmin) {
     console.log('[REFRENS SYNC] ▶ Starting...');
     const startTime = Date.now();
 
-    if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-    try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
-
     let browser = null;
-    let downloadedFile = null;
+    let csvContent = null;
 
     try {
         const cookiesRaw = process.env.REFRENS_COOKIES;
         if (!cookiesRaw) return { success: false, error: 'REFRENS_COOKIES env var missing' };
 
-        // ISOLATED browser — no shared state with crm-automation.js
         browser = await puppeteer.launch({
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
@@ -110,8 +100,59 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         const page = await browser.newPage();
 
-        const client = await page.createCDPSession();
-        await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: DOWNLOAD_DIR });
+        // ── Strategy 1: Intercept CSV response in-memory ──────────────────────
+        // Some Refrens buttons trigger a new page/tab for the download
+        // We intercept at the browser level by watching all targets
+
+        // Set up network response interception on the current page
+        const csvPromise = new Promise((resolve) => {
+            const handler = async (response) => {
+                const url = response.url();
+                const ct = response.headers()['content-type'] || '';
+                const cd = response.headers()['content-disposition'] || '';
+                if (
+                    ct.includes('text/csv') ||
+                    ct.includes('application/csv') ||
+                    ct.includes('application/octet-stream') ||
+                    cd.includes('.csv') ||
+                    url.includes('.csv') ||
+                    url.includes('export') ||
+                    url.includes('download')
+                ) {
+                    try {
+                        const buf = await response.buffer();
+                        console.log(`[REFRENS SYNC] CSV response intercepted: ${url.slice(0, 80)} (${buf.length} bytes)`);
+                        resolve(buf.toString('utf-8'));
+                    } catch (e) {
+                        console.warn('[REFRENS SYNC] Failed to buffer CSV response:', e.message);
+                    }
+                }
+            };
+            page.on('response', handler);
+        });
+
+        // Also watch for new tabs (some apps open a new page for download)
+        const newPageCsvPromise = new Promise((resolve) => {
+            browser.on('targetcreated', async (target) => {
+                if (target.type() === 'page') {
+                    try {
+                        const newPage = await target.page();
+                        if (!newPage) return;
+                        newPage.on('response', async (response) => {
+                            const ct = response.headers()['content-type'] || '';
+                            const cd = response.headers()['content-disposition'] || '';
+                            if (ct.includes('csv') || cd.includes('.csv') || ct.includes('octet-stream')) {
+                                try {
+                                    const buf = await response.buffer();
+                                    console.log(`[REFRENS SYNC] New-tab CSV: ${response.url().slice(0, 80)} (${buf.length} bytes)`);
+                                    resolve(buf.toString('utf-8'));
+                                } catch {}
+                            }
+                        });
+                    } catch {}
+                }
+            });
+        });
 
         try {
             const cookies = JSON.parse(cookiesRaw);
@@ -133,42 +174,92 @@ export async function syncRefrensLeads(supabaseAdmin) {
         await page.waitForSelector('table, [class*="lead"], [class*="Lead"]', { timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2500));
 
-        console.log('[REFRENS SYNC] Clicking Download CSV...');
+        // Log page title and URL to confirm we're in the right place
+        const pageTitle = await page.title();
+        console.log(`[REFRENS SYNC] Page: "${pageTitle}" | URL: ${page.url().slice(0, 80)}`);
+
+        // ── Strategy: Find the download button with multiple approaches ─────
+        const btnInfo = await page.evaluate(() => {
+            const allEls = [...document.querySelectorAll('button,a,span,div,li,svg')];
+            const candidates = allEls
+                .filter(e => {
+                    const text = e.textContent?.trim().toLowerCase() || '';
+                    const title = (e.getAttribute('title') || '').toLowerCase();
+                    const aria = (e.getAttribute('aria-label') || '').toLowerCase();
+                    return text === 'download csv' || text === 'export' || text === 'export csv' ||
+                        title.includes('download') || aria.includes('download') ||
+                        title.includes('export') || aria.includes('export');
+                })
+                .map(e => ({
+                    tag: e.tagName,
+                    text: e.textContent?.trim().slice(0, 50),
+                    title: e.getAttribute('title'),
+                    classes: e.className?.slice?.(0, 60),
+                    visible: e.offsetParent !== null
+                }));
+            return candidates;
+        });
+        console.log('[REFRENS SYNC] Download button candidates:', JSON.stringify(btnInfo));
+
         const clicked = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button,a,span,div,li')];
-            const btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
-            if (btn) { btn.click(); return true; }
-            return false;
+            // Try exact text match first
+            let btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
+            if (!btn) btn = els.find(e => e.textContent?.trim().toLowerCase() === 'export csv');
+            if (!btn) btn = els.find(e => e.textContent?.trim().toLowerCase() === 'export');
+            if (!btn) btn = els.find(e => {
+                const t = (e.getAttribute('title') || '').toLowerCase();
+                return t.includes('download') || t.includes('export');
+            });
+            if (btn) { btn.click(); return btn.textContent?.trim().slice(0, 40); }
+            return null;
         });
 
         if (!clicked) {
+            // Log the full page HTML structure to help debug
+            const structure = await page.evaluate(() => {
+                const btns = [...document.querySelectorAll('button')].map(b => b.textContent?.trim().slice(0, 40));
+                const links = [...document.querySelectorAll('a')].map(a => a.textContent?.trim().slice(0, 40)).filter(Boolean);
+                return { buttons: btns.slice(0, 20), links: links.slice(0, 20) };
+            });
+            console.log('[REFRENS SYNC] Page buttons:', JSON.stringify(structure.buttons));
+            console.log('[REFRENS SYNC] Page links:', JSON.stringify(structure.links));
             await browser.close();
-            return { success: false, error: 'Download CSV button not found on page' };
+            return { success: false, error: 'Download CSV button not found — check logs for page structure' };
         }
 
-        console.log('[REFRENS SYNC] Waiting for download...');
-        const MAX_WAIT = 180000;
-        let elapsed = 0;
-        while (elapsed < MAX_WAIT) {
-            await new Promise(r => setTimeout(r, 4000));
-            elapsed += 4000;
-            const files = fs.readdirSync(DOWNLOAD_DIR).filter(f => f.endsWith('.csv') && !f.endsWith('.crdownload') && !f.endsWith('.tmp'));
-            if (files.length > 0) {
-                downloadedFile = path.join(DOWNLOAD_DIR, files[0]);
-                const kb = (fs.statSync(downloadedFile).size / 1024).toFixed(1);
-                console.log(`[REFRENS SYNC] Downloaded: ${files[0]} (${kb} KB) ✅`);
-                break;
+        console.log(`[REFRENS SYNC] Clicked: "${clicked}"`);
+
+        // Wait up to 90s for CSV response from either strategy
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('CSV response timeout after 90s')), 90000)
+        );
+
+        try {
+            csvContent = await Promise.race([csvPromise, newPageCsvPromise, timeoutPromise]);
+            console.log(`[REFRENS SYNC] CSV captured in memory ✅ (${csvContent.length} chars)`);
+        } catch (timeoutErr) {
+            // Strategy 2 fallback: maybe the page navigated to a CSV URL directly
+            const finalUrl = page.url();
+            if (finalUrl.includes('.csv') || finalUrl.includes('export')) {
+                console.log('[REFRENS SYNC] Trying direct page content as CSV...');
+                const content = await page.content();
+                if (content && !content.includes('<html')) {
+                    csvContent = content;
+                }
             }
-            if (elapsed % 20000 === 0) console.log(`[REFRENS SYNC] Waiting... ${elapsed / 1000}s`);
+            if (!csvContent) {
+                await browser.close();
+                return { success: false, error: timeoutErr.message };
+            }
         }
 
         await browser.close();
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
-        if (!downloadedFile) return { success: false, error: 'Download timed out after 3 minutes' };
-
-        const content = fs.readFileSync(downloadedFile, 'utf-8').replace(/^﻿/, '');
+        // Parse CSV
+        const content = csvContent.replace(/^﻿/, ''); // strip BOM
         const rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
         console.log(`[REFRENS SYNC] Parsed ${rows.length} rows`);
 
@@ -183,10 +274,6 @@ export async function syncRefrensLeads(supabaseAdmin) {
             else upserted += Math.min(BATCH, mapped.length - i);
         }
 
-        fs.unlinkSync(downloadedFile);
-        downloadedFile = null;
-        try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
-
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`[REFRENS SYNC] ✅ Done in ${duration}s — ${upserted} upserted, ${errors} batch errors`);
 
@@ -195,8 +282,6 @@ export async function syncRefrensLeads(supabaseAdmin) {
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
         if (browser) await browser.close().catch(() => {});
-        if (downloadedFile && fs.existsSync(downloadedFile)) fs.unlinkSync(downloadedFile);
-        try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
         return { success: false, error: err.message };
     }
 }
