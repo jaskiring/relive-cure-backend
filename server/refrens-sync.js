@@ -4,7 +4,7 @@ import { dirname } from 'path';
 
 // Reuse the SAME shared browser instance as crm-automation.js
 // This avoids the "browser already running for userDataDir" conflict
-import { getBrowserInstance } from './crm-automation.js';
+import puppeteer from 'puppeteer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -76,8 +76,17 @@ export async function syncRefrensLeads(supabaseAdmin) {
         const cookiesRaw = process.env.REFRENS_COOKIES;
         if (!cookiesRaw) return { success: false, error: 'REFRENS_COOKIES env var missing' };
 
-        // Reuse the shared crm-automation browser (same userDataDir profile Refrens trusts)
-        browser = await getBrowserInstance();
+        // Fresh browser — no userDataDir conflict, but with anti-detection flags
+        browser = await puppeteer.launch({
+            headless: true,
+            defaultViewport: null,
+            args: [
+                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                '--disable-gpu', '--start-maximized',
+                '--disable-blink-features=AutomationControlled'
+            ],
+            timeout: 60000
+        });
         context = await browser.createBrowserContext();
         const page = await context.newPage();
 
@@ -137,7 +146,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
         if (capturedToken) await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken).catch(() => {});
 
         if (page.url().includes('/login')) {
-            await context.close();
+            await context.close(); await browser.close();
             return { success: false, error: 'Session expired — update REFRENS_COOKIES' };
         }
 
@@ -208,7 +217,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         if (!btnPos) {
             console.log('[REFRENS SYNC] Page text:', await page.evaluate(() => document.body?.innerText?.slice(0,300)));
-            await context.close();
+            await context.close(); await browser.close();
             return { success: false, error: 'Download CSV button not found' };
         }
 
@@ -271,7 +280,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
         clearInterval(tryModal);
 
         await context.close();
-
+        await browser.close();
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
@@ -306,6 +315,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
         if (context) await context.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
         
         return { success: false, error: err.message };
     }
