@@ -164,28 +164,34 @@ export async function syncRefrensLeads(supabaseAdmin) {
             };
         }).catch(() => {});
 
-        // ── Find "Download CSV" element via Puppeteer handle (native click) ──
-        const downloadHandle = await page.evaluateHandle(() => {
+        // ── Find "Download CSV" button coordinates, click via page.mouse (real cursor) ──
+        const btnPos = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button, a, span, div')];
-            return els.find(e => e.textContent?.trim().toLowerCase() === 'download csv')
-                || els.find(e => (e.getAttribute('title') || '').toLowerCase().includes('download csv'))
-                || els.find(e => e.textContent?.trim().toLowerCase().includes('download csv'));
+            const btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv')
+                     || els.find(e => (e.getAttribute('title') || '').toLowerCase().includes('download csv'))
+                     || els.find(e => e.textContent?.trim().toLowerCase().includes('download csv'));
+            if (!btn) {
+                // Debug: log what IS on the page
+                console.log('PAGE BUTTONS:', [...document.querySelectorAll('button,a')].map(b => b.textContent?.trim().slice(0,30)).join(' | '));
+                return null;
+            }
+            btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+            const rect = btn.getBoundingClientRect();
+            return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), tag: btn.tagName, text: btn.textContent?.trim().slice(0, 30) };
         });
 
-        const downloadEl = downloadHandle?.asElement();
-        if (!downloadEl) {
-            // Debug: show page content
-            const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 500));
-            console.log('[REFRENS SYNC] Page text sample:', pageText);
+        if (!btnPos) {
+            const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400));
+            console.log('[REFRENS SYNC] Page sample:', pageText?.replace(/\n/g, ' '));
             await browser.close();
             return { success: false, error: 'Download CSV button not found' };
         }
 
-        // Scroll into view + native Puppeteer click (real mouse events)
-        await downloadEl.evaluate(el => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+        console.log(`[REFRENS SYNC] Btn: ${btnPos.tag} "${btnPos.text}" @ (${btnPos.x},${btnPos.y})`);
         await new Promise(r => setTimeout(r, 500));
-        await downloadEl.click();  // Real mouse events — triggers React handlers
-        console.log('[REFRENS SYNC] Step 1: native click fired ✅');
+        // page.mouse.click sends real OS-level mouse events — the only way to trigger React handlers
+        await page.mouse.click(btnPos.x, btnPos.y);
+        console.log('[REFRENS SYNC] Step 1: page.mouse.click fired ✅');
 
         // ── Poll for modal + click Download (interval, frame-error safe) ──
         let modalClicked = false;
@@ -204,9 +210,9 @@ export async function syncRefrensLeads(supabaseAdmin) {
                 });
                 if (snippet) console.log(`[REFRENS SYNC] Body: ${snippet.replace(/\n/g,' ').slice(0,120)}`);
 
-                const result = await page.evaluate(() => {
+                const btnInfo = await page.evaluate(() => {
                     const body = (document.body?.innerText || '').toLowerCase();
-                    if (!body.includes('ready to download') && !body.includes('file is ready')) return 'waiting';
+                    if (!body.includes('ready to download') && !body.includes('file is ready')) return null;
 
                     // Re-inject blob interceptor
                     const orig = URL.createObjectURL.bind(URL);
@@ -215,30 +221,31 @@ export async function syncRefrensLeads(supabaseAdmin) {
                         return orig(blob);
                     };
 
-                    // Find Download button
                     const btns = [...document.querySelectorAll('button, a')];
                     const dlBtn = btns.find(b => {
                         const t = b.textContent?.trim().toLowerCase();
                         return t === 'download' || t === 'download file' || t === 'download leads';
-                    });
-                    if (dlBtn) { dlBtn.click(); return 'clicked:' + dlBtn.textContent?.trim(); }
+                    }) || (() => {
+                        const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="Modal"],[class*="Dialog"]');
+                        return modal && [...modal.querySelectorAll('button,a')].find(b => !/(cancel|close|dismiss)/i.test(b.textContent));
+                    })();
 
-                    // Fallback: modal button that isn't cancel/close
-                    const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="Modal"],[class*="Dialog"]');
-                    if (modal) {
-                        const btn = [...modal.querySelectorAll('button,a')]
-                            .find(b => !/(cancel|close|dismiss)/i.test(b.textContent));
-                        if (btn) { btn.click(); return 'fallback:' + btn.textContent?.trim().slice(0,20); }
-                    }
-                    return 'modal_found_no_btn';
+                    if (!dlBtn) return { found: false };
+                    dlBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    const rect = dlBtn.getBoundingClientRect();
+                    return { found: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: dlBtn.textContent?.trim().slice(0,20) };
                 });
 
-                if (result && result !== 'waiting') {
-                    console.log(`[REFRENS SYNC] Modal: ${result}`);
-                    if (result.startsWith('clicked') || result.startsWith('fallback')) {
-                        modalClicked = true;
-                        clearInterval(tryModal);
-                    }
+                if (btnInfo === null) {
+                    // Modal not ready yet
+                } else if (btnInfo.found) {
+                    console.log(`[REFRENS SYNC] Step 2 modal btn: "${btnInfo.text}" @ (${btnInfo.x},${btnInfo.y})`);
+                    await page.mouse.click(btnInfo.x, btnInfo.y);
+                    modalClicked = true;
+                    clearInterval(tryModal);
+                    console.log('[REFRENS SYNC] Step 2: page.mouse.click on modal Download ✅');
+                } else {
+                    console.log('[REFRENS SYNC] Modal visible but Download btn not found yet');
                 }
             } catch(_) {}
         }, 3000);
