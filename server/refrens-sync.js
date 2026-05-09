@@ -1,5 +1,13 @@
 import puppeteer from 'puppeteer';
+import fs from 'fs';
+import path from 'path';
 import { parse } from 'csv-parse/sync';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const DOWNLOAD_DIR = path.join(__dirname, '../tmp_dl');
 
 const REFRENS_URL = 'https://www.refrens.com/app/relivecure/leads';
 
@@ -22,10 +30,10 @@ function getField(row, ...keys) {
     return null;
 }
 function mapRow(row) {
-    const phone = normalizePhone(getField(row, 'Phone', 'phone_number', 'phone', 'Mobile', 'mobile', 'Phone Number', 'Contact Phone') || '');
+    const phone = normalizePhone(getField(row, 'Phone', 'phone_number', 'phone', 'Mobile', 'Phone Number') || '');
     if (!phone) return null;
     return {
-        id: phone, contact_name: getField(row, 'Contact Name', 'Name', 'name'),
+        id: phone, contact_name: getField(row, 'Contact Name', 'Name'),
         phone, customer_city: getField(row, 'Customer City', 'City'),
         state: getField(row, 'State'), refrens_created_at: parseRefrensDate(row['Created At']),
         status: getField(row, 'Status'), lead_source: getField(row, 'Lead Source'),
@@ -51,22 +59,22 @@ function mapRow(row) {
     };
 }
 
-// Same token exchange as crm-automation.js
 async function waitForTokenRefresh(page, timeoutMs = 20000) {
     await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: timeoutMs });
     try {
-        await page.waitForFunction(() => {
-            const at = sessionStorage.getItem('__at');
-            return !!at && at.length > 20;
-        }, { timeout: timeoutMs, polling: 300 });
+        await page.waitForFunction(() => !!sessionStorage.getItem('__at')?.length > 20, { timeout: timeoutMs, polling: 300 });
         return true;
     } catch (_) { return false; }
 }
 
 export async function syncRefrensLeads(supabaseAdmin) {
-    console.log('[REFRENS SYNC] ▶ Starting v5...');
+    console.log('[REFRENS SYNC] ▶ Starting v6...');
     const startTime = Date.now();
     let browser = null;
+
+    // Clean download dir
+    if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+    try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
 
     try {
         const cookiesRaw = process.env.REFRENS_COOKIES;
@@ -78,94 +86,70 @@ export async function syncRefrensLeads(supabaseAdmin) {
             defaultViewport: { width: 1366, height: 768 }
         });
 
+        // ── BROWSER-LEVEL CDP: catches ALL downloads regardless of mechanism ──
+        const browserSession = await browser.target().createCDPSession();
+        await browserSession.send('Browser.setDownloadBehavior', {
+            behavior: 'allow',
+            downloadPath: DOWNLOAD_DIR,
+            eventsEnabled: true
+        });
+        console.log(`[REFRENS SYNC] Download dir: ${DOWNLOAD_DIR}`);
+
+        let downloadGuid = null;
+        let downloadFilename = null;
+        let downloadComplete = false;
+
+        browserSession.on('Browser.downloadWillBegin', (event) => {
+            downloadGuid = event.guid;
+            downloadFilename = event.suggestedFilename || 'leads.csv';
+            console.log(`[REFRENS SYNC] ⬇ Download starting: "${downloadFilename}" from ${event.url?.slice(0, 80)}`);
+        });
+
+        browserSession.on('Browser.downloadProgress', (event) => {
+            if (event.guid === downloadGuid) {
+                console.log(`[REFRENS SYNC] Download: ${event.state} ${event.receivedBytes}/${event.totalBytes} bytes`);
+                if (event.state === 'completed') downloadComplete = true;
+                if (event.state === 'canceled') console.warn('[REFRENS SYNC] Download canceled!');
+            }
+        });
+
         const page = await browser.newPage();
 
-        // Apply cookies (same as crm-automation.js)
+        // Apply cookies + token exchange (same as crm-automation.js)
         const cookies = JSON.parse(cookiesRaw);
         await page.setCookie(...cookies.filter(c => c.name && c.value && c.domain));
-        console.log('[REFRENS SYNC] Cookies applied ✅');
 
-        // Step 1: Exchange __rt for __at (same as crm-automation.js)
         const tokenReady = await waitForTokenRefresh(page, 15000);
-        if (!tokenReady) {
-            await browser.close();
-            return { success: false, error: 'Token refresh failed — __at not found in sessionStorage' };
+        const capturedToken = tokenReady ? await page.evaluate(() => sessionStorage.getItem('__at')) : null;
+        if (capturedToken) {
+            console.log(`[REFRENS SYNC] __at token ready ✅`);
+            await page.evaluateOnNewDocument((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
+        } else {
+            console.warn('[REFRENS SYNC] Token exchange failed — continuing with cookies only');
         }
-        const capturedToken = await page.evaluate(() => sessionStorage.getItem('__at'));
-        console.log(`[REFRENS SYNC] Got __at token ✅ (len=${capturedToken?.length})`);
 
-        // Persist token for next navigation
-        await page.evaluateOnNewDocument((token) => {
-            try { sessionStorage.setItem('__at', token); } catch(e) {}
-        }, capturedToken);
-
-        // Step 2: Enable request interception to capture ALL post-click requests
-        await page.setRequestInterception(true);
-
-        const postClickRequests = [];
-        let captureActive = false;
-        let csvContent = null;
-
-        page.on('request', (request) => {
-            if (captureActive) {
-                const url = request.url();
-                if (!url.match(/\.(woff2?|ttf|png|jpg|gif|ico|svg|webp)(\?|$)/i)) {
-                    postClickRequests.push({ url, method: request.method() });
-                }
-            }
-            request.continue();
-        });
-
-        page.on('response', async (response) => {
-            if (!captureActive) return;
-            const url = response.url();
-            if (url.match(/\.(woff2?|ttf|png|jpg|gif|ico|svg|webp|js|css)(\?|$)/i)) return;
-            const ct = response.headers()['content-type'] || '';
-            const cd = response.headers()['content-disposition'] || '';
-            const status = response.status();
-            if (status < 200 || status >= 300) return;
-
-            // Capture: text/csv, octet-stream with attachment, or URL has csv/export
-            const isDownload = ct.includes('text/csv') || ct.includes('application/csv') ||
-                               (ct.includes('octet-stream') && (cd.includes('attachment') || cd.includes('.csv'))) ||
-                               cd.toLowerCase().includes('.csv') ||
-                               url.toLowerCase().includes('/csv') || url.toLowerCase().includes('export');
-
-            if (!isDownload) return;
-
-            try {
-                const buf = await response.buffer();
-                const str = buf.toString('utf-8').replace(/^﻿/, '');
-                const sample = str.slice(0, 300);
-                if (sample.includes(',') && (sample.includes('\n') || sample.includes('\r'))) {
-                    console.log(`[REFRENS SYNC] ✅ Network CSV: ${url.slice(0, 100)}`);
-                    console.log(`[REFRENS SYNC] Content-Type: ${ct} | CD: ${cd}`);
-                    console.log(`[REFRENS SYNC] First 200 chars: ${str.slice(0, 200)}`);
-                    csvContent = str;
-                }
-            } catch (e) {
-                console.warn('[REFRENS SYNC] Response buffer error:', e.message);
-            }
-        });
-
-        // Step 3: Navigate to leads page
+        // Navigate to leads page
         await page.goto(REFRENS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-        await page.evaluate((token) => {
-            try { sessionStorage.setItem('__at', token); } catch(e) {}
-        }, capturedToken);
+        if (capturedToken) {
+            await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
+        }
+
+        const currentUrl = page.url();
+        if (currentUrl.includes('/login') || currentUrl.includes('/signin')) {
+            await browser.close();
+            return { success: false, error: 'Session expired — update REFRENS_COOKIES' };
+        }
 
         await page.waitForSelector('table, [class*="lead"], [class*="Lead"]', { timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
-        console.log(`[REFRENS SYNC] Leads page ready: "${await page.title()}"`);
+        console.log(`[REFRENS SYNC] Page ready: "${await page.title()}"`);
 
-        // Step 4: Click button with request capture active
-        captureActive = true;
-
+        // Click Download CSV
         const clicked = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button,a,span,div,li')];
             let btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
             if (!btn) btn = els.find(e => (e.getAttribute('title') || '').toLowerCase() === 'download csv');
-            if (btn) { btn.click(); return btn.tagName + ': ' + btn.textContent?.trim().slice(0, 40); }
+            if (btn) { btn.click(); return btn.tagName + ':' + btn.textContent?.trim().slice(0,30); }
             return null;
         });
 
@@ -175,80 +159,69 @@ export async function syncRefrensLeads(supabaseAdmin) {
         }
         console.log(`[REFRENS SYNC] Clicked: "${clicked}"`);
 
-        // Step 5: Wait 30s and check what requests were made
-        await new Promise(r => setTimeout(r, 5000));
-        console.log(`[REFRENS SYNC] Post-click requests (5s): ${JSON.stringify(postClickRequests.slice(-10))}`);
+        // Wait up to 90s for download to complete
+        const maxWait = 90000;
+        const pollInterval = 2000;
+        let waited = 0;
+        let downloadedFile = null;
 
-        // Wait up to 30 more seconds for CSV
-        for (let i = 0; i < 15; i++) {
-            await new Promise(r => setTimeout(r, 2000));
-            if (csvContent) break;
-            if (i === 4) console.log('[REFRENS SYNC] All post-click requests so far:', JSON.stringify(postClickRequests));
-        }
+        while (waited < maxWait) {
+            await new Promise(r => setTimeout(r, pollInterval));
+            waited += pollInterval;
 
-        // Step 6: If network didn't get it, try direct API with __at token
-        if (!csvContent) {
-            console.log('[REFRENS SYNC] Network capture failed. Trying direct API fetch with __at...');
-            console.log('[REFRENS SYNC] All post-click requests:', JSON.stringify(postClickRequests));
-
-            // Try to fetch the CSV directly using the __at token via page.evaluate
-            const result = await page.evaluate(async (token) => {
-                // Common Refrens export API patterns
-                const attempts = [
-                    { url: '/api/v2/leads/export?businessSlug=relivecure&format=csv', headers: { 'x-at': token, 'Authorization': `Bearer ${token}` } },
-                    { url: '/api/v1/leads/export?businessSlug=relivecure&format=csv', headers: { 'x-at': token } },
-                    { url: '/api/leads/download?format=csv', headers: { 'x-at': token } },
-                ];
-                const logs = [];
-                for (const attempt of attempts) {
-                    try {
-                        const res = await fetch(attempt.url, { headers: attempt.headers, credentials: 'include' });
-                        const ct = res.headers.get('content-type') || '';
-                        const text = await res.text();
-                        logs.push(`${attempt.url} -> ${res.status} ${ct} (${text.length}c)`);
-                        if (res.ok && text.includes(',') && text.includes('\n')) {
-                            return { csv: text, log: logs };
-                        }
-                    } catch(e) {
-                        logs.push(`${attempt.url} -> ERROR: ${e.message}`);
-                    }
-                }
-                return { csv: null, log: logs };
-            }, capturedToken);
-
-            console.log('[REFRENS SYNC] Direct API attempts:', JSON.stringify(result.log));
-            if (result.csv) {
-                console.log(`[REFRENS SYNC] ✅ Direct API CSV: ${result.csv.length} chars`);
-                csvContent = result.csv;
+            // Check via CDP download events
+            if (downloadComplete && downloadGuid) {
+                // File is saved as GUID in the download dir
+                const guidFile = path.join(DOWNLOAD_DIR, downloadGuid);
+                const namedFile = path.join(DOWNLOAD_DIR, downloadFilename);
+                if (fs.existsSync(guidFile)) { downloadedFile = guidFile; break; }
+                if (fs.existsSync(namedFile)) { downloadedFile = namedFile; break; }
             }
+
+            // Also scan the directory for any CSV file
+            const files = fs.readdirSync(DOWNLOAD_DIR).filter(f =>
+                !f.endsWith('.crdownload') && !f.endsWith('.tmp') && !f.endsWith('.part')
+            );
+            if (files.length > 0) {
+                const fullPath = path.join(DOWNLOAD_DIR, files[0]);
+                const stat = fs.statSync(fullPath);
+                if (stat.size > 100) {
+                    downloadedFile = fullPath;
+                    console.log(`[REFRENS SYNC] File found: ${files[0]} (${stat.size} bytes)`);
+                    break;
+                }
+            }
+
+            if (waited % 10000 === 0) console.log(`[REFRENS SYNC] Waiting for download... ${waited/1000}s`);
         }
 
         await browser.close();
         browser = null;
+        console.log('[REFRENS SYNC] Browser closed ✅');
 
-        if (!csvContent) {
-            return { success: false, error: 'All strategies failed. Check logs for post-click request URLs to find the correct API endpoint.' };
+        if (!downloadedFile) {
+            return { success: false, error: `Download did not complete in ${maxWait/1000}s. downloadGuid=${downloadGuid} downloadComplete=${downloadComplete}` };
         }
 
-        const content = csvContent.replace(/^﻿/, '');
+        const content = fs.readFileSync(downloadedFile, 'utf-8').replace(/^﻿/, '');
+        try { fs.unlinkSync(downloadedFile); } catch {}
+
         let rows;
         try {
             rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
         } catch (e) {
-            console.error('[REFRENS SYNC] Parse error:', e.message);
-            console.log('[REFRENS SYNC] First 300 chars:', content.slice(0, 300));
+            console.error('[REFRENS SYNC] Parse error:', e.message, '| First 200:', content.slice(0, 200));
             return { success: false, error: `CSV parse error: ${e.message}` };
         }
 
         console.log(`[REFRENS SYNC] Parsed ${rows.length} rows`);
         if (rows.length > 0) {
-            const cols = Object.keys(rows[0]);
-            console.log('[REFRENS SYNC] Columns:', JSON.stringify(cols));
-            console.log('[REFRENS SYNC] First row sample:', JSON.stringify(rows[0]).slice(0, 400));
+            console.log('[REFRENS SYNC] Columns:', JSON.stringify(Object.keys(rows[0])));
+            console.log('[REFRENS SYNC] Row 0 sample:', JSON.stringify(rows[0]).slice(0, 300));
         }
 
         const mapped = rows.map(mapRow).filter(Boolean);
-        console.log(`[REFRENS SYNC] ${mapped.length} valid rows`);
+        console.log(`[REFRENS SYNC] ${mapped.length} valid rows (${rows.length - mapped.length} skipped)`);
 
         let upserted = 0, errors = 0;
         for (let i = 0; i < mapped.length; i += 100) {
@@ -264,6 +237,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
         if (browser) await browser.close().catch(() => {});
+        try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
         return { success: false, error: err.message };
     }
 }
