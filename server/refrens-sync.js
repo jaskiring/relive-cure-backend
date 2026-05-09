@@ -2,15 +2,13 @@ import { parse } from 'csv-parse/sync';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
-// Reuse the SAME browser instance as crm-automation.js
-// (persistent userDataDir profile — the one Refrens already trusts)
-import { getBrowserCookies } from './crm-automation.js';
-import puppeteer from 'puppeteer';
+// Reuse the SAME shared browser instance as crm-automation.js
+// This avoids the "browser already running for userDataDir" conflict
+import { getBrowserInstance } from './crm-automation.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REFRENS_URL = 'https://www.refrens.com/app/relivecure/leads';
-const USER_DATA_DIR = process.env.PUPPETEER_SESSION_DIR || "./puppeteer-session";
 
 function normalizePhone(raw) {
     if (!raw) return null;
@@ -66,19 +64,6 @@ function looksLikeCsv(text) {
     return lines.length > 3 && lines[0].includes(',') && lines[1].includes(',');
 }
 
-async function ensureChrome() {
-    const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.cache/puppeteer';
-    const { execSync } = await import('child_process');
-    const { default: fs } = await import('fs');
-    try {
-        const found = execSync(`find ${cacheDir} -name "chrome" -type f 2>/dev/null | head -1`, { encoding: 'utf8' }).trim();
-        if (found && fs.existsSync(found)) return found;
-    } catch (e) {}
-    try { const p = puppeteer.executablePath(); if (fs.existsSync(p)) return p; } catch (e) {}
-    const systemPaths = ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium'];
-    for (const p of systemPaths) { if (fs.existsSync(p)) return p; }
-    return undefined;
-}
 
 export async function syncRefrensLeads(supabaseAdmin) {
     console.log('[REFRENS SYNC] ▶ Starting v8 (persistent userDataDir profile)...');
@@ -91,28 +76,8 @@ export async function syncRefrensLeads(supabaseAdmin) {
         const cookiesRaw = process.env.REFRENS_COOKIES;
         if (!cookiesRaw) return { success: false, error: 'REFRENS_COOKIES env var missing' };
 
-        // Launch with same config as crm-automation.js — persistent profile Refrens trusts
-        const executablePath = await ensureChrome();
-        browser = await puppeteer.launch({
-            headless: true,
-            slowMo: 0,
-            ...(executablePath ? { executablePath } : {}),
-            userDataDir: USER_DATA_DIR,
-            defaultViewport: null,
-            args: [
-                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                '--disable-gpu', '--disable-software-rasterizer', '--disable-extensions',
-                '--disable-background-networking', '--disable-default-apps', '--disable-sync',
-                '--disable-translate', '--hide-scrollbars', '--metrics-recording-only',
-                '--mute-audio', '--no-first-run', '--safebrowsing-disable-auto-update',
-                '--memory-pressure-off', '--js-flags=--max-old-space-size=256',
-                '--start-maximized',
-                '--disable-blink-features=AutomationControlled'  // hide webdriver flag
-            ],
-            timeout: 60000
-        });
-
-        // Use isolated context (like crm-automation.js does per lead)
+        // Reuse the shared crm-automation browser (same userDataDir profile Refrens trusts)
+        browser = await getBrowserInstance();
         context = await browser.createBrowserContext();
         const page = await context.newPage();
 
@@ -172,7 +137,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
         if (capturedToken) await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken).catch(() => {});
 
         if (page.url().includes('/login')) {
-            await context.close(); await browser.close();
+            await context.close();
             return { success: false, error: 'Session expired — update REFRENS_COOKIES' };
         }
 
@@ -243,7 +208,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         if (!btnPos) {
             console.log('[REFRENS SYNC] Page text:', await page.evaluate(() => document.body?.innerText?.slice(0,300)));
-            await context.close(); await browser.close();
+            await context.close();
             return { success: false, error: 'Download CSV button not found' };
         }
 
@@ -306,7 +271,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
         clearInterval(tryModal);
 
         await context.close();
-        await browser.close();
+
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
@@ -341,7 +306,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
         if (context) await context.close().catch(() => {});
-        if (browser) await browser.close().catch(() => {});
+        
         return { success: false, error: err.message };
     }
 }
