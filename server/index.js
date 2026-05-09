@@ -668,14 +668,23 @@ app.get('/api/refrens-analytics', async (req, res) => {
 
 app.get('/api/sync-status', async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin
-            .from('crm_sync_logs')
-            .select('*')
-            .order('created_at', { ascending: false })
-            .limit(5);
-        if (error) throw new Error(error.message);
-        const { count } = await supabaseAdmin.from('refrens_leads').select('*', { count: 'exact', head: true });
-        res.json({ success: true, refrens_leads_count: count, recent_syncs: data });
+        const { count, error: countErr } = await supabaseAdmin
+            .from('refrens_leads')
+            .select('*', { count: 'exact', head: true });
+        if (countErr) throw new Error(countErr.message);
+
+        const { data: lastSync, error: syncErr } = await supabaseAdmin
+            .from('refrens_leads')
+            .select('synced_at')
+            .order('synced_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        res.json({
+            success: true,
+            refrens_leads_count: count,
+            last_synced_at: lastSync?.synced_at || null
+        });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
@@ -708,3 +717,4 @@ app.listen(PORT, '0.0.0.0', () => {
     setInterval(runRefrensSync, 4 * 60 * 60 * 1000);
     console.log('[SCHEDULER] Refrens sync: first run in 3 min, then every 4h');
 });
+
