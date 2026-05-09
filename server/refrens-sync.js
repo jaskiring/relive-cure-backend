@@ -1,11 +1,16 @@
-import puppeteer from 'puppeteer';
 import { parse } from 'csv-parse/sync';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
+// Reuse the SAME browser instance as crm-automation.js
+// (persistent userDataDir profile — the one Refrens already trusts)
+import { getBrowserCookies } from './crm-automation.js';
+import puppeteer from 'puppeteer';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REFRENS_URL = 'https://www.refrens.com/app/relivecure/leads';
+const USER_DATA_DIR = process.env.PUPPETEER_SESSION_DIR || "./puppeteer-session";
 
 function normalizePhone(raw) {
     if (!raw) return null;
@@ -55,69 +60,106 @@ function mapRow(row) {
     };
 }
 
-async function waitForTokenRefresh(page, timeoutMs = 20000) {
-    await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    try {
-        await page.waitForFunction(() => {
-            const at = sessionStorage.getItem('__at');
-            return !!at && at.length > 20;
-        }, { timeout: timeoutMs, polling: 300 });
-        return true;
-    } catch (_) { return false; }
-}
-
 function looksLikeCsv(text) {
     if (!text || text.length < 100) return false;
     const lines = text.split('\n').filter(l => l.trim());
     return lines.length > 3 && lines[0].includes(',') && lines[1].includes(',');
 }
 
+async function ensureChrome() {
+    const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.cache/puppeteer';
+    const { execSync } = await import('child_process');
+    const { default: fs } = await import('fs');
+    try {
+        const found = execSync(`find ${cacheDir} -name "chrome" -type f 2>/dev/null | head -1`, { encoding: 'utf8' }).trim();
+        if (found && fs.existsSync(found)) return found;
+    } catch (e) {}
+    try { const p = puppeteer.executablePath(); if (fs.existsSync(p)) return p; } catch (e) {}
+    const systemPaths = ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium'];
+    for (const p of systemPaths) { if (fs.existsSync(p)) return p; }
+    return undefined;
+}
+
 export async function syncRefrensLeads(supabaseAdmin) {
-    console.log('[REFRENS SYNC] ▶ Starting v7d...');
+    console.log('[REFRENS SYNC] ▶ Starting v8 (persistent userDataDir profile)...');
     const startTime = Date.now();
     let browser = null;
+    let context = null;
     let capturedCsvText = null;
 
     try {
         const cookiesRaw = process.env.REFRENS_COOKIES;
         if (!cookiesRaw) return { success: false, error: 'REFRENS_COOKIES env var missing' };
 
+        // Launch with same config as crm-automation.js — persistent profile Refrens trusts
+        const executablePath = await ensureChrome();
         browser = await puppeteer.launch({
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-            defaultViewport: { width: 1366, height: 768 }
+            slowMo: 0,
+            ...(executablePath ? { executablePath } : {}),
+            userDataDir: USER_DATA_DIR,
+            defaultViewport: null,
+            args: [
+                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                '--disable-gpu', '--disable-software-rasterizer', '--disable-extensions',
+                '--disable-background-networking', '--disable-default-apps', '--disable-sync',
+                '--disable-translate', '--hide-scrollbars', '--metrics-recording-only',
+                '--mute-audio', '--no-first-run', '--safebrowsing-disable-auto-update',
+                '--memory-pressure-off', '--js-flags=--max-old-space-size=256',
+                '--start-maximized',
+                '--disable-blink-features=AutomationControlled'  // hide webdriver flag
+            ],
+            timeout: 60000
         });
 
-        const page = await browser.newPage();
+        // Use isolated context (like crm-automation.js does per lead)
+        context = await browser.createBrowserContext();
+        const page = await context.newPage();
 
-        // ── Auth ──
+        // Override navigator.webdriver to avoid bot detection
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
+        // Set auth cookies
         const cookies = JSON.parse(cookiesRaw);
         await page.setCookie(...cookies.filter(c => c.name && c.value && c.domain));
-        const tokenReady = await waitForTokenRefresh(page, 15000);
-        const capturedToken = tokenReady ? await page.evaluate(() => sessionStorage.getItem('__at')) : null;
-        console.log(`[REFRENS SYNC] Auth: token=${capturedToken ? 'OK' : 'missing'}`);
 
-        // ── Network response interceptor ──
+        // Exchange __rt for __at token (same as crm-automation.js)
+        await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        let capturedToken = null;
+        try {
+            await page.waitForFunction(() => {
+                const at = sessionStorage.getItem('__at');
+                return !!at && at.length > 20;
+            }, { timeout: 15000, polling: 300 });
+            capturedToken = await page.evaluate(() => sessionStorage.getItem('__at'));
+            console.log('[REFRENS SYNC] __at token ready ✅');
+        } catch (_) {
+            console.warn('[REFRENS SYNC] Token exchange failed — cookies only');
+        }
+
+        if (capturedToken) {
+            await page.evaluateOnNewDocument((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
+        }
+
+        // ── Intercept CSV via network responses ──
         page.on('response', async (response) => {
             if (capturedCsvText) return;
             try {
-                const url = response.url();
                 const ct = (response.headers()['content-type'] || '').toLowerCase();
                 const cd = (response.headers()['content-disposition'] || '').toLowerCase();
-                if (cd.includes('attachment') || ct.includes('csv') || url.includes('/export') || url.includes('/download')) {
-                    console.log(`[REFRENS SYNC] 📡 ${response.status()} ct="${ct.slice(0,40)}" cd="${cd.slice(0,60)}" ${url.slice(0,100)}`);
-                    if (response.status() === 200) {
-                        const text = await response.text();
-                        if (looksLikeCsv(text)) {
-                            capturedCsvText = text;
-                            console.log(`[REFRENS SYNC] ✅ CSV via network (${text.length}b)`);
-                        }
+                if (response.status() === 200 && (ct.includes('csv') || cd.includes('csv') || cd.includes('attachment'))) {
+                    const text = await response.text();
+                    if (looksLikeCsv(text)) {
+                        capturedCsvText = text;
+                        console.log(`[REFRENS SYNC] ✅ CSV via network (${text.length}b)`);
                     }
                 }
             } catch (_) {}
         });
 
-        // ── Expose CSV capture ──
+        // ── Intercept CSV via blob/fetch in page ──
         await page.exposeFunction('__onCsvText__', (text) => {
             if (!capturedCsvText && looksLikeCsv(text)) {
                 capturedCsvText = text;
@@ -125,31 +167,26 @@ export async function syncRefrensLeads(supabaseAdmin) {
             }
         });
 
-        // ── Navigate ──
-        if (capturedToken) {
-            await page.evaluateOnNewDocument((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
-        }
+        // ── Navigate to leads page ──
         await page.goto(REFRENS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
         if (capturedToken) await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken).catch(() => {});
 
         if (page.url().includes('/login')) {
-            await browser.close();
+            await context.close(); await browser.close();
             return { success: false, error: 'Session expired — update REFRENS_COOKIES' };
         }
 
         await page.waitForSelector('table, [class*="lead"]', { timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
-        console.log(`[REFRENS SYNC] Page ready: "${await page.title()}"`);
+        console.log(`[REFRENS SYNC] Page: "${await page.title()}"`);
 
-        // ── Inject fetch + blob interceptors ──
+        // Inject blob + fetch interceptors
         await page.evaluate(() => {
-            // Blob interceptor
             const origURL = URL.createObjectURL.bind(URL);
             URL.createObjectURL = function(blob) {
                 try { const r = new FileReader(); r.onloadend = () => window.__onCsvText__(r.result); r.readAsText(blob); } catch(_) {}
                 return origURL(blob);
             };
-            // Fetch interceptor
             const origFetch = window.fetch.bind(window);
             window.fetch = async function(...args) {
                 const resp = await origFetch(...args);
@@ -164,52 +201,34 @@ export async function syncRefrensLeads(supabaseAdmin) {
             };
         }).catch(() => {});
 
-        // ── Find "Download CSV" button coordinates, click via page.mouse (real cursor) ──
+        // ── Step 1: Find + click "Download CSV" via real mouse coordinates ──
         const btnPos = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button, a, span, div')];
             const btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv')
                      || els.find(e => (e.getAttribute('title') || '').toLowerCase().includes('download csv'))
                      || els.find(e => e.textContent?.trim().toLowerCase().includes('download csv'));
-            if (!btn) {
-                // Debug: log what IS on the page
-                console.log('PAGE BUTTONS:', [...document.querySelectorAll('button,a')].map(b => b.textContent?.trim().slice(0,30)).join(' | '));
-                return null;
-            }
+            if (!btn) return null;
             btn.scrollIntoView({ behavior: 'instant', block: 'center' });
             const rect = btn.getBoundingClientRect();
-            return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), tag: btn.tagName, text: btn.textContent?.trim().slice(0, 30) };
+            return { x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), tag: btn.tagName, text: btn.textContent?.trim().slice(0,30) };
         });
 
         if (!btnPos) {
-            const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400));
-            console.log('[REFRENS SYNC] Page sample:', pageText?.replace(/\n/g, ' '));
-            await browser.close();
+            console.log('[REFRENS SYNC] Page text:', await page.evaluate(() => document.body?.innerText?.slice(0,300)));
+            await context.close(); await browser.close();
             return { success: false, error: 'Download CSV button not found' };
         }
 
         console.log(`[REFRENS SYNC] Btn: ${btnPos.tag} "${btnPos.text}" @ (${btnPos.x},${btnPos.y})`);
-        await new Promise(r => setTimeout(r, 500));
-        // page.mouse.click sends real OS-level mouse events — the only way to trigger React handlers
+        await new Promise(r => setTimeout(r, 800));
         await page.mouse.click(btnPos.x, btnPos.y);
-        console.log('[REFRENS SYNC] Step 1: page.mouse.click fired ✅');
+        console.log('[REFRENS SYNC] Step 1: mouse.click fired ✅');
 
-        // ── Poll for modal + click Download (interval, frame-error safe) ──
+        // ── Step 2: Poll every 2s for "ready" modal, click Download ──
         let modalClicked = false;
         const tryModal = setInterval(async () => {
             if (capturedCsvText || modalClicked) { clearInterval(tryModal); return; }
             try {
-                // Log body snippet for debugging
-                const snippet = await page.evaluate(() => {
-                    const t = document.body?.innerText || '';
-                    // Return anything modal-like
-                    const lower = t.toLowerCase();
-                    if (lower.includes('ready') || lower.includes('preparing') || lower.includes('download')) {
-                        return t.slice(0, 200);
-                    }
-                    return null;
-                });
-                if (snippet) console.log(`[REFRENS SYNC] Body: ${snippet.replace(/\n/g,' ').slice(0,120)}`);
-
                 const btnInfo = await page.evaluate(() => {
                     const body = (document.body?.innerText || '').toLowerCase();
                     if (!body.includes('ready to download') && !body.includes('file is ready')) return null;
@@ -226,7 +245,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
                         const t = b.textContent?.trim().toLowerCase();
                         return t === 'download' || t === 'download file' || t === 'download leads';
                     }) || (() => {
-                        const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="Modal"],[class*="Dialog"]');
+                        const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"]');
                         return modal && [...modal.querySelectorAll('button,a')].find(b => !/(cancel|close|dismiss)/i.test(b.textContent));
                     })();
 
@@ -236,36 +255,35 @@ export async function syncRefrensLeads(supabaseAdmin) {
                     return { found: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: dlBtn.textContent?.trim().slice(0,20) };
                 });
 
-                if (btnInfo === null) {
-                    // Modal not ready yet
-                } else if (btnInfo.found) {
-                    console.log(`[REFRENS SYNC] Step 2 modal btn: "${btnInfo.text}" @ (${btnInfo.x},${btnInfo.y})`);
+                if (btnInfo?.found) {
+                    console.log(`[REFRENS SYNC] Step 2 modal: "${btnInfo.text}" @ (${btnInfo.x},${btnInfo.y})`);
                     await page.mouse.click(btnInfo.x, btnInfo.y);
                     modalClicked = true;
                     clearInterval(tryModal);
-                    console.log('[REFRENS SYNC] Step 2: page.mouse.click on modal Download ✅');
-                } else {
-                    console.log('[REFRENS SYNC] Modal visible but Download btn not found yet');
+                    console.log('[REFRENS SYNC] Step 2: modal Download clicked ✅');
+                } else if (btnInfo !== null) {
+                    console.log('[REFRENS SYNC] Modal found, waiting for Download btn...');
                 }
             } catch(_) {}
-        }, 3000);
+        }, 2000);
 
-        // ── Wait up to 120s ──
-        const maxWait = 120000;
+        // Wait up to 120s
         const waitStart = Date.now();
-        while (!capturedCsvText && Date.now() - waitStart < maxWait) {
+        while (!capturedCsvText && Date.now() - waitStart < 120000) {
             await new Promise(r => setTimeout(r, 1000));
-            if ((Date.now() - waitStart) % 20000 < 1000) {
-                console.log(`[REFRENS SYNC] Elapsed: ${Math.round((Date.now()-waitStart)/1000)}s | modal=${modalClicked}`);
+            if ((Date.now() - waitStart) % 30000 < 1000) {
+                console.log(`[REFRENS SYNC] ${Math.round((Date.now()-waitStart)/1000)}s elapsed | modal=${modalClicked}`);
             }
         }
         clearInterval(tryModal);
 
-        await browser.close(); browser = null;
+        await context.close();
+        await browser.close();
+        browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
         if (!capturedCsvText) {
-            return { success: false, error: `CSV not captured after ${maxWait/1000}s. modalClicked=${modalClicked}` };
+            return { success: false, error: `CSV not captured after 120s. modalClicked=${modalClicked}` };
         }
 
         // ── Parse & upsert ──
@@ -274,27 +292,27 @@ export async function syncRefrensLeads(supabaseAdmin) {
         try {
             rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
         } catch (e) {
-            return { success: false, error: `Parse error: ${e.message} | preview: ${content.slice(0,80)}` };
+            return { success: false, error: `Parse error: ${e.message}` };
         }
-
-        console.log(`[REFRENS SYNC] ${rows.length} rows | cols: ${JSON.stringify(Object.keys(rows[0]||{})).slice(0,120)}`);
 
         const mapped = rows.map(mapRow).filter(Boolean);
         const deduped = Object.values(mapped.reduce((acc, r) => { acc[r.id] = r; return acc; }, {}));
+        console.log(`[REFRENS SYNC] ${rows.length} rows → ${deduped.length} unique valid`);
 
         let upserted = 0, errors = 0;
         for (let i = 0; i < deduped.length; i += 100) {
-            const { error } = await supabaseAdmin.from('refrens_leads').upsert(deduped.slice(i, i + 100), { onConflict: 'id' });
-            if (error) { errors++; console.error('[REFRENS SYNC] Upsert:', error.message); }
+            const { error } = await supabaseAdmin.from('refrens_leads').upsert(deduped.slice(i, i+100), { onConflict: 'id' });
+            if (error) { errors++; console.error('[REFRENS SYNC] Upsert error:', error.message); }
             else upserted += Math.min(100, deduped.length - i);
         }
 
-        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        const duration = ((Date.now() - startTime)/1000).toFixed(1);
         console.log(`[REFRENS SYNC] ✅ Done in ${duration}s — ${upserted} upserted`);
         return { success: true, total_rows: rows.length, valid_rows: deduped.length, upserted, errors, duration_seconds: duration, synced_at: new Date().toISOString() };
 
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
+        if (context) await context.close().catch(() => {});
         if (browser) await browser.close().catch(() => {});
         return { success: false, error: err.message };
     }
