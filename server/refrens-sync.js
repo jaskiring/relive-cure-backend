@@ -68,7 +68,7 @@ async function waitForTokenRefresh(page, timeoutMs = 20000) {
 }
 
 export async function syncRefrensLeads(supabaseAdmin) {
-    console.log('[REFRENS SYNC] ▶ Starting v7 (two-step modal + blob intercept)...');
+    console.log('[REFRENS SYNC] ▶ Starting v7b (two-step modal + blob/network intercept)...');
     const startTime = Date.now();
     let browser = null;
 
@@ -84,7 +84,7 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         const page = await browser.newPage();
 
-        // ── Auth: set cookies + exchange for __at token ──
+        // ── Auth ──
         const cookies = JSON.parse(cookiesRaw);
         await page.setCookie(...cookies.filter(c => c.name && c.value && c.domain));
 
@@ -97,9 +97,10 @@ export async function syncRefrensLeads(supabaseAdmin) {
             console.warn('[REFRENS SYNC] Token exchange failed — continuing with cookies only');
         }
 
-        // ── Set up CSV capture: intercept network responses ──
+        // ── CSV capture storage (shared between handlers) ──
         let capturedCsvText = null;
 
+        // ── Method 1: Intercept network responses ──
         page.on('response', async (response) => {
             if (capturedCsvText) return;
             try {
@@ -107,21 +108,39 @@ export async function syncRefrensLeads(supabaseAdmin) {
                 const url = response.url();
                 if (ct.includes('csv') || ct.includes('text/plain') || url.includes('export') || url.includes('download') || url.includes('/csv')) {
                     const text = await response.text();
-                    if (text && text.length > 100 && text.split('\n').length > 2 && text.includes(',')) {
+                    if (text && text.length > 200 && text.split('\n').length > 3 && text.includes(',')) {
                         capturedCsvText = text;
-                        console.log(`[REFRENS SYNC] ✅ CSV captured via network response (${text.length} bytes) from: ${url.slice(0, 100)}`);
+                        console.log(`[REFRENS SYNC] ✅ CSV via network (${text.length} bytes): ${url.slice(0, 80)}`);
                     }
                 }
             } catch (_) {}
         });
 
-        // ── Set up blob interceptor (for URL.createObjectURL downloads) ──
+        // ── Method 2: Blob interceptor ──
         await page.exposeFunction('__onCsvBlob__', (text) => {
-            if (!capturedCsvText && text && text.length > 100 && text.split('\n').length > 2) {
+            if (!capturedCsvText && text && text.length > 200 && text.split('\n').length > 3) {
                 capturedCsvText = text;
-                console.log(`[REFRENS SYNC] ✅ CSV captured via blob interceptor (${text.length} bytes)`);
+                console.log(`[REFRENS SYNC] ✅ CSV via blob (${text.length} bytes)`);
             }
         });
+
+        const injectBlobInterceptor = async () => {
+            try {
+                await page.evaluate(() => {
+                    if (window.__blobInterceptorActive__) return;
+                    window.__blobInterceptorActive__ = true;
+                    const orig = URL.createObjectURL.bind(URL);
+                    URL.createObjectURL = function(blob) {
+                        try {
+                            const reader = new FileReader();
+                            reader.onloadend = () => { if (reader.result) window.__onCsvBlob__(reader.result); };
+                            reader.readAsText(blob);
+                        } catch(_) {}
+                        return orig(blob);
+                    };
+                });
+            } catch(_) {}
+        };
 
         // ── Navigate to leads page ──
         await page.goto(REFRENS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -129,7 +148,6 @@ export async function syncRefrensLeads(supabaseAdmin) {
             await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
         }
 
-        // Check we're not on login page
         const currentUrl = page.url();
         if (currentUrl.includes('/login') || currentUrl.includes('/signin')) {
             await browser.close();
@@ -138,22 +156,11 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         await page.waitForSelector('table, [class*="lead"], [class*="Lead"]', { timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
-        console.log(`[REFRENS SYNC] Page ready: "${await page.title()}"`);
+        console.log(`[REFRENS SYNC] Page: "${await page.title()}"`);
 
-        // ── Inject blob interceptor into page ──
-        await page.evaluate(() => {
-            const orig = URL.createObjectURL.bind(URL);
-            URL.createObjectURL = function(blob) {
-                const reader = new FileReader();
-                reader.onloadend = () => {
-                    if (reader.result) window.__onCsvBlob__(reader.result);
-                };
-                reader.readAsText(blob);
-                return orig(blob);
-            };
-        });
+        await injectBlobInterceptor();
 
-        // ── Step 1: Click "Download CSV" button ──
+        // ── Step 1: Click "Download CSV" ──
         const clicked = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button,a,span,div,li')];
             let btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
@@ -165,67 +172,50 @@ export async function syncRefrensLeads(supabaseAdmin) {
 
         if (!clicked) {
             await browser.close();
-            return { success: false, error: 'Download CSV button not found on page' };
+            return { success: false, error: 'Download CSV button not found' };
         }
         console.log(`[REFRENS SYNC] Step 1 clicked: "${clicked}"`);
 
-        // ── Step 2: Wait for "Your file is ready to download" modal, then click Download ──
-        console.log('[REFRENS SYNC] Waiting for download-ready modal...');
-        let modalFound = false;
-        const modalTimeout = 60000; // Refrens can take up to 60s to prepare the file
-        const pollStart = Date.now();
+        // ── Step 2: Wait for "ready to download" modal (up to 90s) ──
+        console.log('[REFRENS SYNC] Waiting for file-ready modal...');
+        try {
+            await page.waitForFunction(
+                () => document.body.innerText.toLowerCase().includes('ready to download') ||
+                      document.body.innerText.toLowerCase().includes('file is ready'),
+                { timeout: 90000, polling: 1500 }
+            );
+            console.log('[REFRENS SYNC] ✅ Modal ready — clicking Download button...');
 
-        while (Date.now() - pollStart < modalTimeout) {
-            await new Promise(r => setTimeout(r, 1500));
+            await injectBlobInterceptor(); // re-inject in case frame refreshed
 
-            // Check if CSV already captured via network response
-            if (capturedCsvText) {
-                console.log('[REFRENS SYNC] CSV already captured via network — skipping modal click');
-                break;
-            }
-
-            // Look for the modal's Download button
-            const downloadBtnClicked = await page.evaluate(() => {
-                // Look for modal with "ready to download" text
-                const allText = document.body.innerText.toLowerCase();
-                if (!allText.includes('ready to download') && !allText.includes('file is ready')) return 'not_ready';
-
-                // Find and click the Download button inside the modal
+            // Click the Download button in modal
+            const modalBtnClicked = await page.evaluate(() => {
                 const btns = [...document.querySelectorAll('button, a')];
                 const dlBtn = btns.find(b => {
                     const t = b.textContent?.trim().toLowerCase();
                     return t === 'download' || t === 'download file' || t === 'download leads';
                 });
-                if (dlBtn) {
-                    // Re-inject blob interceptor right before clicking
-                    const orig2 = URL.createObjectURL.bind(URL);
-                    URL.createObjectURL = function(blob) {
-                        const reader = new FileReader();
-                        reader.onloadend = () => { if (reader.result) window.__onCsvBlob__(reader.result); };
-                        reader.readAsText(blob);
-                        return orig2(blob);
-                    };
-                    dlBtn.click();
-                    return 'clicked:' + dlBtn.textContent?.trim();
+                if (dlBtn) { dlBtn.click(); return dlBtn.textContent?.trim(); }
+                // Try any button inside a modal/dialog
+                const modal = document.querySelector('[class*="modal"], [class*="dialog"], [role="dialog"]');
+                if (modal) {
+                    const anyBtn = modal.querySelector('button');
+                    if (anyBtn) { anyBtn.click(); return 'fallback:' + anyBtn.textContent?.trim(); }
                 }
-                return 'modal_found_no_btn';
-            });
+                return null;
+            }).catch(() => null);
 
-            if (downloadBtnClicked === 'not_ready') {
-                const elapsed = Math.round((Date.now() - pollStart) / 1000);
-                if (elapsed % 10 === 0) console.log(`[REFRENS SYNC] Preparing... ${elapsed}s`);
-                continue;
-            }
+            console.log(`[REFRENS SYNC] Modal btn: "${modalBtnClicked}"`);
 
-            console.log(`[REFRENS SYNC] Step 2: ${downloadBtnClicked}`);
-            modalFound = true;
+        } catch (modalErr) {
+            console.warn('[REFRENS SYNC] Modal wait:', modalErr.message);
+            // CSV might already be captured via network response
+        }
 
-            // Wait up to 15s for CSV to be captured after clicking Download
-            const captureStart = Date.now();
-            while (!capturedCsvText && Date.now() - captureStart < 15000) {
-                await new Promise(r => setTimeout(r, 500));
-            }
-            break;
+        // ── Wait up to 15s for CSV capture ──
+        const captureStart = Date.now();
+        while (!capturedCsvText && Date.now() - captureStart < 15000) {
+            await new Promise(r => setTimeout(r, 500));
         }
 
         await browser.close();
@@ -233,28 +223,23 @@ export async function syncRefrensLeads(supabaseAdmin) {
         console.log('[REFRENS SYNC] Browser closed ✅');
 
         if (!capturedCsvText) {
-            const reason = !modalFound ? 'Download-ready modal never appeared (timeout)' : 'Modal found and clicked but no CSV captured';
-            return { success: false, error: reason };
+            return { success: false, error: 'CSV not captured — modal or download mechanism may have changed' };
         }
 
-        // ── Parse CSV ──
+        // ── Parse ──
         const content = capturedCsvText.replace(/^﻿/, '');
         let rows;
         try {
             rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
         } catch (e) {
-            console.error('[REFRENS SYNC] Parse error:', e.message, '| First 200:', content.slice(0, 200));
             return { success: false, error: `CSV parse error: ${e.message}` };
         }
 
-        console.log(`[REFRENS SYNC] Parsed ${rows.length} rows`);
-        if (rows.length > 0) console.log('[REFRENS SYNC] Columns:', JSON.stringify(Object.keys(rows[0])));
+        console.log(`[REFRENS SYNC] Parsed ${rows.length} rows, columns: ${JSON.stringify(Object.keys(rows[0] || {}))}`);
 
         const mapped = rows.map(mapRow).filter(Boolean);
-        console.log(`[REFRENS SYNC] ${mapped.length} valid rows (${rows.length - mapped.length} skipped)`);
-
-        // Deduplicate by phone (last row wins, same as upload endpoint)
         const deduped = Object.values(mapped.reduce((acc, r) => { acc[r.id] = r; return acc; }, {}));
+        console.log(`[REFRENS SYNC] ${deduped.length} unique valid rows`);
 
         let upserted = 0, errors = 0;
         for (let i = 0; i < deduped.length; i += 100) {
