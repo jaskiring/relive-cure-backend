@@ -61,8 +61,9 @@ app.get('/test-db', async (req, res) => {
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
-    const validUsername = process.env.VITE_ADMIN_USERNAME || 'admin';
-    const validPassword = process.env.VITE_ADMIN_PASSWORD || 'admin123';
+    const validUsername = process.env.VITE_ADMIN_USERNAME;
+    const validPassword = process.env.VITE_ADMIN_PASSWORD;
+    if (!validUsername || !validPassword) return res.status(503).json({ success: false, message: 'Auth not configured' });
     if (username === validUsername && password === validPassword) res.json({ success: true, token: CRM_API_KEY });
     else res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
