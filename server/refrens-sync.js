@@ -1,13 +1,10 @@
 import puppeteer from 'puppeteer';
-import fs from 'fs';
-import path from 'path';
 import { parse } from 'csv-parse/sync';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DOWNLOAD_DIR = path.join(__dirname, '../tmp_dl');
 
 const REFRENS_URL = 'https://www.refrens.com/app/relivecure/leads';
 
@@ -62,19 +59,18 @@ function mapRow(row) {
 async function waitForTokenRefresh(page, timeoutMs = 20000) {
     await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: timeoutMs });
     try {
-        await page.waitForFunction(() => !!sessionStorage.getItem('__at')?.length > 20, { timeout: timeoutMs, polling: 300 });
+        await page.waitForFunction(() => {
+            const at = sessionStorage.getItem('__at');
+            return !!at && at.length > 20;
+        }, { timeout: timeoutMs, polling: 300 });
         return true;
     } catch (_) { return false; }
 }
 
 export async function syncRefrensLeads(supabaseAdmin) {
-    console.log('[REFRENS SYNC] ▶ Starting v6...');
+    console.log('[REFRENS SYNC] ▶ Starting v7 (two-step modal + blob intercept)...');
     const startTime = Date.now();
     let browser = null;
-
-    // Clean download dir
-    if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-    try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
 
     try {
         const cookiesRaw = process.env.REFRENS_COOKIES;
@@ -86,54 +82,54 @@ export async function syncRefrensLeads(supabaseAdmin) {
             defaultViewport: { width: 1366, height: 768 }
         });
 
-        // ── BROWSER-LEVEL CDP: catches ALL downloads regardless of mechanism ──
-        const browserSession = await browser.target().createCDPSession();
-        await browserSession.send('Browser.setDownloadBehavior', {
-            behavior: 'allow',
-            downloadPath: DOWNLOAD_DIR,
-            eventsEnabled: true
-        });
-        console.log(`[REFRENS SYNC] Download dir: ${DOWNLOAD_DIR}`);
-
-        let downloadGuid = null;
-        let downloadFilename = null;
-        let downloadComplete = false;
-
-        browserSession.on('Browser.downloadWillBegin', (event) => {
-            downloadGuid = event.guid;
-            downloadFilename = event.suggestedFilename || 'leads.csv';
-            console.log(`[REFRENS SYNC] ⬇ Download starting: "${downloadFilename}" from ${event.url?.slice(0, 80)}`);
-        });
-
-        browserSession.on('Browser.downloadProgress', (event) => {
-            if (event.guid === downloadGuid) {
-                console.log(`[REFRENS SYNC] Download: ${event.state} ${event.receivedBytes}/${event.totalBytes} bytes`);
-                if (event.state === 'completed') downloadComplete = true;
-                if (event.state === 'canceled') console.warn('[REFRENS SYNC] Download canceled!');
-            }
-        });
-
         const page = await browser.newPage();
 
-        // Apply cookies + token exchange (same as crm-automation.js)
+        // ── Auth: set cookies + exchange for __at token ──
         const cookies = JSON.parse(cookiesRaw);
         await page.setCookie(...cookies.filter(c => c.name && c.value && c.domain));
 
         const tokenReady = await waitForTokenRefresh(page, 15000);
         const capturedToken = tokenReady ? await page.evaluate(() => sessionStorage.getItem('__at')) : null;
         if (capturedToken) {
-            console.log(`[REFRENS SYNC] __at token ready ✅`);
+            console.log('[REFRENS SYNC] __at token ready ✅');
             await page.evaluateOnNewDocument((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
         } else {
             console.warn('[REFRENS SYNC] Token exchange failed — continuing with cookies only');
         }
 
-        // Navigate to leads page
+        // ── Set up CSV capture: intercept network responses ──
+        let capturedCsvText = null;
+
+        page.on('response', async (response) => {
+            if (capturedCsvText) return;
+            try {
+                const ct = response.headers()['content-type'] || '';
+                const url = response.url();
+                if (ct.includes('csv') || ct.includes('text/plain') || url.includes('export') || url.includes('download') || url.includes('/csv')) {
+                    const text = await response.text();
+                    if (text && text.length > 100 && text.split('\n').length > 2 && text.includes(',')) {
+                        capturedCsvText = text;
+                        console.log(`[REFRENS SYNC] ✅ CSV captured via network response (${text.length} bytes) from: ${url.slice(0, 100)}`);
+                    }
+                }
+            } catch (_) {}
+        });
+
+        // ── Set up blob interceptor (for URL.createObjectURL downloads) ──
+        await page.exposeFunction('__onCsvBlob__', (text) => {
+            if (!capturedCsvText && text && text.length > 100 && text.split('\n').length > 2) {
+                capturedCsvText = text;
+                console.log(`[REFRENS SYNC] ✅ CSV captured via blob interceptor (${text.length} bytes)`);
+            }
+        });
+
+        // ── Navigate to leads page ──
         await page.goto(REFRENS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
         if (capturedToken) {
             await page.evaluate((t) => { try { sessionStorage.setItem('__at', t); } catch(e) {} }, capturedToken);
         }
 
+        // Check we're not on login page
         const currentUrl = page.url();
         if (currentUrl.includes('/login') || currentUrl.includes('/signin')) {
             await browser.close();
@@ -144,68 +140,105 @@ export async function syncRefrensLeads(supabaseAdmin) {
         await new Promise(r => setTimeout(r, 2000));
         console.log(`[REFRENS SYNC] Page ready: "${await page.title()}"`);
 
-        // Click Download CSV
+        // ── Inject blob interceptor into page ──
+        await page.evaluate(() => {
+            const orig = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function(blob) {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    if (reader.result) window.__onCsvBlob__(reader.result);
+                };
+                reader.readAsText(blob);
+                return orig(blob);
+            };
+        });
+
+        // ── Step 1: Click "Download CSV" button ──
         const clicked = await page.evaluate(() => {
             const els = [...document.querySelectorAll('button,a,span,div,li')];
             let btn = els.find(e => e.textContent?.trim().toLowerCase() === 'download csv');
-            if (!btn) btn = els.find(e => (e.getAttribute('title') || '').toLowerCase() === 'download csv');
-            if (btn) { btn.click(); return btn.tagName + ':' + btn.textContent?.trim().slice(0,30); }
+            if (!btn) btn = els.find(e => (e.getAttribute('title') || '').toLowerCase().includes('download csv'));
+            if (!btn) btn = els.find(e => e.textContent?.trim().toLowerCase().includes('download csv'));
+            if (btn) { btn.click(); return btn.tagName + ':' + btn.textContent?.trim().slice(0, 30); }
             return null;
         });
 
         if (!clicked) {
             await browser.close();
-            return { success: false, error: 'Download CSV button not found' };
+            return { success: false, error: 'Download CSV button not found on page' };
         }
-        console.log(`[REFRENS SYNC] Clicked: "${clicked}"`);
+        console.log(`[REFRENS SYNC] Step 1 clicked: "${clicked}"`);
 
-        // Wait up to 90s for download to complete
-        const maxWait = 90000;
-        const pollInterval = 2000;
-        let waited = 0;
-        let downloadedFile = null;
+        // ── Step 2: Wait for "Your file is ready to download" modal, then click Download ──
+        console.log('[REFRENS SYNC] Waiting for download-ready modal...');
+        let modalFound = false;
+        const modalTimeout = 60000; // Refrens can take up to 60s to prepare the file
+        const pollStart = Date.now();
 
-        while (waited < maxWait) {
-            await new Promise(r => setTimeout(r, pollInterval));
-            waited += pollInterval;
+        while (Date.now() - pollStart < modalTimeout) {
+            await new Promise(r => setTimeout(r, 1500));
 
-            // Check via CDP download events
-            if (downloadComplete && downloadGuid) {
-                // File is saved as GUID in the download dir
-                const guidFile = path.join(DOWNLOAD_DIR, downloadGuid);
-                const namedFile = path.join(DOWNLOAD_DIR, downloadFilename);
-                if (fs.existsSync(guidFile)) { downloadedFile = guidFile; break; }
-                if (fs.existsSync(namedFile)) { downloadedFile = namedFile; break; }
+            // Check if CSV already captured via network response
+            if (capturedCsvText) {
+                console.log('[REFRENS SYNC] CSV already captured via network — skipping modal click');
+                break;
             }
 
-            // Also scan the directory for any CSV file
-            const files = fs.readdirSync(DOWNLOAD_DIR).filter(f =>
-                !f.endsWith('.crdownload') && !f.endsWith('.tmp') && !f.endsWith('.part')
-            );
-            if (files.length > 0) {
-                const fullPath = path.join(DOWNLOAD_DIR, files[0]);
-                const stat = fs.statSync(fullPath);
-                if (stat.size > 100) {
-                    downloadedFile = fullPath;
-                    console.log(`[REFRENS SYNC] File found: ${files[0]} (${stat.size} bytes)`);
-                    break;
+            // Look for the modal's Download button
+            const downloadBtnClicked = await page.evaluate(() => {
+                // Look for modal with "ready to download" text
+                const allText = document.body.innerText.toLowerCase();
+                if (!allText.includes('ready to download') && !allText.includes('file is ready')) return 'not_ready';
+
+                // Find and click the Download button inside the modal
+                const btns = [...document.querySelectorAll('button, a')];
+                const dlBtn = btns.find(b => {
+                    const t = b.textContent?.trim().toLowerCase();
+                    return t === 'download' || t === 'download file' || t === 'download leads';
+                });
+                if (dlBtn) {
+                    // Re-inject blob interceptor right before clicking
+                    const orig2 = URL.createObjectURL.bind(URL);
+                    URL.createObjectURL = function(blob) {
+                        const reader = new FileReader();
+                        reader.onloadend = () => { if (reader.result) window.__onCsvBlob__(reader.result); };
+                        reader.readAsText(blob);
+                        return orig2(blob);
+                    };
+                    dlBtn.click();
+                    return 'clicked:' + dlBtn.textContent?.trim();
                 }
+                return 'modal_found_no_btn';
+            });
+
+            if (downloadBtnClicked === 'not_ready') {
+                const elapsed = Math.round((Date.now() - pollStart) / 1000);
+                if (elapsed % 10 === 0) console.log(`[REFRENS SYNC] Preparing... ${elapsed}s`);
+                continue;
             }
 
-            if (waited % 10000 === 0) console.log(`[REFRENS SYNC] Waiting for download... ${waited/1000}s`);
+            console.log(`[REFRENS SYNC] Step 2: ${downloadBtnClicked}`);
+            modalFound = true;
+
+            // Wait up to 15s for CSV to be captured after clicking Download
+            const captureStart = Date.now();
+            while (!capturedCsvText && Date.now() - captureStart < 15000) {
+                await new Promise(r => setTimeout(r, 500));
+            }
+            break;
         }
 
         await browser.close();
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
-        if (!downloadedFile) {
-            return { success: false, error: `Download did not complete in ${maxWait/1000}s. downloadGuid=${downloadGuid} downloadComplete=${downloadComplete}` };
+        if (!capturedCsvText) {
+            const reason = !modalFound ? 'Download-ready modal never appeared (timeout)' : 'Modal found and clicked but no CSV captured';
+            return { success: false, error: reason };
         }
 
-        const content = fs.readFileSync(downloadedFile, 'utf-8').replace(/^﻿/, '');
-        try { fs.unlinkSync(downloadedFile); } catch {}
-
+        // ── Parse CSV ──
+        const content = capturedCsvText.replace(/^﻿/, '');
         let rows;
         try {
             rows = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
@@ -215,29 +248,28 @@ export async function syncRefrensLeads(supabaseAdmin) {
         }
 
         console.log(`[REFRENS SYNC] Parsed ${rows.length} rows`);
-        if (rows.length > 0) {
-            console.log('[REFRENS SYNC] Columns:', JSON.stringify(Object.keys(rows[0])));
-            console.log('[REFRENS SYNC] Row 0 sample:', JSON.stringify(rows[0]).slice(0, 300));
-        }
+        if (rows.length > 0) console.log('[REFRENS SYNC] Columns:', JSON.stringify(Object.keys(rows[0])));
 
         const mapped = rows.map(mapRow).filter(Boolean);
         console.log(`[REFRENS SYNC] ${mapped.length} valid rows (${rows.length - mapped.length} skipped)`);
 
+        // Deduplicate by phone (last row wins, same as upload endpoint)
+        const deduped = Object.values(mapped.reduce((acc, r) => { acc[r.id] = r; return acc; }, {}));
+
         let upserted = 0, errors = 0;
-        for (let i = 0; i < mapped.length; i += 100) {
-            const { error } = await supabaseAdmin.from('refrens_leads').upsert(mapped.slice(i, i + 100), { onConflict: 'id' });
+        for (let i = 0; i < deduped.length; i += 100) {
+            const { error } = await supabaseAdmin.from('refrens_leads').upsert(deduped.slice(i, i + 100), { onConflict: 'id' });
             if (error) { console.error('[REFRENS SYNC] Upsert error:', error.message); errors++; }
-            else upserted += Math.min(100, mapped.length - i);
+            else upserted += Math.min(100, deduped.length - i);
         }
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`[REFRENS SYNC] ✅ Done in ${duration}s — ${upserted} upserted`);
-        return { success: true, total_rows: rows.length, valid_rows: mapped.length, upserted, errors, duration_seconds: duration, synced_at: new Date().toISOString() };
+        return { success: true, total_rows: rows.length, valid_rows: deduped.length, upserted, errors, duration_seconds: duration, synced_at: new Date().toISOString() };
 
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
         if (browser) await browser.close().catch(() => {});
-        try { fs.readdirSync(DOWNLOAD_DIR).forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f))); } catch {}
         return { success: false, error: err.message };
     }
 }
