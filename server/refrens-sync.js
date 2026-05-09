@@ -180,6 +180,25 @@ export async function syncRefrensLeads(supabaseAdmin) {
         await new Promise(r => setTimeout(r, 2000));
         console.log(`[REFRENS SYNC] Page: "${await page.title()}"`);
 
+        // ── Click "All" tab so export includes all leads, not just today's ──
+        const allTabPos = await page.evaluate(() => {
+            const tabs = [...document.querySelectorAll('a, button, span, div, li')];
+            const allTab = tabs.find(t => /^all\s*\(\d+\)$/i.test(t.textContent?.trim()))
+                        || tabs.find(t => /^all$/i.test(t.textContent?.trim()) && t.closest('[class*="tab"],[class*="filter"],[class*="pill"]'));
+            if (!allTab) return null;
+            allTab.scrollIntoView({ behavior: 'instant', block: 'center' });
+            const rect = allTab.getBoundingClientRect();
+            return { x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: allTab.textContent?.trim().slice(0, 20) };
+        });
+
+        if (allTabPos) {
+            console.log(`[REFRENS SYNC] Clicking All tab: "${allTabPos.text}" @ (${allTabPos.x},${allTabPos.y})`);
+            await page.mouse.click(allTabPos.x, allTabPos.y);
+            await new Promise(r => setTimeout(r, 2500));
+        } else {
+            console.warn('[REFRENS SYNC] All tab not found — using current view');
+        }
+
         // Inject blob + fetch interceptors
         await page.evaluate(() => {
             const origURL = URL.createObjectURL.bind(URL);
