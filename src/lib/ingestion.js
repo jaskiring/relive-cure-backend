@@ -51,7 +51,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
         message_count,
         first_message_at,
         last_message_at,
-        current_flow_state
+        current_flow_state,
+        callback_source
     } = leadData;
 
     if (!phone_number) {
@@ -64,7 +65,7 @@ export const ingestLead = async (supabaseClient, leadData) => {
     if ((leadData.intent_level || '').toUpperCase() === 'HOT') score += 50;
     if ((leadData.urgency_level || '').toLowerCase() === 'high') score += 20;
     if (leadData.request_call === true) score += 20;
-    const intent_score = score;
+    const intent_score = Math.min(score, 100);
 
     const calculateIntent = (comp, time) => {
         if (comp >= 3 && (time || '').toLowerCase().includes('immediately')) return 'hot';
@@ -107,7 +108,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
         message_count: message_count || leadData.message_count || null,
         first_message_at: first_message_at || leadData.first_message_at || null,
         last_message_at: last_message_at || leadData.last_message_at || null,
-        current_flow_state: current_flow_state || leadData.current_flow_state || null
+        current_flow_state: current_flow_state || leadData.current_flow_state || null,
+        callback_source: callback_source || leadData.callback_source || null
     };
 
     console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
