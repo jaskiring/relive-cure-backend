@@ -18,6 +18,7 @@ import { dirname } from 'path';
 import { ingestLead } from '../src/lib/ingestion.js';
 import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
+import { syncRefrensLeads } from './refrens-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -638,6 +639,48 @@ app.post('/webhook', async (req, res) => {
     } catch (err) { console.error('[WEBHOOK] ❌ Unhandled error:', err.message); }
 });
 
+
+// ─── Refrens Sync Routes ──────────────────────────────────────────────────────
+app.post('/api/sync-refrens', async (req, res) => {
+    const key = req.headers['x-api-key'] || req.query.key;
+    if (key !== process.env.CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        const result = await syncRefrensLeads(supabaseAdmin);
+        res.json(result);
+    } catch (err) {
+        console.error('[SYNC-REFRENS ROUTE]', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/refrens-analytics', async (req, res) => {
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('refrens_leads')
+            .select('status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, synced_at')
+            .order('refrens_created_at', { ascending: false });
+        if (error) throw new Error(error.message);
+        res.json({ success: true, count: data.length, leads: data });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/sync-status', async (req, res) => {
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('crm_sync_logs')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(5);
+        if (error) throw new Error(error.message);
+        const { count } = await supabaseAdmin.from('refrens_leads').select('*', { count: 'exact', head: true });
+        res.json({ success: true, refrens_leads_count: count, recent_syncs: data });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // ─── Keep-alive ───────────────────────────────────────────────────────────────
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health` : null;
 if (SELF_URL) {
@@ -648,4 +691,20 @@ if (SELF_URL) {
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[API] ✅ Server running on port ${PORT}`);
     console.log('[BOT] ✅ v6.2-stable embedded — no HTTP overhead');
+
+    // ─── Refrens auto-sync scheduler ─────────────────────────────────────────
+    async function runRefrensSync() {
+        console.log('[SCHEDULER] 🔄 Auto-sync Refrens leads...');
+        try {
+            const result = await syncRefrensLeads(supabaseAdmin);
+            console.log('[SCHEDULER] Refrens sync result:', JSON.stringify(result));
+        } catch (err) {
+            console.error('[SCHEDULER] Refrens sync failed:', err.message);
+        }
+    }
+    // First run: 3 minutes after boot (let server fully warm up)
+    setTimeout(runRefrensSync, 3 * 60 * 1000);
+    // Then every 4 hours
+    setInterval(runRefrensSync, 4 * 60 * 60 * 1000);
+    console.log('[SCHEDULER] Refrens sync: first run in 3 min, then every 4h');
 });
