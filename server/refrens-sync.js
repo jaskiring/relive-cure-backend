@@ -181,22 +181,31 @@ export async function syncRefrensLeads(supabaseAdmin) {
         console.log(`[REFRENS SYNC] Page: "${await page.title()}"`);
 
         // ── Click "All" tab so export includes all leads, not just today's ──
-        const allTabPos = await page.evaluate(() => {
+        // First log all tab-like elements to debug
+        const tabInfo = await page.evaluate(() => {
             const tabs = [...document.querySelectorAll('a, button, span, div, li')];
+            // Find anything that looks like a tab/filter pill with a count
+            const withCount = tabs.filter(t => /\(\d+\)/.test(t.textContent?.trim()) && t.textContent?.trim().length < 30);
             const allTab = tabs.find(t => /^all\s*\(\d+\)$/i.test(t.textContent?.trim()))
-                        || tabs.find(t => /^all$/i.test(t.textContent?.trim()) && t.closest('[class*="tab"],[class*="filter"],[class*="pill"]'));
-            if (!allTab) return null;
+                        || tabs.find(t => /^all\s*\d+$/i.test(t.textContent?.trim()))
+                        || tabs.find(t => t.textContent?.trim().toLowerCase().startsWith('all('))
+                        || tabs.find(t => t.textContent?.trim().toLowerCase().startsWith('all '));
+            const summary = withCount.slice(0, 6).map(t => t.textContent?.trim().slice(0,25)).join(' | ');
+            if (!allTab) return { found: false, summary };
             allTab.scrollIntoView({ behavior: 'instant', block: 'center' });
             const rect = allTab.getBoundingClientRect();
-            return { x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: allTab.textContent?.trim().slice(0, 20) };
+            return { found: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: allTab.textContent?.trim().slice(0, 25), summary };
         });
 
-        if (allTabPos) {
-            console.log(`[REFRENS SYNC] Clicking All tab: "${allTabPos.text}" @ (${allTabPos.x},${allTabPos.y})`);
-            await page.mouse.click(allTabPos.x, allTabPos.y);
-            await new Promise(r => setTimeout(r, 2500));
+        console.log(`[REFRENS SYNC] Tabs found: ${tabInfo.summary}`);
+        if (tabInfo.found) {
+            console.log(`[REFRENS SYNC] Clicking All tab: "${tabInfo.text}" @ (${tabInfo.x},${tabInfo.y})`);
+            await page.mouse.click(tabInfo.x, tabInfo.y);
+            await new Promise(r => setTimeout(r, 4000)); // wait for data reload
+            const countAfter = await page.evaluate(() => document.body?.innerText?.match(/showing\s+\d+\s+to\s+\d+\s+of\s+([\d,]+)/i)?.[1] || 'unknown');
+            console.log(`[REFRENS SYNC] Leads count after All tab: ${countAfter}`);
         } else {
-            console.warn('[REFRENS SYNC] All tab not found — using current view');
+            console.warn(`[REFRENS SYNC] All tab not found. Available: ${tabInfo.summary}`);
         }
 
         // Inject blob + fetch interceptors
