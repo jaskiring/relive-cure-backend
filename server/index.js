@@ -658,7 +658,8 @@ app.get('/api/refrens-analytics', async (req, res) => {
         const { data, error } = await supabaseAdmin
             .from('refrens_leads')
             .select('status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, synced_at')
-            .order('refrens_created_at', { ascending: false });
+            .order('refrens_created_at', { ascending: false })
+            .range(0, 9999);
         if (error) throw new Error(error.message);
         res.json({ success: true, count: data.length, leads: data });
     } catch (err) {
@@ -717,4 +718,5 @@ app.listen(PORT, '0.0.0.0', () => {
     setInterval(runRefrensSync, 4 * 60 * 60 * 1000);
     console.log('[SCHEDULER] Refrens sync: first run in 3 min, then every 4h');
 });
+
 
