@@ -19,6 +19,7 @@ import { ingestLead } from '../src/lib/ingestion.js';
 import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -62,7 +63,7 @@ app.get('/test-db', async (req, res) => {
 function getSessionToken() {
     const u = process.env.VITE_ADMIN_USERNAME || '';
     const p = process.env.VITE_ADMIN_PASSWORD || '';
-    return require('crypto').createHmac('sha256', CRM_API_KEY || 'fallback').update(`${u}:${p}`).digest('hex');
+    return crypto.createHmac('sha256', CRM_API_KEY || 'fallback').update(`${u}:${p}`).digest('hex');
 }
 
 app.post('/api/auth/login', (req, res) => {
