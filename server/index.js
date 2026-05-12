@@ -675,13 +675,23 @@ app.post('/api/sync-refrens', async (req, res) => {
 
 app.get('/api/refrens-analytics', async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin
-            .from('refrens_leads')
-            .select('status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, synced_at')
-            .order('refrens_created_at', { ascending: false })
-            .range(0, 9999);
-        if (error) throw new Error(error.message);
-        res.json({ success: true, count: data.length, leads: data });
+        // Paginate to fetch all leads (Supabase default cap is 1000/page)
+        let allData = [];
+        let from = 0;
+        const pageSize = 1000;
+        while (true) {
+            const { data, error } = await supabaseAdmin
+                .from('refrens_leads')
+                .select('id, phone, contact_name, status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, objection_type, follow_up_date, labels, state, timeline, insurance, eye_power, age, reason_for_lasik, parameters_completed, last_user_message, lead_type, city_preference, lead_description, last_comment_by, synced_at')
+                .order('refrens_created_at', { ascending: false })
+                .range(from, from + pageSize - 1);
+            if (error) throw new Error(error.message);
+            if (!data || data.length === 0) break;
+            allData = allData.concat(data);
+            if (data.length < pageSize) break;
+            from += pageSize;
+        }
+        res.json({ success: true, count: allData.length, leads: allData });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
