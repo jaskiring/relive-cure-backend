@@ -339,21 +339,52 @@ async function processLead(lead) {
     await page.waitForSelector('.disco-select__control', { timeout: 10000 });
     await new Promise(r => setTimeout(r, 1500)); // let React hydrate
 
-    // ── 3. Prospect Organisation (disco-select[1]) ────────────────────────────
-    // Click the org dropdown and select the first available option
+    // ── 3. Prospect Organisation (REQUIRED by Refrens) ──────────────────────────
+    // On Railway (fresh browser, no saved session) this is an async search dropdown.
+    // Must type "Relive" to trigger API search — clicking alone shows no options.
     try {
       const controls = await page.$$('.disco-select__control');
+      console.log(`[CRM] Found ${controls.length} disco-select controls`);
       if (controls.length >= 2) {
         await controls[1].click();
-        await page.waitForSelector('.disco-select__option', { timeout: 4000 });
-        await page.evaluate(() => {
-          const opt = document.querySelector('.disco-select__option');
-          if (opt) opt.click();
+        await new Promise(r => setTimeout(r, 600));
+
+        // Check if options already appeared (saved-session case)
+        let opts = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+        );
+
+        if (opts.length === 0) {
+          // Fresh browser: type to trigger async search
+          await page.keyboard.type('Relive', { delay: 40 });
+          await new Promise(r => setTimeout(r, 2500)); // wait for API response
+          opts = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+          );
+        }
+
+        console.log(`[CRM] Org options (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
+
+        const clicked = await page.evaluate(() => {
+          const options = Array.from(document.querySelectorAll('.disco-select__option'));
+          const match = options.find(o => o.innerText.toLowerCase().includes('relive'));
+          const target = match || options[0];
+          if (target) { target.click(); return target.innerText.trim(); }
+          return null;
         });
+
+        if (clicked) {
+          console.log(`[CRM] Org selected: "${clicked}" ✅`);
+        } else {
+          console.warn('[CRM] Org: no options found — form may fail validation');
+          await page.keyboard.press('Escape');
+        }
         await new Promise(r => setTimeout(r, 500));
+      } else {
+        console.warn(`[CRM] Org: only ${controls.length} controls found`);
       }
     } catch (e) {
-      console.warn('[CRM] Org dropdown: could not select option:', e.message);
+      console.warn('[CRM] Org dropdown error:', e.message);
     }
 
     const t_fill = Date.now();
