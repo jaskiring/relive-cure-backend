@@ -361,24 +361,22 @@ async function processLead(lead) {
         if (controls.length >= 2) await controls[1].click();
         await new Promise(r => setTimeout(r, 500));
 
-        // Step C: type directly into the dropdown input (not page.keyboard)
-        const typed = await page.evaluate(() => {
+        // Step C: use ElementHandle.type() — fires keydown/keypress/keyup per character,
+        // which is what React Select AsyncSelect's onInputChange handler listens for.
+        // page.evaluate() + native setter / DOM events do NOT trigger React Select's loadOptions.
+        const orgHandle = await page.evaluateHandle(() => {
           const controls = Array.from(document.querySelectorAll('.disco-select__control'));
-          if (controls.length < 2) return false;
-          const input = controls[1].querySelector('input');
-          if (!input) return false;
-          input.focus();
-          // Simulate value change so React Select triggers API search
-          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-          if (nativeSetter) nativeSetter.call(input, 'Relive');
-          input.dispatchEvent(new Event('input',  { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          // Also send a keydown to trigger React Select's internal search
-          input.dispatchEvent(new KeyboardEvent('keydown', { key: 'e', bubbles: true }));
-          return true;
+          return controls.length >= 2 ? controls[1].querySelector('input') : null;
         });
-        console.log(`[ORG] typed into input: ${typed}`);
-        await new Promise(r => setTimeout(r, 2000)); // wait for API search
+        const orgInput = orgHandle.asElement();
+        if (orgInput) {
+          await orgInput.click(); // ensure focused
+          await orgInput.type('Relive', { delay: 50 }); // real keyboard events → triggers loadOptions
+          console.log('[ORG] typed "Relive" via ElementHandle.type() ✅');
+        } else {
+          console.warn('[ORG] could not get input ElementHandle — org may not be selected');
+        }
+        await new Promise(r => setTimeout(r, 2500)); // wait for async API search to return options
 
         // Step D: check options
         const opts = await page.evaluate(() =>
