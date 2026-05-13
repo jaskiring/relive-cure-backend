@@ -432,11 +432,31 @@ async function processLead(lead) {
     await fillField(page, SEL.customerCity, lead.city || 'Delhi');
 
     // ── 7. Lead Subject ───────────────────────────────────────────────────────
+    // IMPORTANT: subject is REQUIRED by Refrens. On Railway (no saved session),
+    // the Lead Details accordion may be collapsed so page.type() fails silently.
+    // Use $eval + React native value setter — works on hidden inputs in the DOM.
     const isTest = !!(lead.is_test || (lead.contact_name || '').toUpperCase().includes('TEST'));
     const intentTag = (lead.intent_level || 'WARM').toUpperCase();
     const subjectPrefix = isTest ? '[TEST] ' : '';
     const subject = `${subjectPrefix}[${intentTag}] LASIK Lead — ${realName} (${cleanPhone})`;
-    await fillField(page, SEL.subject, subject);
+
+    const subjectResult = await page.$eval(SEL.subject, (el, val) => {
+      el.focus();
+      const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      if (proto && proto.set) proto.set.call(el, val);
+      else el.value = val;
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return el.value;
+    }, subject).catch(() => null);
+
+    if (!subjectResult) {
+      // Element may not be in DOM at all — last resort: try visible-path fill
+      await fillField(page, SEL.subject, subject);
+      console.warn('[CRM] Subject $eval failed — fell back to fillField');
+    } else {
+      console.log(`[CRM] Subject set via $eval ✅ ("${subjectResult.substring(0, 50)}")`);
+    }
 
     // ── 8. Additional Description — ALL lead data packed here ────────────────
     // This is the primary data carrier for analytics and Refrens team visibility
@@ -492,6 +512,19 @@ async function processLead(lead) {
       if (btn) btn.scrollIntoView({ behavior: 'instant', block: 'center' });
     });
     await new Promise(r => setTimeout(r, 400));
+
+    // Debug: log field values just before submit
+    const preSubmitCheck = await page.evaluate((sels) => ({
+      name:    document.querySelector(sels.contactName)?.value || '(empty)',
+      phone:   document.querySelector(sels.contactPhone)?.value || '(empty)',
+      subject: document.querySelector(sels.subject)?.value || '(empty)',
+    }), SEL);
+    console.log(`[CRM] Pre-submit values: name="${preSubmitCheck.name}" phone="${preSubmitCheck.phone}" subject="${preSubmitCheck.subject.substring(0,40)}"`);
+
+    // Screenshot before submit (saved to /tmp for Railway debugging)
+    try {
+      await page.screenshot({ path: `/tmp/crm-presubmit-${lead.id}.png`, fullPage: false });
+    } catch(_) {}
 
     await Promise.all([
       page.waitForNavigation({ timeout: 12000 }).catch(() => {}),
