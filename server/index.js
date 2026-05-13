@@ -297,12 +297,20 @@ function passiveExtract(message, session) {
         for (const city of INDIAN_CITIES) { if (m.includes(city)) { d.city = city.charAt(0).toUpperCase() + city.slice(1); break; } }
         const fromMatch = m.match(/(?:from|i'm from|i am from|main.*se hoon|main.*se hun)\s+([a-z]+)/i);
         if (fromMatch && !d.city && fromMatch[1].length > 2) d.city = fromMatch[1].charAt(0).toUpperCase() + fromMatch[1].slice(1);
+        if (d.city && d.lastAskedField === 'CITY') d.lastAskedField = null;
     }
     if (!d.eyePower) {
         const powerContext = ['power', 'number', 'minus', 'plus', 'diopter', 'aankhein', 'eye', 'vision'];
         const hasContext = powerContext.some(w => m.includes(w)) || /[-+]\d/.test(message);
         const powerMatch = message.match(/[-+]?\d+(\.\d+)?/);
-        if (powerMatch && (hasContext || session.state === 'EYE_POWER')) { d.eyePower = parseEyePower(message); d.concern_power = true; }
+        const justAskedPower = d.lastAskedField === 'EYE_POWER';
+        if (powerMatch && (hasContext || session.state === 'EYE_POWER' || justAskedPower)) {
+            d.eyePower = parseEyePower(message);
+            d.concern_power = true;
+            d.lastAskedField = null; // clear so it doesn't keep matching
+        }
+    } else if (d.lastAskedField === 'EYE_POWER') {
+        d.lastAskedField = null; // already answered, clear the flag
     }
     if (!d.timeline) {
         if (/this month|is mahine|abhi|immediately|jaldi|urgent/i.test(m)) { d.timeline = message; d.urgency = 'high'; }
@@ -416,7 +424,7 @@ const INTENTS = {
     PAIN: ['pain', 'painful', 'dard', 'dard hoga', 'takleef', 'hurt', 'kya dard', 'दर्द', 'तकलीफ'],
     ELIGIBILITY: ['eligible', 'eligibility', 'suitable', 'possible', 'kar sakta', 'kar sakti', 'ho sakta', 'can i do', 'karwa sakta', 'kya main', 'योग्य', 'हो सकता'],
     REFERRAL: ['refer', 'referral', 'reward', 'earn', 'kya milega', 'रेफर', 'कमाई'],
-    COST: ['cost', 'price', 'charges', 'fees', 'kharcha', 'rate', 'expense', 'amount', 'kitna padega', 'kitne ka', 'kitna hai', 'kitna paisa', 'paisa kitna', 'paisa lagega', 'kitne paise', 'कितना खर्चा', 'कीमत', 'फीस', 'खर्च'],
+    COST: ['cost', 'price', 'charges', 'fees', 'kharcha', 'rate', 'expense', 'amount', 'how much', 'how much does', 'how much is', 'money', 'kitna padega', 'kitne ka', 'kitna hai', 'kitna paisa', 'paisa kitna', 'paisa lagega', 'kitne paise', 'कितना खर्चा', 'कीमत', 'फीस', 'खर्च'],
     TIMELINE: ['when', 'how soon', 'schedule', 'kab', 'jaldi', 'next week', 'this week', 'soon', 'immediately', 'कब', 'जल्दी'],
     SAFETY: ['scared', 'fear', 'safe', 'risk', 'side effects', 'nervous', 'afraid', 'dar lag raha', 'danger', 'dangerous', 'डर', 'खतरा', 'सुरक्षित'],
     LOCATION: ['where', 'location', 'address', 'kahan hai', 'nearest', 'clinic', 'hospital', 'centre', 'कहाँ', 'पता'],
@@ -434,6 +442,7 @@ function getNextQuestion(session, context = 'normal') {
     else if (!d.eyePower) { field = 'EYE_POWER'; text = t('ASK_EYE_POWER', lang); }
     else if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) { field = 'POWER_STABILITY'; text = t('ASK_POWER_STABILITY', lang); }
     if (!field) return { text: '', field: null };
+    session.data.lastAskedField = field;
     if (context === 'normal' && firstName && field !== 'NAME') { const g = { EN: `Got it, ${firstName} 👍\n\n`, HI: `समझ गया, ${firstName} 👍\n\n` }; text = (g[lang] || g.EN) + text; }
     if (context === 'resume') {
         const fn = { NAME: { EN: 'your name', HI: 'आपका नाम' }, CITY: { EN: 'your city', HI: 'आपका शहर' }, EYE_POWER: { EN: 'your eye power', HI: 'आपकी eye power' }, POWER_STABILITY: { EN: 'how stable your power is', HI: 'power कितनी stable है' } };
@@ -472,8 +481,17 @@ function buildKnowledgeResponse(message, session) {
             baseReply += `\n\n${getEscalationMessage('candidate', lang, fn)}`;
         } else {
             const nextStep = getNextQuestion(session, 'resume');
-            if (nextStep.text) { baseReply += `\n\n${nextStep.text}`; }
-            else if (!isCallbackAlreadyOffered) { const rep = { EN: '\n\nOur representative will call you shortly 😊', HI: '\n\nहमारा representative जल्द call करेगा 😊' }; baseReply += rep[lang] || rep.EN; }
+            if (nextStep.text && nextStep.field) {
+                // Only ask a field once via the resume path — don't repeat it on every KB response
+                if (!session.data.resumeAsked) session.data.resumeAsked = [];
+                if (!session.data.resumeAsked.includes(nextStep.field)) {
+                    session.data.resumeAsked.push(nextStep.field);
+                    baseReply += `\n\n${nextStep.text}`;
+                }
+            } else if (!isCallbackAlreadyOffered) {
+                const rep = { EN: '\n\nOur representative will call you shortly 😊', HI: '\n\nहमारा representative जल्द call करेगा 😊' };
+                baseReply += rep[lang] || rep.EN;
+            }
         }
     }
     return baseReply;
