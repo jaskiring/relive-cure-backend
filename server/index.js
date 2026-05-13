@@ -346,6 +346,7 @@ async function sendToAPI(phone, session, trigger = 'update') {
 
     const payload = {
         phone_number: phone, contact_name: d.contactName || 'WhatsApp Lead',
+        channel: 'whatsapp',
         city: d.city || '', preferred_surgery_city: d.city || '',
         timeline: d.timeline || '', insurance: d.insurance || '',
         interest_cost: scored.interest_cost, interest_recovery: scored.interest_recovery,
