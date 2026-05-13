@@ -357,36 +357,19 @@ async function processLead(lead) {
       console.log(`[ORG] current value: "${alreadySelected}"`);
 
       if (!alreadySelected) {
-        // Step B: click to open
+        // Step B: click to open the dropdown — options appear immediately on click
         if (controls.length >= 2) await controls[1].click();
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 1000)); // wait for options to render
 
-        // Step C: use ElementHandle.type() — fires keydown/keypress/keyup per character,
-        // which is what React Select AsyncSelect's onInputChange handler listens for.
-        // page.evaluate() + native setter / DOM events do NOT trigger React Select's loadOptions.
-        const orgHandle = await page.evaluateHandle(() => {
-          const controls = Array.from(document.querySelectorAll('.disco-select__control'));
-          return controls.length >= 2 ? controls[1].querySelector('input') : null;
-        });
-        const orgInput = orgHandle.asElement();
-        if (orgInput) {
-          await orgInput.click(); // ensure focused
-          await orgInput.type('Relive', { delay: 50 }); // real keyboard events → triggers loadOptions
-          console.log('[ORG] typed "Relive" via ElementHandle.type() ✅');
-        } else {
-          console.warn('[ORG] could not get input ElementHandle — org may not be selected');
-        }
-        await new Promise(r => setTimeout(r, 2500)); // wait for async API search to return options
-
-        // Step D: check options
+        // Step C: pick the first available option (no typing/search needed)
         const opts = await page.evaluate(() =>
           Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
         );
-        console.log(`[ORG] options after search (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
+        console.log(`[ORG] options available (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
 
-        // Step E: click the match
         const clicked = await page.evaluate(() => {
           const options = Array.from(document.querySelectorAll('.disco-select__option'));
+          // Prefer "Relive" match, otherwise just take whatever first option is there
           const match = options.find(o => o.innerText.toLowerCase().includes('relive')) || options[0];
           if (match) { match.click(); return match.innerText.trim(); }
           return null;
