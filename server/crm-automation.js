@@ -8,9 +8,9 @@ const CRM_FORM_URL = process.env.CRM_FORM_URL || 'https://www.refrens.com/app/re
 const USER_DATA_DIR = process.env.PUPPETEER_SESSION_DIR || "./puppeteer-session";
 
 const queue = new PQueue({
-  concurrency: 3,
-  intervalCap: 6,      // max 6 tasks per interval
-  interval: 10000      // per 10s
+  concurrency: 2,       // max 2 CRM pushes in parallel (bulk mode)
+  intervalCap: 4,       // max 4 tasks per interval
+  interval: 10000       // per 10s
 });
 
 async function withTimeout(promise, ms) {
@@ -531,7 +531,7 @@ async function processLead(lead) {
   }
 }
 
-export async function processQueue(leads, concurrencyLimit = 3) {
+export async function processQueue(leads, concurrencyLimit = 2) {
   const results = [];
   queue.concurrency = concurrencyLimit;
   
