@@ -40,7 +40,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const BOT_SECRET = process.env.BOT_SECRET;
 const CRM_API_KEY = process.env.CRM_API_KEY;
-const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
 app.use(cors());
 app.use(express.json());
@@ -148,6 +147,7 @@ app.delete('/api/leads/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+<<<<<<< Updated upstream
 // ═════════════════════════════════════════════════════════════════════════════
 // BOT ENGINE — v6.2-stable (embedded, no HTTP calls, direct Supabase)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -690,6 +690,30 @@ app.get('/api/refrens-analytics', async (req, res) => {
             allData = allData.concat(data);
             if (data.length < pageSize) break;
             from += pageSize;
+=======
+// ─── Keep-alive + Puppeteer warm-up (prevents Railway sleep + pre-warms Chrome) ─
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
+  : null;
+
+if (SELF_URL) {
+  let puppeteerWarmed = false;
+  setInterval(async () => {
+    try {
+      const r = await fetch(SELF_URL);
+      console.log(`[KEEPALIVE] Self-ping → ${r.status}`);
+
+      // 🔥 Warm Puppeteer on first ping — lazy import since it's ESM
+      if (!puppeteerWarmed) {
+        puppeteerWarmed = true;
+        console.log('[KEEPALIVE] Launching Puppeteer warm-up...');
+        try {
+          // Instead, just import to trigger module evaluation and Chrome path resolution
+          await import('./crm-automation.js');
+          console.log('[KEEPALIVE] ✅ Puppeteer module loaded and warmed');
+        } catch (pe) {
+          console.warn('[KEEPALIVE] Puppeteer warm-up error (non-fatal):', pe.message);
+>>>>>>> Stashed changes
         }
         res.json({ success: true, count: allData.length, leads: allData });
     } catch (err) {
@@ -816,3 +840,5 @@ app.listen(PORT, '0.0.0.0', () => {
     setInterval(runRefrensSync, 4 * 60 * 60 * 1000);
     console.log('[SCHEDULER] Refrens sync: first run in 3 min, then every 4h');
 });
+
+
