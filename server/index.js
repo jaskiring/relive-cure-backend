@@ -566,6 +566,20 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 }).catch(e => console.error('[WA CAPTURE] inbound', e.message));
             } catch (e) { console.error('[WA CAPTURE] inbound-prep', e.message); }
 
+            // ─── Bot-pause: if a human took over this conversation in the dashboard,
+            //     the inbound message is already captured above — just don't auto-reply. ───
+            try {
+                const { data: _convoPause } = await supabaseAdmin
+                    .from('whatsapp_conversations')
+                    .select('bot_paused')
+                    .eq('phone', phone)
+                    .maybeSingle();
+                if (_convoPause?.bot_paused) {
+                    console.log(`[BOT] ⏸️  paused for ${phone} — human takeover, skipping auto-reply`);
+                    return;
+                }
+            } catch (e) { console.error('[BOT] pause-check error', e.message); }
+
             if (!message && messageObj.type && messageObj.type !== 'text') {
                 const lang = botSessions[phone]?.lang || 'EN';
                 await sendWhatsAppReply(phone, lang === 'HI' ? 'मैं अभी सिर्फ text process कर सकता हूँ 😊 कृपया type करें।' : 'I can only process text right now 😊 Please type your question.'); return;
@@ -697,6 +711,60 @@ function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = fa
 app.post('/chat', async (req, res) => {
     try { const reply = await handleIncomingMessage(req.body, true); res.json({ reply }); }
     catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────
+app.post('/api/whatsapp/send', async (req, res) => {
+    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const { phone, message } = req.body || {};
+    if (!phone || !message || !String(message).trim()) {
+        return res.status(400).json({ error: 'phone and message are required' });
+    }
+    try {
+        // sendWhatsAppReply already captures the outbound message into whatsapp_messages
+        await sendWhatsAppReply(phone, String(message).trim());
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[WA SEND API] ❌', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─── WhatsApp Inbox: proxy media (image/audio/video/doc) from the Cloud API ──
+// Cloud API media URLs are short-lived and require the auth token, so an <img>
+// tag can't load them directly — the dashboard points at this proxy instead.
+app.get('/api/whatsapp/media/:mediaId', async (req, res) => {
+    const { mediaId } = req.params;
+    if (!mediaId) return res.status(400).send('media id required');
+    try {
+        // Only proxy media ids we actually captured (guards against arbitrary fetches)
+        const { data: known } = await supabaseAdmin
+            .from('whatsapp_messages')
+            .select('id')
+            .eq('media_id', mediaId)
+            .limit(1)
+            .maybeSingle();
+        if (!known) return res.status(404).send('Unknown media');
+
+        // Step 1: resolve the short-lived media URL
+        const metaRes = await globalThis.fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+            headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` }
+        });
+        const meta = await metaRes.json();
+        if (!meta || !meta.url) return res.status(404).send('Media URL unavailable');
+
+        // Step 2: download the bytes (auth header required)
+        const binRes = await globalThis.fetch(meta.url, {
+            headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` }
+        });
+        const buf = Buffer.from(await binRes.arrayBuffer());
+        res.set('Content-Type', meta.mime_type || 'application/octet-stream');
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.send(buf);
+    } catch (e) {
+        console.error('[WA MEDIA] ❌', e.message);
+        res.status(500).send('Media fetch failed');
+    }
 });
 
 app.get('/webhook', (req, res) => {
