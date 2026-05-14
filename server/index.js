@@ -210,6 +210,7 @@ function getEyePowerString(ep) { if (!ep) return null; if (typeof ep === 'string
 function getAcknowledgement(message, lang) {
     const m = message.toLowerCase();
     const acks = [
+        { test: () => /issue|problem|trouble|difficulty|blurr?y?|blurred|can'?t see|cannot see|cant see|weak eye|weak eyesight|poor vision|bad vision|low vision|dikhai nahi|dikhta nahi|saaf nahi|kamzor|nazar|धुंधला|दिखाई नहीं|नज़र|कमज़ोर/i.test(m), EN: 'I understand — that must be frustrating 😊', HI: 'मैं समझता हूँ — यह परेशान करने वाला होता है 😊' },
         { test: () => /[-+]?\d+(\.\d+)?/.test(m) && (m.includes('power') || m.includes('minus') || m.includes('-') || m.includes('+')), EN: 'That power range is more common than people think 👍', HI: 'यह power range सोच से ज़्यादा common है 👍' },
         { test: () => /scared|fear|nervous|afraid|darta|daro/i.test(m), EN: 'That\'s completely understandable 😊', HI: 'यह बिल्कुल समझ में आता है 😊' },
         { test: () => /this month|next month|jaldi|soon|abhi|asap/i.test(m), EN: 'That sounds like a good timeline 👍', HI: 'यह एक अच्छा timeline है 👍' },
@@ -418,7 +419,8 @@ const KB = {
     TIMELINE: { EN: '📅 *LASIK at Relive Cure:*\n\n• Surgery: 10–15 mins (both eyes)\n• Same day discharge\n• Back to work next day\n• Driving: after 1–2 days', HI: '📅 *Relive Cure में LASIK:*\n\n• Surgery: 10–15 मिनट\n• Same day discharge\n• अगले दिन काम पर वापस\n• Driving: 1–2 दिन बाद' },
     REFERRAL: { EN: '🎁 Refer a friend → Earn *₹1,000* per surgery. No limit!\n\nOur team will share details when you book 😊', HI: '🎁 एक दोस्त refer करें → *₹1,000* कमाएँ। कोई limit नहीं!\n\nBooking पर team details देगी 😊' },
     LOCATION: { EN: '📍 *Relive Cure:*\nUnitech Cyber Hub, Gurugram\n\n• Near Cyber Hub Metro\n• Free parking\n• Mon–Sat: 9 AM – 7 PM', HI: '📍 *Relive Cure:*\nUnitech Cyber Hub, Gurugram\n\n• Cyber Hub Metro के पास\n• Free parking\n• सोम–शनि: सुबह 9 – शाम 7' },
-    ALTERNATIVES: { EN: '👓 LASIK vs Glasses:\n\n• LASIK → one-time cost, permanent freedom\n• Glasses → recurring cost, daily hassle\n• Sports / swimming → no glasses with LASIK ✅', HI: '👓 LASIK vs Chashma:\n\n• LASIK → एक बार का खर्च, हमेशा की आज़ादी\n• Chashma → बार-बार खर्च, रोज़ की परेशानी' }
+    ALTERNATIVES: { EN: '👓 LASIK vs Glasses:\n\n• LASIK → one-time cost, permanent freedom\n• Glasses → recurring cost, daily hassle\n• Sports / swimming → no glasses with LASIK ✅', HI: '👓 LASIK vs Chashma:\n\n• LASIK → एक बार का खर्च, हमेशा की आज़ादी\n• Chashma → बार-बार खर्च, रोज़ की परेशानी' },
+    CONCERN: { EN: '😊 I hear you — blurry vision and being dependent on glasses is exactly what LASIK is designed to fix. Most patients become completely glasses-free after the procedure.\n\nOur specialist can check your eligibility properly — let me grab a couple of quick details first.', HI: '😊 मैं समझता हूँ — धुंधला दिखना और चश्मे पर निर्भर रहना, LASIK इसी के लिए बना है। ज़्यादातर patients procedure के बाद पूरी तरह चश्मा-मुक्त हो जाते हैं।\n\nSpecialist आपकी eligibility ठीक से check कर सकते हैं — पहले कुछ quick details ले लेता हूँ।' }
 };
 
 const INTENTS = {
@@ -430,7 +432,8 @@ const INTENTS = {
     TIMELINE: ['when', 'how soon', 'schedule', 'kab', 'jaldi', 'next week', 'this week', 'soon', 'immediately', 'कब', 'जल्दी'],
     SAFETY: ['scared', 'fear', 'safe', 'risk', 'side effects', 'nervous', 'afraid', 'dar lag raha', 'danger', 'dangerous', 'डर', 'खतरा', 'सुरक्षित'],
     LOCATION: ['where', 'location', 'address', 'kahan hai', 'nearest', 'clinic', 'hospital', 'centre', 'कहाँ', 'पता'],
-    ALTERNATIVES: ['contact lens', 'glasses', 'specs', 'chashma', 'alternative', 'lenses', 'spectacles', 'vs', 'compare', 'चश्मा', 'लेंस']
+    ALTERNATIVES: ['contact lens', 'glasses', 'specs', 'chashma', 'alternative', 'lenses', 'spectacles', 'vs', 'compare', 'चश्मा', 'लेंस'],
+    CONCERN: ['issue with my eye', 'issue with my eyes', 'issue in my eye', 'problem with my eye', 'problem in my eye', 'eye problem', 'eye issue', 'eyes problem', 'eyesight problem', 'blurry', 'blurred', 'blur', "can't see", 'cant see', 'cannot see', "can't read", 'unable to see', 'weak eyesight', 'weak eyes', 'weak eye', 'poor vision', 'bad vision', 'low vision', 'vision problem', 'vision issue', 'trouble seeing', 'difficulty seeing', 'thick glasses', 'high power', 'aankh', 'aankhon', 'aankhon mein', 'dikhai nahi', 'dikhta nahi', 'saaf nahi dikhta', 'nazar kamzor', 'kamzor nazar', 'धुंधला', 'दिखाई नहीं', 'नज़र', 'कमज़ोर']
 };
 
 function detectAllIntents(message) { const m = message.toLowerCase(); return Object.entries(INTENTS).filter(([, words]) => words.some(w => m.includes(w))).map(([intent]) => intent); }
@@ -473,6 +476,7 @@ function buildKnowledgeResponse(message, session) {
     if (intents.includes('RECOVERY')) session.data.interest_recovery = true;
     if (intents.includes('PAIN')) session.data.concern_pain = true;
     if (intents.includes('SAFETY')) session.data.concern_safety = true;
+    if (intents.includes('CONCERN')) session.data.concern_power = true;
     const isEmotional = ['PAIN', 'SAFETY'].includes(topIntent);
     const isCallbackAlreadyOffered = session.data.callback_offered;
     if (!isEmotional) {
@@ -663,7 +667,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 return finalizeWithIngest(phone, session, 'complete', finalize, isTestChat);
             }
             const next = getNextQuestion(session);
-            if (next.field) { setReply(next.text); }
+            if (next.field) {
+                const ackCC = getAcknowledgement(message, lang);
+                setReply(ackCC ? `${ackCC}\n\n${next.text}` : next.text);
+            }
             else { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'completion'; setReply(getRandomCompleteReply(lang)); }
         }
 
