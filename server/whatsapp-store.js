@@ -33,20 +33,25 @@ export async function saveWhatsAppMessage({ phone, direction, body = null, msgTy
     // 2. Upsert the conversation summary row (one per phone).
     const { data: existing } = await supabaseAdmin
       .from('whatsapp_conversations')
-      .select('unread_count')
+      .select('unread_count, last_message_at')
       .eq('phone', phone)
       .maybeSingle();
     const currentUnread = existing?.unread_count || 0;
     const nextUnread = direction === 'inbound' ? currentUnread + 1 : currentUnread;
 
-    const convoRow = {
-      phone,
-      last_message_at: ts,
-      last_message_body: body ? body.slice(0, 120) : `[${msgType}]`,
-      last_direction: direction,
-      unread_count: nextUnread
-    };
+    // Only overwrite the "last message" fields if this message is actually
+    // newer than what's stored — inbound + outbound capture writes run
+    // concurrently, so without this the earlier message can win the race.
+    const isNewer = !existing?.last_message_at
+      || new Date(ts) >= new Date(existing.last_message_at);
+
+    const convoRow = { phone, unread_count: nextUnread };
     if (contactName) convoRow.contact_name = contactName;
+    if (isNewer) {
+      convoRow.last_message_at = ts;
+      convoRow.last_message_body = body ? body.slice(0, 120) : `[${msgType}]`;
+      convoRow.last_direction = direction;
+    }
 
     await supabaseAdmin
       .from('whatsapp_conversations')
