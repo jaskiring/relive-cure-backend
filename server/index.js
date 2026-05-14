@@ -19,6 +19,7 @@ import { ingestLead } from '../src/lib/ingestion.js';
 import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
+import { saveWhatsAppMessage } from './whatsapp-store.js';
 import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -506,7 +507,20 @@ async function sendWhatsAppReply(phone, reply) {
         const res = await globalThis.fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: reply } }) });
         rawText = await res.text();
         if (res.status === 429) { console.warn('[WA SEND] ⚠️ Rate limited (429)'); return; }
-        if (rawText.trim().startsWith('{')) { const data = JSON.parse(rawText); console.log('[WA SEND] ✅', JSON.stringify(data)); }
+        if (rawText.trim().startsWith('{')) {
+            const data = JSON.parse(rawText);
+            console.log('[WA SEND] ✅', JSON.stringify(data));
+            // ─── WhatsApp Engine: capture every outbound message ───
+            const _sentId = data.messages?.[0]?.id || null;
+            saveWhatsAppMessage({
+                phone,
+                direction: 'outbound',
+                body: reply,
+                msgType: 'text',
+                waMessageId: _sentId,
+                waTimestamp: new Date().toISOString()
+            }).catch(e => console.error('[WA CAPTURE] outbound', e.message));
+        }
         else { console.warn('[WA SEND] ⚠️ Non-JSON:', rawText.substring(0, 200)); }
     } catch (err) { console.error('[WA SEND] ❌', err.message, rawText.substring(0, 200)); }
 }
@@ -529,6 +543,25 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             const messageObj = reqBody.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
             if (!messageObj) return;
             phone = messageObj.from; message = messageObj.text?.body || ''; msgId = messageObj.id;
+
+            // ─── WhatsApp Engine: capture every inbound message (text + media) ───
+            try {
+                const _waValue = reqBody.entry?.[0]?.changes?.[0]?.value;
+                const _waContactName = _waValue?.contacts?.[0]?.profile?.name || null;
+                const _waType = messageObj.type || 'text';
+                const _waMediaId = (_waType !== 'text' && messageObj[_waType]) ? (messageObj[_waType].id || null) : null;
+                saveWhatsAppMessage({
+                    phone,
+                    direction: 'inbound',
+                    body: message || null,
+                    msgType: _waType,
+                    mediaId: _waMediaId,
+                    waMessageId: msgId,
+                    contactName: _waContactName,
+                    waTimestamp: messageObj.timestamp || null
+                }).catch(e => console.error('[WA CAPTURE] inbound', e.message));
+            } catch (e) { console.error('[WA CAPTURE] inbound-prep', e.message); }
+
             if (!message && messageObj.type && messageObj.type !== 'text') {
                 const lang = botSessions[phone]?.lang || 'EN';
                 await sendWhatsAppReply(phone, lang === 'HI' ? 'मैं अभी सिर्फ text process कर सकता हूँ 😊 कृपया type करें।' : 'I can only process text right now 😊 Please type your question.'); return;
