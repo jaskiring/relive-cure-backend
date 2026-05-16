@@ -31,7 +31,7 @@ function getField(row, ...keys) {
 function mapRow(row) {
     const phone = normalizePhone(getField(row, 'Phone', 'phone_number', 'phone', 'Mobile', 'Phone Number') || '');
     if (!phone) return null;
-    return {
+    const mapped = {
         id: phone, contact_name: getField(row, 'Contact Name', 'Name'),
         phone, customer_city: getField(row, 'Customer City', 'City'),
         state: getField(row, 'State'), refrens_created_at: parseRefrensDate(row['Created At']),
@@ -56,6 +56,20 @@ function mapRow(row) {
         glasses_problem: getField(row, "what's_the_biggest_problem_you_face_while_using_glasses_or_contact_lenses_?👀🤔_"),
         synced_at: new Date().toISOString(), raw_data: row
     };
+    // ── Defensive upsert ────────────────────────────────────────────────────
+    // Drop null/empty fields from the payload so that when the Refrens CSV
+    // omits a value (e.g. Assignee comes back blank from the scraper-side
+    // CSV even though the UI download has it), the existing DB value is
+    // PRESERVED instead of wiped to null. Real value changes still
+    // overwrite — only nulls are skipped. Always-include keys: id, phone,
+    // synced_at, raw_data.
+    const KEEP_ALWAYS = new Set(['id', 'phone', 'synced_at', 'raw_data']);
+    for (const k of Object.keys(mapped)) {
+        if (!KEEP_ALWAYS.has(k) && (mapped[k] === null || mapped[k] === undefined || mapped[k] === '')) {
+            delete mapped[k];
+        }
+    }
+    return mapped;
 }
 
 function looksLikeCsv(text) {
