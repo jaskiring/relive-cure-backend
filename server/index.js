@@ -20,6 +20,10 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
+import multer from 'multer';
+
+// In-memory upload (we re-stream to Meta immediately; files are bounded to ~25MB).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 26 * 1024 * 1024 } });
 import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -726,6 +730,91 @@ app.post('/api/whatsapp/send', async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         console.error('[WA SEND API] ❌', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─── WhatsApp Inbox: send IMAGE / AUDIO / VIDEO / DOCUMENT from the dashboard ──
+// Multipart form fields: `file` (the media), `phone`, optional `caption`, optional `type` override.
+// Type is auto-detected from the file's MIME if not provided. Auto-captured into whatsapp_messages.
+app.post('/api/whatsapp/send-media', upload.single('file'), async (req, res) => {
+    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const { phone, caption, type: typeOverride } = req.body || {};
+    const file = req.file;
+    if (!phone || !file || !file.buffer) {
+        return res.status(400).json({ error: 'phone and file are required (multipart)' });
+    }
+    // Detect WhatsApp type from MIME (caller may override via the type field).
+    const mime = file.mimetype || 'application/octet-stream';
+    const waType = typeOverride || (
+        mime.startsWith('image/')    ? 'image' :
+        mime.startsWith('audio/')    ? 'audio' :
+        mime.startsWith('video/')    ? 'video' :
+        'document'
+    );
+    // Meta is strict on audio MIME — accept ogg/opus, aac, amr, mp3, mp4 audio.
+    // Browser MediaRecorder usually produces audio/webm;codecs=opus — relabel to audio/ogg
+    // so Meta accepts it (the Opus payload is identical inside both containers in practice).
+    const sendMime = (waType === 'audio' && /webm/i.test(mime)) ? 'audio/ogg' : mime;
+
+    try {
+        // ─── STEP 1: upload the bytes to Meta → get a media_id ───
+        const uploadUrl = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/media`;
+        const uploadForm = new FormData();
+        uploadForm.append('messaging_product', 'whatsapp');
+        uploadForm.append('type', sendMime);
+        uploadForm.append('file', new Blob([file.buffer], { type: sendMime }), file.originalname || `upload.${waType}`);
+        const upRes = await globalThis.fetch(uploadUrl, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
+            body: uploadForm
+        });
+        const upJson = await upRes.json();
+        if (!upJson.id) {
+            console.error('[WA SEND-MEDIA] ❌ upload failed:', JSON.stringify(upJson).substring(0, 300));
+            return res.status(500).json({ error: 'Media upload to Meta failed', detail: upJson });
+        }
+        const mediaId = upJson.id;
+
+        // ─── STEP 2: send the message referencing media_id ───
+        const sendBody = {
+            messaging_product: 'whatsapp',
+            to: phone,
+            type: waType,
+            [waType]: caption && String(caption).trim()
+                ? { id: mediaId, caption: String(caption).trim() }
+                : { id: mediaId }
+        };
+        // documents need a filename so the recipient sees a sensible name
+        if (waType === 'document') sendBody.document.filename = file.originalname || 'document';
+        const sendUrl = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+        const sendRes = await globalThis.fetch(sendUrl, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(sendBody)
+        });
+        const sendJson = await sendRes.json();
+        const sentId = sendJson?.messages?.[0]?.id || null;
+        if (!sentId) {
+            console.error('[WA SEND-MEDIA] ❌ send failed:', JSON.stringify(sendJson).substring(0, 300));
+            return res.status(500).json({ error: 'Message send failed', detail: sendJson });
+        }
+        console.log(`[WA SEND-MEDIA] ✅ ${waType} sent: media_id=${mediaId}, wa_message_id=${sentId}`);
+
+        // ─── STEP 3: capture the outbound media message into whatsapp_messages ───
+        saveWhatsAppMessage({
+            phone,
+            direction: 'outbound',
+            body: caption && String(caption).trim() ? String(caption).trim() : null,
+            msgType: waType,
+            mediaId,
+            waMessageId: sentId,
+            waTimestamp: new Date().toISOString()
+        }).catch(e => console.error('[WA CAPTURE] outbound media', e.message));
+
+        res.json({ success: true, wa_message_id: sentId, media_id: mediaId, type: waType });
+    } catch (e) {
+        console.error('[WA SEND-MEDIA] ❌', e.message);
         res.status(500).json({ error: e.message });
     }
 });
