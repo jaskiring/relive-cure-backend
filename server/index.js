@@ -809,7 +809,7 @@ app.get('/api/refrens-analytics', async (req, res) => {
         while (true) {
             const { data, error } = await supabaseAdmin
                 .from('refrens_leads')
-                .select('id, phone, contact_name, status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, objection_type, follow_up_date, labels, state, timeline, insurance, eye_power, age, reason_for_lasik, parameters_completed, last_user_message, lead_type, city_preference, lead_description, last_comment_by, synced_at')
+                .select('id, phone, contact_name, status, assignee, lead_source, customer_city, refrens_created_at, intent_band, call_outcome, consultation_status, objection_type, follow_up_date, labels, state, timeline, insurance, eye_power, age, reason_for_lasik, parameters_completed, last_user_message, lead_type, city_preference, lead_description, last_comment_by, synced_at, date_closed, next_activity, last_internal_note, first_response_time, whatsapp_link, duplicate, intent_score')
                 .order('refrens_created_at', { ascending: false })
                 .range(from, from + pageSize - 1);
             if (error) throw new Error(error.message);
