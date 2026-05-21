@@ -46,6 +46,38 @@ CREATE TABLE IF NOT EXISTS meta_ad_insights (
 
 CREATE INDEX IF NOT EXISTS meta_ad_insights_date_idx ON meta_ad_insights(date DESC);
 
+-- ─── meta_leads ──────────────────────────────────────────────────────────────
+-- One row per Facebook Lead Form submission. Captured via the Meta Page
+-- leadgen webhook (object: page, field: leadgen). Phone is normalized so we
+-- can match back to refrens_leads / leads_surgery by phone.
+CREATE TABLE IF NOT EXISTS meta_leads (
+  meta_lead_id     text        PRIMARY KEY,
+  page_id          text,
+  form_id          text,
+  ad_id            text,
+  adgroup_id       text,                      -- Meta calls this adset_id
+  campaign_id      text,
+  created_time     timestamptz,
+  phone            text,                      -- normalized digits, e.g. "9892520668"
+  name             text,
+  email            text,
+  city             text,
+  field_data       jsonb,                     -- full form payload from Meta
+  matched_lead_id  text,                      -- FK to refrens_leads.id or leads_surgery.id once matched
+  matched_source   text,                      -- 'refrens' | 'chatbot' | null
+  raw_payload      jsonb,                     -- complete Meta webhook payload (for debugging)
+  inserted_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS meta_leads_phone_idx     ON meta_leads(phone);
+CREATE INDEX IF NOT EXISTS meta_leads_campaign_idx  ON meta_leads(campaign_id);
+CREATE INDEX IF NOT EXISTS meta_leads_form_idx      ON meta_leads(form_id);
+CREATE INDEX IF NOT EXISTS meta_leads_created_idx   ON meta_leads(created_time DESC);
+
+ALTER TABLE meta_leads DISABLE ROW LEVEL SECURITY;
+GRANT ALL ON meta_leads TO service_role, authenticated, anon;
+
 -- ─── Cleanup (optional) ──────────────────────────────────────────────────────
 -- If you ran the previous version of this SQL, the old meta_credentials table
 -- can be dropped. Uncomment to clean up:

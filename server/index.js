@@ -868,7 +868,33 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
     try {
-        const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+        const body = req.body || {};
+        const objectType = body.object;  // 'whatsapp_business_account' | 'page'
+
+        // ─── Meta Page leadgen events (Phase C-2) ─────────────────────────────
+        if (objectType === 'page') {
+            const entries = body.entry || [];
+            for (const entry of entries) {
+                const changes = entry.changes || [];
+                for (const change of changes) {
+                    if (change.field === 'leadgen') {
+                        try {
+                            const { processLeadgenChange } = await import('./meta-marketing.js');
+                            const r = await processLeadgenChange(change);
+                            console.log(`[WEBHOOK] ✅ Leadgen ${r.metaLeadId} processed${r.linked ? ` → linked to ${r.linked.source}` : ''}`);
+                        } catch (e) {
+                            console.error('[WEBHOOK] ❌ Leadgen process failed:', e.message);
+                        }
+                    } else {
+                        console.log(`[WEBHOOK] Page change field='${change.field}' — ignored`);
+                    }
+                }
+            }
+            return;
+        }
+
+        // ─── WhatsApp Cloud (existing) ────────────────────────────────────────
+        const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
         if (!message) { console.log('[WEBHOOK] No message — status update, skipping.'); return; }
         console.log('[WEBHOOK] 📩 phone:', message.from, '| text:', message.text?.body, '| msgId:', message.id);
         await handleIncomingMessage(req.body, false);
@@ -948,6 +974,8 @@ import {
     runSync as metaRunSync,
     listCampaignsWithTotals as metaListCampaigns,
     getCampaignDetail as metaCampaignDetail,
+    getCampaignLeads as metaCampaignLeads,
+    backfillLeadLinks as metaBackfillLinks,
     recordSyncError as metaRecordSyncError,
     bustVerificationCache as metaBustCache
 } from './meta-marketing.js';
@@ -1011,6 +1039,29 @@ app.get('/api/meta/campaign/:id', async (req, res) => {
     } catch (err) {
         const status = err.status || 500;
         return res.status(status).json({ success: false, error: err.message });
+    }
+});
+
+// GET /api/meta/campaign/:id/leads — leads attributed to this campaign + funnel
+app.get('/api/meta/campaign/:id/leads', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const result = await metaCampaignLeads(req.params.id);
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// POST /api/meta/backfill-links — re-run lead linker for unmatched meta_leads
+// Useful after a Refrens sync brings in leads that came before we had attribution.
+app.post('/api/meta/backfill-links', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const result = await metaBackfillLinks();
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 

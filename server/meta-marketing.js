@@ -283,6 +283,190 @@ export function bustVerificationCache() {
   verifiedAccountCache = null;
 }
 
+// ─── Lead-form attribution (used by /webhook leadgen events) ─────────────────
+
+// Normalize Indian phone to bare digits (last 10), or just digits if shorter.
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/[^\d]/g, '');
+  if (d.length < 7) return null;
+  if (d.startsWith('91') && d.length === 12) return d.slice(2);
+  if (d.length > 10) return d.slice(-10);
+  return d;
+}
+
+// Extract phone / name / email / city from a Meta Lead-Form field_data array.
+// field_data is an array of { name, values: [string] } objects.
+function extractFieldData(fieldData) {
+  const out = { phone: null, name: null, email: null, city: null };
+  if (!Array.isArray(fieldData)) return out;
+  for (const f of fieldData) {
+    const key = String(f.name || '').toLowerCase();
+    const val = Array.isArray(f.values) && f.values.length ? String(f.values[0]) : '';
+    if (!val) continue;
+    if (!out.phone && /phone|mobile|whatsapp/.test(key)) out.phone = normalizePhone(val);
+    else if (!out.email && /email/.test(key)) out.email = val;
+    else if (!out.name && /name|full_name|first_name/.test(key)) out.name = val;
+    else if (!out.city && /city|location/.test(key)) out.city = val;
+  }
+  return out;
+}
+
+// Try to match a Meta lead to an existing Refrens / chatbot lead by phone.
+// Updates the meta_leads row with matched_lead_id + matched_source.
+async function linkToExistingLead(metaLeadId, phone) {
+  if (!phone) return null;
+  // Try Refrens first (most common source)
+  const { data: refrensHit } = await supabaseAdmin
+    .from('refrens_leads')
+    .select('id')
+    .eq('phone', phone)
+    .maybeSingle();
+  if (refrensHit) {
+    await supabaseAdmin.from('meta_leads')
+      .update({ matched_lead_id: refrensHit.id, matched_source: 'refrens', updated_at: new Date().toISOString() })
+      .eq('meta_lead_id', metaLeadId);
+    return { source: 'refrens', id: refrensHit.id };
+  }
+  // Then chatbot leads
+  const { data: botHit } = await supabaseAdmin
+    .from('leads_surgery')
+    .select('id')
+    .eq('phone_number', phone)
+    .maybeSingle();
+  if (botHit) {
+    await supabaseAdmin.from('meta_leads')
+      .update({ matched_lead_id: botHit.id, matched_source: 'chatbot', updated_at: new Date().toISOString() })
+      .eq('meta_lead_id', metaLeadId);
+    return { source: 'chatbot', id: botHit.id };
+  }
+  return null;
+}
+
+// Process a single leadgen webhook change. Meta sends us:
+//   { value: { leadgen_id, page_id, form_id, ad_id, adgroup_id, created_time } }
+// We then fetch the actual form data via Graph API and store it.
+export async function processLeadgenChange(change) {
+  const v = change?.value;
+  if (!v?.leadgen_id) throw new Error('leadgen webhook change has no leadgen_id');
+  const creds = await loadCredentials();
+  if (!creds) throw new Error('META_ACCESS_TOKEN not set — cannot fetch lead form data');
+
+  // Fetch the lead detail from Graph API
+  const detail = await graphGet(v.leadgen_id, {
+    fields: 'id,created_time,ad_id,ad_name,adgroup_id,campaign_id,form_id,field_data,platform'
+  }, creds.token);
+
+  const fields = extractFieldData(detail.field_data);
+
+  const row = {
+    meta_lead_id: detail.id || v.leadgen_id,
+    page_id: v.page_id || null,
+    form_id: detail.form_id || v.form_id || null,
+    ad_id: detail.ad_id || v.ad_id || null,
+    adgroup_id: detail.adgroup_id || v.adgroup_id || null,
+    campaign_id: detail.campaign_id || null,
+    created_time: detail.created_time || v.created_time || new Date().toISOString(),
+    phone: fields.phone,
+    name: fields.name,
+    email: fields.email,
+    city: fields.city,
+    field_data: detail.field_data || null,
+    raw_payload: { change, detail },
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabaseAdmin
+    .from('meta_leads')
+    .upsert(row, { onConflict: 'meta_lead_id' });
+  if (error) throw new Error(`meta_leads upsert failed: ${error.message}`);
+
+  // Try to link to existing Refrens/chatbot lead by phone
+  const link = await linkToExistingLead(row.meta_lead_id, row.phone);
+
+  console.log(`[META] 📥 Leadgen captured: ${row.name || 'no-name'} / ${row.phone || 'no-phone'} → campaign ${row.campaign_id || '?'}${link ? ` → linked to ${link.source}` : ''}`);
+  return { metaLeadId: row.meta_lead_id, campaignId: row.campaign_id, linked: link };
+}
+
+// Back-fill: re-run linker for all unmatched meta_leads (e.g. after Refrens sync brings in new leads).
+export async function backfillLeadLinks() {
+  const { data: unmatched, error } = await supabaseAdmin
+    .from('meta_leads')
+    .select('meta_lead_id, phone')
+    .is('matched_lead_id', null)
+    .not('phone', 'is', null);
+  if (error) throw new Error(error.message);
+  let linked = 0;
+  for (const r of (unmatched || [])) {
+    const link = await linkToExistingLead(r.meta_lead_id, r.phone);
+    if (link) linked++;
+  }
+  return { scanned: unmatched?.length || 0, linked };
+}
+
+// Return leads attributed to a specific campaign, joined with their Refrens / chatbot status.
+export async function getCampaignLeads(campaignId) {
+  const { data: metaLeads, error } = await supabaseAdmin
+    .from('meta_leads')
+    .select('meta_lead_id, name, phone, email, city, created_time, ad_id, adgroup_id, matched_lead_id, matched_source')
+    .eq('campaign_id', campaignId)
+    .order('created_time', { ascending: false });
+  if (error) throw new Error(error.message);
+
+  if (!metaLeads || metaLeads.length === 0) {
+    return { leads: [], funnel: { total: 0, matched: 0, hot: 0, consulted: 0, won: 0, lost: 0, pending: 0 } };
+  }
+
+  // Bulk-fetch the matched Refrens leads
+  const refrensIds = metaLeads.filter(l => l.matched_source === 'refrens' && l.matched_lead_id).map(l => l.matched_lead_id);
+  const botIds = metaLeads.filter(l => l.matched_source === 'chatbot' && l.matched_lead_id).map(l => l.matched_lead_id);
+
+  let refrensMap = {};
+  if (refrensIds.length > 0) {
+    const { data } = await supabaseAdmin
+      .from('refrens_leads')
+      .select('id, status, intent_band, assignee, last_internal_note, date_closed')
+      .in('id', refrensIds);
+    for (const r of (data || [])) refrensMap[r.id] = r;
+  }
+
+  let botMap = {};
+  if (botIds.length > 0) {
+    const { data } = await supabaseAdmin
+      .from('leads_surgery')
+      .select('id, status, parameters_completed, contact_name, last_user_message')
+      .in('id', botIds);
+    for (const r of (data || [])) botMap[r.id] = r;
+  }
+
+  const leads = metaLeads.map(l => {
+    const refrens = l.matched_source === 'refrens' ? refrensMap[l.matched_lead_id] : null;
+    const bot = l.matched_source === 'chatbot' ? botMap[l.matched_lead_id] : null;
+    const status = refrens?.status || bot?.status || (l.matched_source ? 'matched' : 'pending');
+    return {
+      ...l,
+      refrens,
+      bot,
+      status,
+      isWon: /deal done|won|surgery done|surgery booked/i.test(status),
+      isLost: /lost|dnp|not interested/i.test(status),
+      isHot: refrens?.intent_band === 'HOT' || /hot/i.test(refrens?.intent_band || '')
+    };
+  });
+
+  const funnel = {
+    total: leads.length,
+    matched: leads.filter(l => l.matched_lead_id).length,
+    hot: leads.filter(l => l.isHot).length,
+    consulted: leads.filter(l => /consult|consulted|interested/i.test(l.refrens?.status || '')).length,
+    won: leads.filter(l => l.isWon).length,
+    lost: leads.filter(l => l.isLost).length,
+    pending: leads.filter(l => !l.matched_lead_id).length
+  };
+
+  return { leads, funnel };
+}
+
 // ─── Single-campaign drill-down (used by GET /api/meta/campaign/:id) ─────────
 // Returns: metadata + 30-day aggregated KPIs + daily breakdown + week-over-week deltas.
 export async function getCampaignDetail(campaignId) {
