@@ -947,6 +947,7 @@ import {
     getStatus as metaGetStatus,
     runSync as metaRunSync,
     listCampaignsWithTotals as metaListCampaigns,
+    getCampaignDetail as metaCampaignDetail,
     recordSyncError as metaRecordSyncError,
     bustVerificationCache as metaBustCache
 } from './meta-marketing.js';
@@ -997,6 +998,19 @@ app.get('/api/meta/campaigns', async (req, res) => {
         return res.json({ success: true, campaigns });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// GET /api/meta/campaign/:id — full drill-down for one campaign
+//   ↳ metadata + 30d totals + 7d totals + 7d-vs-prior-7d deltas + daily breakdown
+app.get('/api/meta/campaign/:id', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const detail = await metaCampaignDetail(req.params.id);
+        return res.json({ success: true, ...detail });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({ success: false, error: err.message });
     }
 });
 

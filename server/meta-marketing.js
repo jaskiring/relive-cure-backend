@@ -282,3 +282,107 @@ export async function listCampaignsWithTotals() {
 export function bustVerificationCache() {
   verifiedAccountCache = null;
 }
+
+// ─── Single-campaign drill-down (used by GET /api/meta/campaign/:id) ─────────
+// Returns: metadata + 30-day aggregated KPIs + daily breakdown + week-over-week deltas.
+export async function getCampaignDetail(campaignId) {
+  // 1) Metadata
+  const { data: campaign, error: cErr } = await supabaseAdmin
+    .from('meta_campaigns')
+    .select('*')
+    .eq('id', campaignId)
+    .maybeSingle();
+  if (cErr) throw new Error(cErr.message);
+  if (!campaign) {
+    const err = new Error(`Campaign ${campaignId} not found in sync — try clicking Sync now first`);
+    err.status = 404;
+    throw err;
+  }
+
+  // 2) Daily insights — last 30 days
+  const since30 = new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10);
+  const { data: daily, error: dErr } = await supabaseAdmin
+    .from('meta_ad_insights')
+    .select('date, spend, impressions, clicks, leads, reach, cpm, cpc, ctr')
+    .eq('campaign_id', campaignId)
+    .gte('date', since30)
+    .order('date', { ascending: true });
+  if (dErr) throw new Error(dErr.message);
+
+  // 3) Aggregate totals (30d) and a 7-day vs prior-7d comparison
+  const today = new Date();
+  const ymd = d => d.toISOString().slice(0, 10);
+  const last7Start = ymd(new Date(today.getTime() - 7 * 86400 * 1000));
+  const prev7Start = ymd(new Date(today.getTime() - 14 * 86400 * 1000));
+  const prev7End   = ymd(new Date(today.getTime() - 8  * 86400 * 1000));
+
+  function sumRange(rows, from, to) {
+    let s = { spend: 0, impressions: 0, clicks: 0, leads: 0, reach: 0, days: 0 };
+    for (const r of rows) {
+      if ((!from || r.date >= from) && (!to || r.date <= to)) {
+        s.spend += Number(r.spend || 0);
+        s.impressions += Number(r.impressions || 0);
+        s.clicks += Number(r.clicks || 0);
+        s.leads += Number(r.leads || 0);
+        s.reach += Number(r.reach || 0);
+        s.days += 1;
+      }
+    }
+    return s;
+  }
+
+  const totals30 = sumRange(daily, null, null);
+  const totals7  = sumRange(daily, last7Start, null);
+  const totalsPrev7 = sumRange(daily, prev7Start, prev7End);
+
+  function deriveKpis(t) {
+    return {
+      ...t,
+      cpl: t.leads > 0 ? Math.round((t.spend / t.leads) * 100) / 100 : null,
+      cpm: t.impressions > 0 ? Math.round((t.spend / t.impressions) * 1000 * 100) / 100 : null,
+      cpc: t.clicks > 0 ? Math.round((t.spend / t.clicks) * 100) / 100 : null,
+      ctr: t.impressions > 0 ? Math.round((t.clicks / t.impressions) * 10000) / 100 : null, // %
+      conversionRate: t.clicks > 0 ? Math.round((t.leads / t.clicks) * 10000) / 100 : null, // %
+      frequency: t.reach > 0 ? Math.round((t.impressions / t.reach) * 100) / 100 : null
+    };
+  }
+
+  function pctChange(a, b) {
+    if (b === 0) return a > 0 ? null : 0; // null = "new" data
+    return Math.round(((a - b) / b) * 1000) / 10; // 1 decimal place
+  }
+
+  const kpis30 = deriveKpis(totals30);
+  const kpis7 = deriveKpis(totals7);
+  const kpisPrev7 = deriveKpis(totalsPrev7);
+
+  // Week-over-week deltas (last 7 vs prior 7)
+  const wow = {
+    spend: pctChange(kpis7.spend, kpisPrev7.spend),
+    leads: pctChange(kpis7.leads, kpisPrev7.leads),
+    cpl: kpis7.cpl != null && kpisPrev7.cpl != null ? pctChange(kpis7.cpl, kpisPrev7.cpl) : null,
+    ctr: kpis7.ctr != null && kpisPrev7.ctr != null ? pctChange(kpis7.ctr, kpisPrev7.ctr) : null,
+    impressions: pctChange(kpis7.impressions, kpisPrev7.impressions),
+    clicks: pctChange(kpis7.clicks, kpisPrev7.clicks),
+  };
+
+  return {
+    campaign: {
+      id: campaign.id,
+      name: campaign.name,
+      objective: campaign.objective,
+      status: campaign.status,
+      daily_budget: campaign.daily_budget,
+      lifetime_budget: campaign.lifetime_budget,
+      start_time: campaign.start_time,
+      stop_time: campaign.stop_time,
+      account_id: campaign.account_id,
+      last_synced_at: campaign.last_synced_at
+    },
+    kpis30,    // 30-day totals + derived metrics
+    kpis7,     // last 7 days
+    kpisPrev7, // 7 days before that (for comparison)
+    wow,       // week-over-week % change
+    daily      // raw daily rows for the trend chart
+  };
+}
