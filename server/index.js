@@ -939,15 +939,16 @@ app.get('/api/sync-status', async (req, res) => {
 
 
 // ─── Meta Ads (Marketing API) ────────────────────────────────────────────────
-// All four endpoints are gated on the CRM API key the dashboard already uses
-// for other privileged calls (x-crm-key header). The token itself never
-// leaves the server once stored — encrypted at rest in meta_credentials.
+// Credentials live in Railway env vars (META_ACCESS_TOKEN + META_AD_ACCOUNT_ID).
+// The token is never written to the database and never returned to the browser.
+// All three endpoints are gated on the same CRM API key the dashboard uses for
+// other privileged calls (x-crm-key header).
 import {
-    saveCredentials as metaSaveCredentials,
     getStatus as metaGetStatus,
     runSync as metaRunSync,
     listCampaignsWithTotals as metaListCampaigns,
-    normalizeAccountId as metaNormalizeAccountId
+    recordSyncError as metaRecordSyncError,
+    bustVerificationCache as metaBustCache
 } from './meta-marketing.js';
 
 function requireCrmKey(req, res) {
@@ -959,44 +960,12 @@ function requireCrmKey(req, res) {
     return true;
 }
 
-// POST /api/meta/credentials — save + verify
-// Body: { token: "EAAB…", accountId: "act_…" }  (accountId may be bare numeric — we'll prepend act_)
-app.post('/api/meta/credentials', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
-    const { token, accountId } = req.body || {};
-    if (!token || !accountId) return res.status(400).json({ success: false, error: 'token and accountId are required' });
-    if (typeof token !== 'string' || token.length < 50) return res.status(400).json({ success: false, error: 'Token looks malformed (expected ~200-char EAAB… string)' });
-
-    try {
-        const { account } = await metaSaveCredentials({ token, accountId });
-        console.log(`[META] ✅ Credentials saved for ${account.name} (${account.id})`);
-        // Kick off an initial sync in the background — don't block the response.
-        setImmediate(async () => {
-            try {
-                const result = await metaRunSync({});
-                console.log(`[META] ✅ Initial sync done — ${result.campaignsCount} campaigns, ${result.insightsCount} insight rows`);
-            } catch (e) {
-                console.error('[META] ❌ Initial sync failed:', e.message);
-            }
-        });
-        return res.json({
-            success: true,
-            accountId: account.id,
-            accountName: account.name,
-            currency: account.currency,
-            businessName: account.businessName
-        });
-    } catch (err) {
-        console.error('[META] ❌ Credentials verify/save failed:', err.message);
-        // Surface Graph API error messages back to the UI so the user can fix scopes etc.
-        return res.status(400).json({ success: false, error: err.message, fbCode: err.fbCode });
-    }
-});
-
-// GET /api/meta/status — connection status + last sync
+// GET /api/meta/status — connection status, account name, last sync time
 app.get('/api/meta/status', async (req, res) => {
     if (!requireCrmKey(req, res)) return;
     try {
+        // Allow ?refresh=1 to bust the in-memory verification cache (e.g. after the user changes env vars)
+        if (req.query.refresh === '1') metaBustCache();
         const status = await metaGetStatus();
         return res.json({ success: true, ...status });
     } catch (err) {
@@ -1011,14 +980,12 @@ app.post('/api/meta/sync', async (req, res) => {
     try {
         const { since, until } = req.body || {};
         const result = await metaRunSync({ since, until });
+        console.log(`[META] ✅ Manual sync done — ${result.campaignsCount} campaigns, ${result.insightsCount} insight rows`);
         return res.json({ success: true, ...result });
     } catch (err) {
         console.error('[META] ❌ Sync failed:', err.message);
-        // Record the failure on the credentials row so the UI shows it.
-        try {
-            await supabaseAdmin.from('meta_credentials').update({ last_sync_status: `error: ${err.message}` }).eq('id', 'default');
-        } catch {}
-        return res.status(500).json({ success: false, error: err.message });
+        metaRecordSyncError(err.message);
+        return res.status(500).json({ success: false, error: err.message, reason: err.reason });
     }
 });
 
@@ -1132,15 +1099,17 @@ app.listen(PORT, '0.0.0.0', () => {
     async function runMetaSync() {
         try {
             const status = await metaGetStatus();
-            if (!status.connected) return; // no credentials saved yet — skip silently
+            if (!status.connected) {
+                // Quietly skip — either env vars are missing or verification failed.
+                // The dashboard surfaces the reason; no point spamming logs every hour.
+                return;
+            }
             console.log('[SCHEDULER] 🔄 Auto-sync Meta Ads...');
             const result = await metaRunSync({});
             console.log(`[SCHEDULER] Meta sync ok — ${result.campaignsCount} campaigns, ${result.insightsCount} insight rows`);
         } catch (err) {
             console.error('[SCHEDULER] Meta sync failed:', err.message);
-            try {
-                await supabaseAdmin.from('meta_credentials').update({ last_sync_status: `error: ${err.message}` }).eq('id', 'default');
-            } catch {}
+            metaRecordSyncError(err.message);
         }
     }
     // First run: 5 minutes after boot. Then every hour.

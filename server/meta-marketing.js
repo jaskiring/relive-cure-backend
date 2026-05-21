@@ -1,50 +1,44 @@
 // ─── Meta Ads (Marketing API) helpers ─────────────────────────────────────────
-// • AES-256-GCM encrypt/decrypt for the System User token at rest
-// • Thin wrappers around graph.facebook.com/v21.0 endpoints we use
-// • A single `runSync` that pulls campaigns + the last 30 days of insights
-//   and upserts them into meta_campaigns / meta_ad_insights
+// Credentials live in Railway env vars (META_ACCESS_TOKEN + META_AD_ACCOUNT_ID).
+// We never write the token to Supabase or to disk. Verification of the account
+// (name, currency) is cached in memory for the lifetime of the process so we
+// don't ping Graph on every status check.
 //
-// The raw token only lives in env (META_ENCRYPTION_KEY) + memory while we
-// decrypt-for-use. It is never written to the browser, never logged.
+// Tables used (see meta-marketing.sql):
+//   meta_campaigns       — campaign metadata (synced from Graph)
+//   meta_ad_insights     — daily spend/impressions/clicks/leads (composite PK)
+//
+// (The meta_credentials table is no longer used. It's safe to drop, but harmless to leave.)
 
-import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { supabaseAdmin } from './supabase-admin.js';
 
 const GRAPH_VERSION = 'v21.0';
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
-// ─── Encryption ───────────────────────────────────────────────────────────────
-// Key comes from META_ENCRYPTION_KEY (64 hex chars = 32 bytes).
-// If the env var is missing we fall back to a key derived from CRM_API_KEY +
-// SUPABASE_SERVICE_ROLE_KEY so first deploys still encrypt at rest. The user
-// can later set META_ENCRYPTION_KEY explicitly and rotate.
-function getKey() {
-  const explicit = process.env.META_ENCRYPTION_KEY;
-  if (explicit && /^[0-9a-fA-F]{64}$/.test(explicit)) {
-    return Buffer.from(explicit, 'hex');
-  }
-  const seed = `${process.env.CRM_API_KEY || ''}:${process.env.SUPABASE_SERVICE_ROLE_KEY || ''}`;
-  return crypto.createHash('sha256').update(seed).digest();
+// ─── In-memory state ──────────────────────────────────────────────────────────
+// Reset on every process restart. last_sync_at is read from DB so it survives
+// restarts; verification cache + last_sync_status are best-effort in-memory.
+let verifiedAccountCache = null;       // { id, name, currency, businessName, ... }
+let lastSyncStatusCache = null;        // 'ok' | 'error: <msg>'
+
+// ─── Credentials from env vars ───────────────────────────────────────────────
+export function normalizeAccountId(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (s.startsWith('act_')) return s;
+  if (/^\d+$/.test(s)) return `act_${s}`;
+  return s;
 }
 
-export function encryptToken(plaintext) {
-  const key = getKey();
-  const iv = crypto.randomBytes(12); // GCM standard
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `${iv.toString('hex')}:${ciphertext.toString('hex')}:${tag.toString('hex')}`;
-}
-
-export function decryptToken(blob) {
-  const [ivHex, ctHex, tagHex] = String(blob || '').split(':');
-  if (!ivHex || !ctHex || !tagHex) throw new Error('meta token blob malformed');
-  const key = getKey();
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  const out = Buffer.concat([decipher.update(Buffer.from(ctHex, 'hex')), decipher.final()]);
-  return out.toString('utf8');
+export async function loadCredentials() {
+  const token = process.env.META_ACCESS_TOKEN;
+  const rawAccountId = process.env.META_AD_ACCOUNT_ID;
+  if (!token || !rawAccountId) return null;
+  return {
+    token: token.trim(),
+    accountId: normalizeAccountId(rawAccountId)
+  };
 }
 
 // ─── Graph API thin wrappers ──────────────────────────────────────────────────
@@ -67,16 +61,6 @@ async function graphGet(path, params, token) {
   return json;
 }
 
-// Normalize account ID to "act_NNN" form.
-export function normalizeAccountId(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return '';
-  if (s.startsWith('act_')) return s;
-  if (/^\d+$/.test(s)) return `act_${s}`;
-  return s;
-}
-
-// Quick sanity check + return account name (used during /api/meta/credentials).
 export async function verifyAccount(accountId, token) {
   const data = await graphGet(accountId, {
     fields: 'id,name,account_status,currency,timezone_name,business{id,name}'
@@ -92,11 +76,10 @@ export async function verifyAccount(accountId, token) {
   };
 }
 
-// All campaigns for the account (paginates).
 export async function fetchCampaigns(accountId, token) {
   const out = [];
   let after = null;
-  for (let i = 0; i < 20; i++) { // safety cap (20 pages × 100 = 2000 campaigns)
+  for (let i = 0; i < 20; i++) {
     const params = {
       fields: 'id,name,objective,status,daily_budget,lifetime_budget,start_time,stop_time',
       limit: 100
@@ -110,8 +93,6 @@ export async function fetchCampaigns(accountId, token) {
   return out;
 }
 
-// Daily insights for the account, grouped by campaign + day.
-// time_range is { since: 'YYYY-MM-DD', until: 'YYYY-MM-DD' } (inclusive)
 export async function fetchInsights(accountId, token, { since, until } = {}) {
   const today = new Date();
   const ymd = d => d.toISOString().slice(0, 10);
@@ -120,12 +101,12 @@ export async function fetchInsights(accountId, token, { since, until } = {}) {
 
   const out = [];
   let after = null;
-  for (let i = 0; i < 50; i++) { // safety
+  for (let i = 0; i < 50; i++) {
     const params = {
       level: 'campaign',
       fields: 'campaign_id,spend,impressions,clicks,reach,cpm,cpc,ctr,actions,date_start,date_stop',
       time_range: JSON.stringify({ since: s, until: u }),
-      time_increment: 1,           // one row per day
+      time_increment: 1,
       limit: 500
     };
     if (after) params.after = after;
@@ -137,62 +118,61 @@ export async function fetchInsights(accountId, token, { since, until } = {}) {
   return out;
 }
 
-// ─── Persistence ──────────────────────────────────────────────────────────────
-export async function saveCredentials({ token, accountId }) {
-  const normalizedId = normalizeAccountId(accountId);
-  const account = await verifyAccount(normalizedId, token);   // throws if bad
-  const encrypted = encryptToken(token);
-  const { error } = await supabaseAdmin
-    .from('meta_credentials')
-    .upsert({
-      id: 'default',
-      token_encrypted: encrypted,
-      ad_account_id: normalizedId,
-      account_name: account.name,
-      business_id: account.businessId || null,
-    }, { onConflict: 'id' });
-  if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
-  return { account };
-}
-
-export async function loadCredentials() {
-  const { data, error } = await supabaseAdmin
-    .from('meta_credentials')
-    .select('id, ad_account_id, account_name, business_id, token_encrypted, last_sync_at, last_sync_status, updated_at')
-    .eq('id', 'default')
-    .maybeSingle();
-  if (error) throw new Error(error.message);
-  if (!data) return null;
-  return {
-    accountId: data.ad_account_id,
-    accountName: data.account_name,
-    businessId: data.business_id,
-    lastSyncAt: data.last_sync_at,
-    lastSyncStatus: data.last_sync_status,
-    updatedAt: data.updated_at,
-    token: decryptToken(data.token_encrypted)
-  };
-}
-
+// ─── Status (used by GET /api/meta/status) ───────────────────────────────────
 export async function getStatus() {
-  const creds = await loadCredentials().catch(() => null);
-  if (!creds) return { connected: false };
+  const creds = await loadCredentials();
+  if (!creds) {
+    return {
+      connected: false,
+      reason: 'env_missing',
+      message: 'Set META_ACCESS_TOKEN and META_AD_ACCOUNT_ID in Railway → Variables.'
+    };
+  }
+
+  // Verify the account (cached for the process lifetime).
+  if (!verifiedAccountCache || verifiedAccountCache._for !== creds.accountId) {
+    try {
+      const acc = await verifyAccount(creds.accountId, creds.token);
+      verifiedAccountCache = { ...acc, _for: creds.accountId };
+    } catch (e) {
+      return {
+        connected: false,
+        reason: 'verify_failed',
+        message: e.message,
+        fbCode: e.fbCode
+      };
+    }
+  }
+
+  // last_sync_at = most recent last_synced_at across meta_campaigns. Survives restarts.
+  let lastSyncAt = null;
+  try {
+    const { data } = await supabaseAdmin
+      .from('meta_campaigns')
+      .select('last_synced_at')
+      .order('last_synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    lastSyncAt = data?.last_synced_at || null;
+  } catch { /* not fatal */ }
+
   return {
     connected: true,
     accountId: creds.accountId,
-    accountName: creds.accountName,
-    businessId: creds.businessId,
-    lastSyncAt: creds.lastSyncAt,
-    lastSyncStatus: creds.lastSyncStatus
+    accountName: verifiedAccountCache.name,
+    businessId: verifiedAccountCache.businessId,
+    businessName: verifiedAccountCache.businessName,
+    currency: verifiedAccountCache.currency,
+    lastSyncAt,
+    lastSyncStatus: lastSyncStatusCache
   };
 }
 
-// Convert a Graph "actions" array to a lead count.
+// ─── Sync (used by POST /api/meta/sync + scheduler) ───────────────────────────
 function leadsFromActions(actions) {
   if (!Array.isArray(actions)) return 0;
   let n = 0;
   for (const a of actions) {
-    // on-platform leadgen forms
     if (a.action_type === 'leadgen.other' || a.action_type === 'lead') {
       n += Number(a.value || 0);
     }
@@ -200,13 +180,15 @@ function leadsFromActions(actions) {
   return n;
 }
 
-// One-shot sync: pull campaigns + last-30d insights, upsert them.
 export async function runSync({ since, until } = {}) {
   const creds = await loadCredentials();
-  if (!creds) throw new Error('No credentials saved');
+  if (!creds) {
+    const err = new Error('META_ACCESS_TOKEN or META_AD_ACCOUNT_ID not set in env');
+    err.reason = 'env_missing';
+    throw err;
+  }
   const { accountId, token } = creds;
 
-  // Campaigns
   const campaigns = await fetchCampaigns(accountId, token);
   if (campaigns.length > 0) {
     const rows = campaigns.map(c => ({
@@ -227,12 +209,11 @@ export async function runSync({ since, until } = {}) {
     if (error) throw new Error(`Campaigns upsert failed: ${error.message}`);
   }
 
-  // Insights
   const insights = await fetchInsights(accountId, token, { since, until });
   if (insights.length > 0) {
     const rows = insights.map(r => ({
       campaign_id: r.campaign_id,
-      date: r.date_start,        // because time_increment=1, date_start === date_stop
+      date: r.date_start,
       spend: Number(r.spend || 0),
       impressions: Number(r.impressions || 0),
       clicks: Number(r.clicks || 0),
@@ -243,7 +224,6 @@ export async function runSync({ since, until } = {}) {
       ctr: r.ctr != null ? Number(r.ctr) : null,
       last_synced_at: new Date().toISOString()
     }));
-    // Batch upsert in chunks of 500 to stay under request limits
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
       const { error } = await supabaseAdmin
@@ -253,20 +233,19 @@ export async function runSync({ since, until } = {}) {
     }
   }
 
-  const now = new Date().toISOString();
-  await supabaseAdmin
-    .from('meta_credentials')
-    .update({ last_sync_at: now, last_sync_status: 'ok' })
-    .eq('id', 'default');
-
+  lastSyncStatusCache = 'ok';
   return {
-    syncedAt: now,
+    syncedAt: new Date().toISOString(),
     campaignsCount: campaigns.length,
     insightsCount: insights.length
   };
 }
 
-// Convenience for the dashboard: list campaigns + their last-30d totals.
+export function recordSyncError(msg) {
+  lastSyncStatusCache = `error: ${msg}`;
+}
+
+// ─── Campaign list with 30-day totals + CPL ──────────────────────────────────
 export async function listCampaignsWithTotals() {
   const { data: campaigns, error: cErr } = await supabaseAdmin
     .from('meta_campaigns')
@@ -297,4 +276,9 @@ export async function listCampaignsWithTotals() {
       cpl: t.leads > 0 ? Math.round((t.spend / t.leads) * 100) / 100 : null
     };
   });
+}
+
+// Bust the verification cache (called when env vars might have changed via Railway redeploy).
+export function bustVerificationCache() {
+  verifiedAccountCache = null;
 }

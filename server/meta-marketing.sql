@@ -1,21 +1,11 @@
--- Meta Ads integration — schema for credentials, campaigns, daily insights
+-- Meta Ads integration — schema for synced campaign + insights data
 -- Run this once in Supabase Studio → SQL editor (or `psql`)
 -- Safe to re-run: every CREATE uses IF NOT EXISTS.
-
--- ─── meta_credentials ────────────────────────────────────────────────────────
--- One row per business. Token is AES-256-GCM encrypted server-side; the raw
--- token is never written to the browser and never logged.
-CREATE TABLE IF NOT EXISTS meta_credentials (
-  id              text        PRIMARY KEY DEFAULT 'default',
-  token_encrypted text        NOT NULL,    -- format: <iv_hex>:<ciphertext_hex>:<tag_hex>
-  ad_account_id   text        NOT NULL,    -- e.g. "act_1506354983886720"
-  account_name    text,                    -- cached from Graph API
-  business_id     text,                    -- cached from Graph API
-  last_sync_at    timestamptz,
-  last_sync_status text,                   -- 'ok' | 'error: <msg>'
-  created_at      timestamptz NOT NULL DEFAULT now(),
-  updated_at      timestamptz NOT NULL DEFAULT now()
-);
+--
+-- Credentials (System User token + ad account ID) live in Railway env vars:
+--   META_ACCESS_TOKEN
+--   META_AD_ACCOUNT_ID    (e.g. "act_1506354983886720" or bare digits)
+-- They are NEVER stored in this database.
 
 -- ─── meta_campaigns ──────────────────────────────────────────────────────────
 -- One row per Meta ad campaign. Mirrors what the Graph API returns.
@@ -34,6 +24,7 @@ CREATE TABLE IF NOT EXISTS meta_campaigns (
 
 CREATE INDEX IF NOT EXISTS meta_campaigns_account_idx ON meta_campaigns(account_id);
 CREATE INDEX IF NOT EXISTS meta_campaigns_status_idx  ON meta_campaigns(status);
+CREATE INDEX IF NOT EXISTS meta_campaigns_synced_idx  ON meta_campaigns(last_synced_at DESC);
 
 -- ─── meta_ad_insights ────────────────────────────────────────────────────────
 -- Daily roll-up of spend / impressions / clicks / leads per campaign.
@@ -55,16 +46,7 @@ CREATE TABLE IF NOT EXISTS meta_ad_insights (
 
 CREATE INDEX IF NOT EXISTS meta_ad_insights_date_idx ON meta_ad_insights(date DESC);
 
--- ─── trigger to keep meta_credentials.updated_at fresh ──────────────────────
-CREATE OR REPLACE FUNCTION meta_credentials_touch_updated_at()
-RETURNS trigger AS $$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS meta_credentials_touch ON meta_credentials;
-CREATE TRIGGER meta_credentials_touch
-  BEFORE UPDATE ON meta_credentials
-  FOR EACH ROW EXECUTE FUNCTION meta_credentials_touch_updated_at();
+-- ─── Cleanup (optional) ──────────────────────────────────────────────────────
+-- If you ran the previous version of this SQL, the old meta_credentials table
+-- can be dropped. Uncomment to clean up:
+--   DROP TABLE IF EXISTS meta_credentials CASCADE;
