@@ -404,6 +404,167 @@ export async function backfillLeadLinks() {
   return { scanned: unmatched?.length || 0, linked };
 }
 
+// ─── Per-ad + audience breakdowns (live Graph API, lazy-loaded) ──────────────
+// These are NOT cached in Supabase — pulled on-demand when the user drills
+// into a campaign. Tradeoff: slower drill-down (one extra Graph call) but
+// always fresh data and no schema migrations.
+
+// In-memory cache to avoid hammering Graph if the user reopens the same
+// campaign repeatedly. 5-minute TTL.
+const adBreakdownCache = new Map();   // campaignId → { fetchedAt, data }
+const audBreakdownCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+function readCache(map, key) {
+  const hit = map.get(key);
+  if (hit && Date.now() - hit.fetchedAt < CACHE_TTL_MS) return hit.data;
+  return null;
+}
+
+function writeCache(map, key, data) {
+  map.set(key, { fetchedAt: Date.now(), data });
+}
+
+// Per-ad performance inside a campaign. Pulled level=ad with the campaign
+// filtered server-side via the filtering param.
+export async function getCampaignAds(campaignId) {
+  const cached = readCache(adBreakdownCache, campaignId);
+  if (cached) return cached;
+
+  const creds = await loadCredentials();
+  if (!creds) throw new Error('META_ACCESS_TOKEN not set');
+
+  // 1) Fetch ad metadata (names + creative thumbnails)
+  const meta = await graphGet(`${campaignId}/ads`, {
+    fields: 'id,name,status,creative{thumbnail_url,image_url}',
+    limit: 100
+  }, creds.token);
+
+  // 2) Fetch ad-level insights (last 30 days, all ads in this campaign)
+  const since = new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10);
+  const until = new Date().toISOString().slice(0, 10);
+  const insights = await graphGet(`${campaignId}/insights`, {
+    level: 'ad',
+    fields: 'ad_id,ad_name,spend,impressions,clicks,reach,cpm,cpc,ctr,actions',
+    time_range: JSON.stringify({ since, until }),
+    limit: 500
+  }, creds.token);
+
+  // 3) Merge metadata with insights
+  const insightsByAdId = {};
+  for (const r of (insights.data || [])) {
+    insightsByAdId[r.ad_id] = r;
+  }
+
+  function leadsFromActions(actions) {
+    if (!Array.isArray(actions)) return 0;
+    let n = 0;
+    for (const a of actions) {
+      if (a.action_type === 'leadgen.other' || a.action_type === 'lead') {
+        n += Number(a.value || 0);
+      }
+    }
+    return n;
+  }
+
+  const ads = (meta.data || []).map(ad => {
+    const i = insightsByAdId[ad.id] || {};
+    const spend = Number(i.spend || 0);
+    const leads = leadsFromActions(i.actions);
+    return {
+      id: ad.id,
+      name: ad.name,
+      status: ad.status,
+      thumbnail: ad.creative?.thumbnail_url || ad.creative?.image_url || null,
+      spend,
+      impressions: Number(i.impressions || 0),
+      clicks: Number(i.clicks || 0),
+      reach: Number(i.reach || 0),
+      leads,
+      cpl: leads > 0 ? Math.round((spend / leads) * 100) / 100 : null,
+      cpm: i.cpm != null ? Number(i.cpm) : null,
+      cpc: i.cpc != null ? Number(i.cpc) : null,
+      ctr: i.ctr != null ? Number(i.ctr) : null
+    };
+  }).sort((a, b) => b.spend - a.spend);  // biggest spenders first
+
+  const result = { ads, count: ads.length };
+  writeCache(adBreakdownCache, campaignId, result);
+  return result;
+}
+
+// Audience breakdowns for a campaign: age × gender, region, placement
+export async function getCampaignAudience(campaignId) {
+  const cached = readCache(audBreakdownCache, campaignId);
+  if (cached) return cached;
+
+  const creds = await loadCredentials();
+  if (!creds) throw new Error('META_ACCESS_TOKEN not set');
+
+  const since = new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10);
+  const until = new Date().toISOString().slice(0, 10);
+
+  async function fetchBreakdown(breakdowns) {
+    return graphGet(`${campaignId}/insights`, {
+      level: 'campaign',
+      fields: 'spend,impressions,clicks,reach,actions',
+      time_range: JSON.stringify({ since, until }),
+      breakdowns,
+      limit: 500
+    }, creds.token);
+  }
+
+  function leadsFromActions(actions) {
+    if (!Array.isArray(actions)) return 0;
+    let n = 0;
+    for (const a of actions) {
+      if (a.action_type === 'leadgen.other' || a.action_type === 'lead') {
+        n += Number(a.value || 0);
+      }
+    }
+    return n;
+  }
+
+  function mapRows(rows, keyFields) {
+    return (rows || []).map(r => {
+      const spend = Number(r.spend || 0);
+      const leads = leadsFromActions(r.actions);
+      const key = {};
+      for (const k of keyFields) key[k] = r[k];
+      return {
+        ...key,
+        spend,
+        impressions: Number(r.impressions || 0),
+        clicks: Number(r.clicks || 0),
+        reach: Number(r.reach || 0),
+        leads,
+        cpl: leads > 0 ? Math.round((spend / leads) * 100) / 100 : null,
+        ctr: r.impressions > 0 ? Math.round((r.clicks / r.impressions) * 10000) / 100 : null
+      };
+    });
+  }
+
+  // Run all three in parallel — Graph API handles them concurrently fine
+  const [ageGender, region, placement] = await Promise.allSettled([
+    fetchBreakdown('age,gender'),
+    fetchBreakdown('region'),
+    fetchBreakdown('publisher_platform,platform_position')
+  ]);
+
+  const result = {
+    ageGender: ageGender.status === 'fulfilled' ? mapRows(ageGender.value.data, ['age', 'gender']).sort((a, b) => b.spend - a.spend) : [],
+    region: region.status === 'fulfilled' ? mapRows(region.value.data, ['region']).sort((a, b) => b.spend - a.spend) : [],
+    placement: placement.status === 'fulfilled' ? mapRows(placement.value.data, ['publisher_platform', 'platform_position']).sort((a, b) => b.spend - a.spend) : [],
+    errors: {
+      ageGender: ageGender.status === 'rejected' ? ageGender.reason.message : null,
+      region: region.status === 'rejected' ? region.reason.message : null,
+      placement: placement.status === 'rejected' ? placement.reason.message : null
+    }
+  };
+  writeCache(audBreakdownCache, campaignId, result);
+  return result;
+}
+
 // Return leads attributed to a specific campaign, joined with their Refrens / chatbot status.
 export async function getCampaignLeads(campaignId) {
   const { data: metaLeads, error } = await supabaseAdmin

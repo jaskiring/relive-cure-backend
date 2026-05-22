@@ -975,6 +975,8 @@ import {
     listCampaignsWithTotals as metaListCampaigns,
     getCampaignDetail as metaCampaignDetail,
     getCampaignLeads as metaCampaignLeads,
+    getCampaignAds as metaCampaignAds,
+    getCampaignAudience as metaCampaignAudience,
     backfillLeadLinks as metaBackfillLinks,
     recordSyncError as metaRecordSyncError,
     bustVerificationCache as metaBustCache
@@ -1062,6 +1064,28 @@ app.post('/api/meta/backfill-links', async (req, res) => {
         return res.json({ success: true, ...result });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// GET /api/meta/campaign/:id/ads — per-ad performance breakdown (live Graph API)
+app.get('/api/meta/campaign/:id/ads', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const result = await metaCampaignAds(req.params.id);
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message, fbCode: err.fbCode });
+    }
+});
+
+// GET /api/meta/campaign/:id/audience — age/gender/region/placement breakdowns
+app.get('/api/meta/campaign/:id/audience', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const result = await metaCampaignAudience(req.params.id);
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message, fbCode: err.fbCode });
     }
 });
 
