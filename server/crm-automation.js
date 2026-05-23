@@ -724,43 +724,41 @@ async function processLead(lead) {
         return { picked: existing, reason: 'already_filled' };
       }
 
-      // Probe (May 2026) showed: clicking the outer control center does NOT
-      // open the menu in headless Puppeteer. Clicking the INPUT directly does.
-      // Get the input's own bounding rect and click that.
+      // Get the React-Select hidden input element.
+      // IMPORTANT: React-Select's input has width:1px when unfocused, so
+      // page.mouse.click() on its bounding rect misses it. Use
+      // ElementHandle.focus() which calls element.focus() directly — works
+      // regardless of visual dimensions.
       const inpHandle = await ctrl.evaluateHandle(c => c.querySelector('input'));
       const inpEl = inpHandle.asElement();
       if (!inpEl) return { picked: null, reason: 'no_input' };
 
-      const inpRect = await inpEl.evaluate(el => {
-        el.scrollIntoView({ behavior: 'instant', block: 'center' });
-        const r = el.getBoundingClientRect();
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-      });
-      await new Promise(r => setTimeout(r, 300));
-      await page.mouse.click(inpRect.x, inpRect.y);
+      // Scroll the control into view, then focus the input
+      await ctrl.evaluate(c => c.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await new Promise(r => setTimeout(r, 200));
+      await inpEl.focus();
+      await new Promise(r => setTimeout(r, 600));
 
-      // Short wait — Refrens may show all prospects immediately on open
-      await new Promise(r => setTimeout(r, 800));
-
+      // Check if options loaded on focus alone (Refrens sometimes loads all)
       const initialOpts = await page.evaluate(() =>
         Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
       );
-      console.log(`[ORG] after open: ${initialOpts.length} options${initialOpts.length ? ': ' + initialOpts.slice(0, 5).join(' | ') : ''}`);
+      console.log(`[ORG] after focus: ${initialOpts.length} options${initialOpts.length ? ': ' + initialOpts.slice(0, 5).join(' | ') : ''}`);
 
-      // If options already loaded, look for "Relive cure" match
       let pickedNow = await tryClickReliveMatch();
       if (pickedNow) return { picked: pickedNow, reason: 'open_only' };
 
       // No match yet — progressively type to trigger the async search.
-      // Probe confirmed 're' → 0 opts, 'rel' → 1 opt ("Relive cure").
-      const searchAttempts = ['re', 'rel', 'reli', 'relive'];
-      for (const term of searchAttempts) {
-        // Triple-click to select all text, then Backspace to clear
-        await page.mouse.click(inpRect.x, inpRect.y, { clickCount: 3 });
+      // Probe confirmed: 're' → 0 opts, 'rel' → 1 opt ("Relive cure").
+      for (const term of ['re', 'rel', 'reli', 'relive']) {
+        // Re-focus input, clear with Ctrl+A → Backspace, then type
+        await inpEl.focus();
+        await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
         await page.keyboard.press('Backspace');
-        await new Promise(r => setTimeout(r, 150));
+        await new Promise(r => setTimeout(r, 200));
 
-        await page.keyboard.type(term, { delay: 100 });
+        // ElementHandle.type() ensures focus before each keystroke
+        await inpEl.type(term, { delay: 100 });
         try {
           await page.waitForFunction(
             () => document.querySelectorAll('.disco-select__option').length > 0,
