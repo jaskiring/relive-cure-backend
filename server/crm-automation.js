@@ -842,40 +842,59 @@ async function processLead(lead) {
       await page.keyboard.press('Backspace');
       await new Promise(r => setTimeout(r, 700));   // wait for unfiltered list
 
-      const firstOptRect = await page.evaluate(() => {
+      const firstPicked = await page.evaluate(() => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option'));
         if (opts.length === 0) return null;
-        const r = opts[0].getBoundingClientRect();
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: opts[0].innerText.trim() };
+        const opt = opts[0];
+        const propsKey = Object.keys(opt).find(k => k.startsWith('__reactProps'));
+        const onClick = propsKey ? opt[propsKey]?.onClick : null;
+        if (typeof onClick !== 'function') return null;
+        try {
+          onClick({
+            target: opt, currentTarget: opt, type: 'click', button: 0,
+            defaultPrevented: false, preventDefault: () => {}, stopPropagation: () => {}
+          });
+          return opt.innerText.trim();
+        } catch(e) { return null; }
       });
-      if (firstOptRect) {
-        await page.mouse.click(firstOptRect.x, firstOptRect.y);
-        console.warn(`[ORG] ⚠️ "Relive cure" not matched in any search — fell back to first prospect: "${firstOptRect.text}". Investigate why Refrens isn't returning it.`);
-        return { picked: firstOptRect.text, reason: 'first_available_after_clear' };
+      if (firstPicked) {
+        console.warn(`[ORG] ⚠️ "Relive cure" not matched in any search — fell back to first prospect: "${firstPicked}". Investigate why Refrens isn't returning it.`);
+        return { picked: firstPicked, reason: 'first_available_after_clear' };
       }
 
       await page.keyboard.press('Escape').catch(() => {});
       return { picked: null, reason: 'no_options_at_all' };
     }
 
-    // Clicks whichever visible option matches "Relive cure" using REAL mouse
-    // events (page.mouse.click) so React-Select's onMouseDown fires.
-    // Synthetic element.click() inside page.evaluate only dispatches a click
-    // event — React-Select ignores it. page.mouse.click dispatches the full
-    // mousedown + mouseup + click sequence.
+    // Picks "Relive cure" option by calling the React props.onClick handler
+    // directly. Proven via MCP browser inspection (May 2026):
+    //   - React-Select v3 options have onClick (not onMouseDown) in props
+    //   - page.mouse.click() does NOT trigger the onClick because of how
+    //     React's synthetic event system / event delegation works in headless
+    //   - Calling props.onClick({...}) directly DOES update React state
+    //     (verified: URL changed to /leads/<new-id>)
     async function tryClickReliveMatch() {
-      const optRect = await page.evaluate(() => {
+      return await page.evaluate(() => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option'));
         const match = opts.find(o => /relive\s*cure/i.test(o.innerText))
                    || opts.find(o => /relive/i.test(o.innerText));
         if (!match) return null;
-        const r = match.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) return null;
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: match.innerText.trim() };
+        const propsKey = Object.keys(match).find(k => k.startsWith('__reactProps'));
+        const onClick = propsKey ? match[propsKey]?.onClick : null;
+        if (typeof onClick === 'function') {
+          try {
+            onClick({
+              target: match, currentTarget: match, type: 'click', button: 0,
+              defaultPrevented: false,
+              preventDefault: () => {}, stopPropagation: () => {}
+            });
+            return match.innerText.trim();
+          } catch(e) { /* fall through */ }
+        }
+        // Fallback: native click (won't actually pick but lets us log)
+        match.click();
+        return null;
       });
-      if (!optRect) return null;
-      await page.mouse.click(optRect.x, optRect.y);
-      return optRect.text;
     }
 
     try {
@@ -979,24 +998,23 @@ async function processLead(lead) {
     }
 
     // ── 6. Fill contact text fields ──────────────────────────────────────────
-    // F4: Strategy varies by field:
-    //  - Name / City: use React-aware setter (native value+dispatchEvent
-    //    doesn't reach Refrens's controlled state, so submit reads "" even
-    //    though DOM is filled).
-    //  - Phone: Refrens uses a wrapped phone input that rejects bulk-set
-    //    and resets to "+91" prefix only. Char-by-char typing IS accepted
-    //    (proven by prior pre-submit log showing "+91 72899-88493"), so
-    //    use the typing path here.
+    // F4: Use React-aware setter for all fields.
+    //  - Phone: MUST include "+91" prefix (proven via MCP browser test).
+    //    The phone-input library rejects raw "9999900099" and resets to "+91".
+    //    Setting "+919999900099" via native setter produces "+91 99999-00099"
+    //    formatted display AND submits correctly.
     const nameSet  = await setReactInputValue(page, SEL.contactName, realName);
     if (!nameSet)  await fillField(page, SEL.contactName, realName);
 
-    // Phone: type char-by-char so the phone-input formatter accepts each digit
-    await fillField(page, SEL.contactPhone, cleanPhone);
+    // Phone: ALWAYS prepend +91 for India (Refrens's phone-input requires E.164)
+    const phoneE164 = '+91' + cleanPhone.replace(/\D/g, '').replace(/^91/, '');
+    const phoneSet = await setReactInputValue(page, SEL.contactPhone, phoneE164);
+    if (!phoneSet) await fillField(page, SEL.contactPhone, phoneE164);
 
     const citySet  = await setReactInputValue(page, SEL.customerCity, lead.city || 'Delhi');
     if (!citySet)  await fillField(page, SEL.customerCity, lead.city || 'Delhi');
 
-    console.log(`[CRM] Field fill: name=${nameSet} (react) phone=typed city=${citySet} (react)`);
+    console.log(`[CRM] Field fill: name=${nameSet} phone=${phoneSet}(E164="${phoneE164}") city=${citySet}`);
 
     // ── 7. Lead Subject ───────────────────────────────────────────────────────
     // IMPORTANT: subject is REQUIRED by Refrens. On Railway (no saved session),
@@ -1279,7 +1297,14 @@ async function processLead(lead) {
       if (surfaced) {
         throw new Error(`Refrens rejected submit: ${surfaced}`);
       }
-      throw new Error('Submit clicked but URL did not change — no visible error captured. Likely Refrens changed validation rules silently. See /tmp/crm-submit-fail-' + lead.id + '.png on Railway.');
+      // Include a compact diag snapshot in the error so it surfaces in the
+      // API response (Railway log is also written, but the dashboard sees this).
+      const compactDiag = {
+        url: diag.url,
+        inv: diag.invalidFields,
+        net: (diag.networkCalls || []).map(n => `${n.method} ${n.status} ${n.url.slice(-60)}`),
+      };
+      throw new Error('Submit clicked but URL did not change — no visible error captured. Diag: ' + JSON.stringify(compactDiag).slice(0, 600));
     }
 
     const t_done = Date.now();
