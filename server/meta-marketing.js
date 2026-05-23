@@ -627,13 +627,28 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   if (formErrorList.length > 0) {
     console.warn(`[META] Form errors: ${JSON.stringify(formErrors)}`);
   }
+
+  // If we found forms but couldn't read any leads, the System User token is
+  // missing page-level access. Surface this as an actionable remediation
+  // message rather than letting it look like the campaign has 0 leads.
+  let permissionsHint = null;
+  if (formIds.length > 0 && totalImported === 0 && formErrorList.length > 0) {
+    const allMissingPermissions = formErrorList.every(([, msg]) =>
+      /does not exist|missing permissions|unsupported get/i.test(msg || '')
+    );
+    if (allMissingPermissions) {
+      permissionsHint = 'PAGE_ACCESS_REQUIRED';
+    }
+  }
+
   return {
     imported: totalImported,
     linked: totalLinked,
     forms: formIds.length,
     adsScanned,
     pageFallbackUsed,
-    ...(formErrorList.length > 0 ? { formErrors } : {})
+    ...(formErrorList.length > 0 ? { formErrors } : {}),
+    ...(permissionsHint ? { permissionsHint } : {})
   };
 }
 
