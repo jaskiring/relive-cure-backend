@@ -697,135 +697,152 @@ async function processLead(lead) {
     await new Promise(r => setTimeout(r, 1500)); // let React hydrate
 
     // ── 3. Prospect Organisation (REQUIRED by Refrens) ──────────────────────────
-    // On Railway (fresh browser session) the org dropdown is async-search:
-    // clicking it sometimes returns 0 options until a character is typed to
-    // trigger the search. Production logs proved this — May 23 run got
-    // `options available (0)` and submit failed with required-field error.
+    // Diagnostics proved (live probe May 23):
+    //   - Refrens reorganized the form — the field at index [1] is now
+    //     "Prospect Organisation", not the old Sales Rep dropdown
+    //   - Synthetic DOM .click() does NOT open the dropdown reliably
+    //   - The dropdown DOES contain prospects (Relive cure, etc.) on the real
+    //     UI, but the puppeteer search returns "No Prospect Found" if the
+    //     dropdown's data hasn't loaded
+    //   - The cure: open via real mouse events (page.mouse) at the bounding-
+    //     rect center, wait for the menu to render, then progressively type
+    //     "re" → "rel" → backspace → "rel" until "Relive cure" appears
     //
-    // Resilient flow:
-    //   1) read current value; if non-empty, skip
-    //   2) click to open
-    //   3) try options() — if >=1 option, pick it
-    //   4) if 0 options, type "rel" into the dropdown's own input to trigger
-    //      async search, wait up to 4s for options to appear, pick first
-    //   5) if still 0, type "a" (broadest match), wait, pick first
-    //   6) if STILL nothing, escape and continue (the assert below will throw
-    //      a precise error so the dashboard knows what to retry)
-    async function tryOpenAndPick(controlIdx, label) {
-      const control = await page.evaluateHandle((idx) => {
+    // Find dropdowns by their LABEL instead of positional index so future
+    // Refrens reorders don't break us again.
+    async function findDiscoSelectByLabel(labelRegex) {
+      return await page.evaluateHandle((reSrc) => {
+        const re = new RegExp(reSrc, 'i');
         const all = Array.from(document.querySelectorAll('.disco-select__control'));
-        return all[idx] || null;
-      }, controlIdx);
-      const el = control.asElement();
-      if (!el) return { picked: null, optionsCount: 0 };
+        for (const c of all) {
+          // Walk up to ~5 parents looking for a label/heading text that matches
+          let cur = c;
+          for (let d = 0; d < 6 && cur; d++) {
+            cur = cur.parentElement;
+            if (!cur) break;
+            const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+            if (lbl && re.test(lbl.innerText || lbl.textContent || '')) return c;
+          }
+        }
+        return null;
+      }, labelRegex.source || labelRegex);
+    }
 
-      // Open
-      await el.click();
-      await new Promise(r => setTimeout(r, 600));
+    async function pickProspectOrganisation() {
+      const ctrlHandle = await findDiscoSelectByLabel(/prospect\s*organi[sz]ation/);
+      const ctrl = ctrlHandle.asElement();
+      if (!ctrl) {
+        console.warn('[ORG] Prospect Organisation dropdown not found by label');
+        return { picked: null, reason: 'no_dropdown' };
+      }
 
-      // First attempt — options may already be there
-      let opts = await page.evaluate(() =>
+      // Already filled? skip.
+      const existing = await ctrl.evaluate(c => c.querySelector('.disco-select__single-value')?.innerText?.trim() || '');
+      if (existing) {
+        console.log(`[ORG] current value: "${existing}" — leaving as-is`);
+        return { picked: existing, reason: 'already_filled' };
+      }
+
+      // Open with a REAL mouse click at the rect center (synthetic .click()
+      // doesn't reliably trigger React-Select's open handler).
+      const rect = await ctrl.evaluate(c => {
+        const r = c.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+      await ctrl.scrollIntoView();
+      await new Promise(r => setTimeout(r, 200));
+      await page.mouse.click(rect.x, rect.y);
+
+      // Wait for the menu to render — Refrens shows all prospects on open,
+      // no typing needed for the initial list (user confirmed via screenshot).
+      try {
+        await page.waitForFunction(
+          () => {
+            const opts = document.querySelectorAll('.disco-select__option');
+            const menu = document.querySelector('.disco-select__menu');
+            return opts.length > 0 || (menu && menu.innerText.length > 5);
+          },
+          { timeout: 5000 }
+        );
+      } catch (_) {}
+
+      const initialOpts = await page.evaluate(() =>
         Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
       );
+      console.log(`[ORG] after open: ${initialOpts.length} options${initialOpts.length ? ': ' + initialOpts.slice(0, 5).join(' | ') : ''}`);
 
-      // If empty, type "rel" into the actual input to trigger async search
-      if (opts.length === 0) {
-        const inputHandle = await page.evaluateHandle((idx) => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          return all[idx]?.querySelector('input') || null;
-        }, controlIdx);
-        const inp = inputHandle.asElement();
-        if (inp) {
-          await inp.focus();
-          await inp.type('rel', { delay: 80 });
-          // Wait for async options
-          try {
-            await page.waitForFunction(
-              () => document.querySelectorAll('.disco-select__option').length > 0,
-              { timeout: 4000 }
-            );
-          } catch(_) {}
-          opts = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+      // If options already loaded, look for "Relive cure" match
+      let pickedNow = await tryClickReliveMatch();
+      if (pickedNow) return { picked: pickedNow, reason: 'open_only' };
+
+      // No match in initial list — progressively search per user's guidance:
+      // type "re" then "rel" then backspace+retry, with the dropdown's own input.
+      const input = await ctrl.evaluateHandle(c => c.querySelector('input'));
+      const inpEl = input.asElement();
+      if (!inpEl) return { picked: null, reason: 'no_input' };
+
+      const searchAttempts = ['re', 'rel', 'reli', 'relive'];
+      for (const term of searchAttempts) {
+        // Clear input — select all + backspace
+        await inpEl.focus();
+        await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+        await page.keyboard.press('Backspace');
+        await new Promise(r => setTimeout(r, 200));
+
+        await inpEl.type(term, { delay: 120 });
+        try {
+          await page.waitForFunction(
+            () => document.querySelectorAll('.disco-select__option').length > 0,
+            { timeout: 3500 }
           );
-        }
+        } catch(_) {}
+        const opts = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+        );
+        console.log(`[ORG] typed "${term}" → ${opts.length} options: ${opts.slice(0, 5).join(' | ')}`);
+
+        pickedNow = await tryClickReliveMatch();
+        if (pickedNow) return { picked: pickedNow, reason: `search:${term}` };
       }
 
-      // If still empty, try a broader char
-      if (opts.length === 0) {
-        const inputHandle = await page.evaluateHandle((idx) => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          return all[idx]?.querySelector('input') || null;
-        }, controlIdx);
-        const inp = inputHandle.asElement();
-        if (inp) {
-          // Clear and try "a" (matches almost any org/name)
-          await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await inp.type('a', { delay: 80 });
-          try {
-            await page.waitForFunction(
-              () => document.querySelectorAll('.disco-select__option').length > 0,
-              { timeout: 4000 }
-            );
-          } catch(_) {}
-          opts = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
-          );
+      // Last resort: if any option is visible at all, pick the first one
+      // (so the lead at least gets ASSIGNED to something rather than failing).
+      const anyPick = await page.evaluate(() => {
+        const opts = Array.from(document.querySelectorAll('.disco-select__option'));
+        if (opts.length > 0) {
+          opts[0].click();
+          return opts[0].innerText.trim();
         }
+        return null;
+      });
+      if (anyPick) {
+        console.log(`[ORG] fell back to first available option: "${anyPick}"`);
+        return { picked: anyPick, reason: 'first_available' };
       }
 
-      console.log(`[${label}] options available (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
+      await page.keyboard.press('Escape').catch(() => {});
+      return { picked: null, reason: 'no_options_at_all' };
+    }
 
-      const picked = await page.evaluate(() => {
-        const options = Array.from(document.querySelectorAll('.disco-select__option'));
-        const match = options.find(o => o.innerText.toLowerCase().includes('relive')) || options[0];
+    // Looks at currently rendered options and clicks the one that matches
+    // "Relive cure" (or any case-insensitive variant containing "relive").
+    async function tryClickReliveMatch() {
+      return await page.evaluate(() => {
+        const opts = Array.from(document.querySelectorAll('.disco-select__option'));
+        const match = opts.find(o => /relive\s*cure/i.test(o.innerText))
+                   || opts.find(o => /relive/i.test(o.innerText));
         if (match) { match.click(); return match.innerText.trim(); }
         return null;
       });
-      if (!picked) await page.keyboard.press('Escape');
-      await new Promise(r => setTimeout(r, 400));
-      return { picked, optionsCount: opts.length };
     }
 
     try {
-      const controls = await page.$$('.disco-select__control');
-      console.log(`[ORG] ${controls.length} disco-select controls`);
-
-      const alreadySelected = await page.evaluate(() => {
-        const controls = Array.from(document.querySelectorAll('.disco-select__control'));
-        return controls.length >= 2
-          ? (controls[1].querySelector('.disco-select__single-value')?.innerText?.trim() || '')
-          : '';
-      });
-      console.log(`[ORG] current value: "${alreadySelected}"`);
-
-      if (!alreadySelected && controls.length >= 2) {
-        const r = await tryOpenAndPick(1, 'ORG');
-        console.log(`[ORG] clicked: "${r.picked}"`);
-
-        // Fallback: if index-1 truly has no options, scan EVERY empty disco-select
-        // and try the same flow — Refrens may have reordered the form.
-        if (!r.picked) {
-          console.warn('[ORG] index-1 dropdown empty after typing — scanning all controls');
-          const emptyIdxs = await page.evaluate(() => {
-            const ctrls = Array.from(document.querySelectorAll('.disco-select__control'));
-            const out = [];
-            ctrls.forEach((c, i) => {
-              const v = c.querySelector('.disco-select__single-value')?.innerText?.trim() || '';
-              if (!v) out.push(i);
-            });
-            return out;
-          });
-          console.log(`[ORG] empty dropdown indexes: ${JSON.stringify(emptyIdxs)}`);
-          for (const idx of emptyIdxs) {
-            if (idx === 1 || idx === 3) continue; // 1 already tried, 3 is stage (handled below)
-            const r2 = await tryOpenAndPick(idx, `ORG-FALLBACK[${idx}]`);
-            console.log(`[ORG-FALLBACK[${idx}]] clicked: "${r2.picked}"`);
-            if (r2.picked) break;
-          }
-        }
+      const result = await pickProspectOrganisation();
+      console.log(`[ORG] result: picked="${result.picked || '(none)'}" reason="${result.reason}"`);
+      if (!result.picked) {
+        console.warn('[ORG] No prospect could be selected — submit will likely fail with required-field error');
       }
+      await new Promise(r => setTimeout(r, 400));
     } catch (e) {
       console.warn(`[ORG] error: ${e.message}`);
     }
