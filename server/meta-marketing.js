@@ -418,35 +418,115 @@ export async function backfillLeadLinks() {
 // Optional params:
 //   campaignId — restrict to one campaign (undefined = account-wide)
 //   since      — ISO date string; only leads created after this date
+// Extract lead_gen_form_id from an ad creative — Meta stores it at different
+// nesting depths depending on the creative type (link ad / video ad / dynamic /
+// IG story). Walk all the known paths.
+function formIdFromCreative(creative) {
+  if (!creative) return null;
+  if (creative.lead_gen_form_id) return creative.lead_gen_form_id;
+  const linkData = creative.object_story_spec?.link_data;
+  if (linkData?.lead_gen_form_id) return linkData.lead_gen_form_id;
+  if (linkData?.call_to_action?.value?.lead_gen_form_id) return linkData.call_to_action.value.lead_gen_form_id;
+  const videoData = creative.object_story_spec?.video_data;
+  if (videoData?.lead_gen_form_id) return videoData.lead_gen_form_id;
+  if (videoData?.call_to_action?.value?.lead_gen_form_id) return videoData.call_to_action.value.lead_gen_form_id;
+  // Asset feed (dynamic / advantage+) creatives put the form id in call_to_action_types
+  const asf = creative.asset_feed_spec;
+  if (asf?.call_to_action_types && Array.isArray(asf.call_to_actions)) {
+    for (const cta of asf.call_to_actions) {
+      if (cta?.value?.lead_gen_form_id) return cta.value.lead_gen_form_id;
+    }
+  }
+  return null;
+}
+
+// Extract the page_id from a creative so we can fall back to the page-level
+// /leadgen_forms endpoint when the per-ad form id isn't exposed.
+function pageIdFromCreative(creative) {
+  if (!creative) return null;
+  return creative.object_story_spec?.page_id
+      || creative.effective_object_story_id?.split('_')[0]
+      || null;
+}
+
 export async function importHistoricalLeads({ campaignId, since } = {}) {
   const creds = await loadCredentials();
   if (!creds) throw new Error('META_ACCESS_TOKEN not set');
   const { accountId, token } = creds;
 
-  // Step 1 — collect all lead-form IDs (and the campaign they belong to)
+  // Step 1 — walk the campaign's ads and collect (a) form_ids and (b) page_ids
+  // for the fallback path.
   const adsPath = campaignId ? `${campaignId}/ads` : `${accountId}/ads`;
   const formMap = {};   // formId → campaignId (string)
+  const pageIds = new Set();
   let after = null;
+  let adsScanned = 0;
   for (let page = 0; page < 30; page++) {
     const params = {
-      fields: 'id,campaign_id,creative{lead_gen_form_id}',
-      limit: 500
+      // Request all known nesting paths in one shot. Graph silently drops
+      // fields that don't exist on a given creative type.
+      fields: [
+        'id', 'campaign_id',
+        'creative{',
+          'id,name,',
+          'lead_gen_form_id,',
+          'effective_object_story_id,',
+          'object_story_spec{page_id,link_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}},video_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}}},',
+          'asset_feed_spec{call_to_action_types,call_to_actions{type,value{lead_gen_form_id}}}',
+        '}'
+      ].join(''),
+      limit: 200
     };
     if (after) params.after = after;
     let data;
     try { data = await graphGet(adsPath, params, token); }
     catch (e) { console.warn(`[META] importHistoricalLeads ads page ${page}: ${e.message}`); break; }
     for (const ad of (data.data || [])) {
-      const fid = ad.creative?.lead_gen_form_id;
+      adsScanned++;
+      const fid = formIdFromCreative(ad.creative);
       if (fid) formMap[fid] = ad.campaign_id;
+      const pid = pageIdFromCreative(ad.creative);
+      if (pid) pageIds.add(pid);
     }
     after = data.paging?.cursors?.after;
     if (!data.paging?.next || !after) break;
   }
 
-  const formIds = Object.keys(formMap);
+  let formIds = Object.keys(formMap);
+  let pageFallbackUsed = false;
+
+  // Step 1b — FALLBACK: if no form ids were exposed by the creative fields,
+  // walk each page's leadgen_forms endpoint and use those. We still filter
+  // the resulting leads by campaign_id, so cross-campaign noise is harmless.
+  if (formIds.length === 0 && pageIds.size > 0) {
+    pageFallbackUsed = true;
+    for (const pid of pageIds) {
+      let pageAfter = null;
+      for (let p = 0; p < 20; p++) {
+        const params = { fields: 'id,name,status', limit: 100 };
+        if (pageAfter) params.after = pageAfter;
+        let fd;
+        try { fd = await graphGet(`${pid}/leadgen_forms`, params, token); }
+        catch (e) { console.warn(`[META] page ${pid} leadgen_forms: ${e.message}`); break; }
+        for (const f of (fd.data || [])) {
+          if (!formMap[f.id]) formMap[f.id] = campaignId || null;
+        }
+        pageAfter = fd.paging?.cursors?.after;
+        if (!fd.paging?.next || !pageAfter) break;
+      }
+    }
+    formIds = Object.keys(formMap);
+  }
+
   if (formIds.length === 0) {
-    return { imported: 0, linked: 0, forms: 0, message: 'No Lead Ad forms found — this campaign may not use Lead Ads (e.g. it drives traffic to a website instead).' };
+    return {
+      imported: 0, linked: 0, forms: 0,
+      adsScanned,
+      pageIdsFound: pageIds.size,
+      message: pageIds.size === 0
+        ? `No ads with creatives found in this campaign (scanned ${adsScanned}). The campaign may be paused, not yet launched, or use a creative type we don't recognize.`
+        : `Found ${pageIds.size} page(s) but no Lead Forms attached. This campaign may not use Lead Ads (e.g. it drives traffic to a website or WhatsApp instead).`
+    };
   }
 
   // Step 2 — pull leads from each form
@@ -475,8 +555,21 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
         break;
       }
 
-      const leads = data.data || [];
-      if (leads.length === 0) break;
+      const allLeads = data.data || [];
+      if (allLeads.length === 0) break;
+
+      // When we used the page fallback, the form may belong to a different
+      // campaign than the one being imported — filter by campaign_id so we
+      // don't pollute other campaigns' attribution.
+      const leads = (pageFallbackUsed && campaignId)
+        ? allLeads.filter(l => l.campaign_id === campaignId)
+        : allLeads;
+      if (leads.length === 0) {
+        // page returned leads but none for this campaign — keep paginating
+        formAfter = data.paging?.cursors?.after;
+        if (!data.paging?.next || !formAfter) break;
+        continue;
+      }
 
       // Upsert in chunks of 50
       const rows = leads.map(lead => {
@@ -522,8 +615,14 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
     }
   }
 
-  console.log(`[META] ✅ Historical import done: ${totalImported} leads from ${formIds.length} forms, ${totalLinked} matched in CRM`);
-  return { imported: totalImported, linked: totalLinked, forms: formIds.length };
+  console.log(`[META] ✅ Historical import done: ${totalImported} leads from ${formIds.length} forms${pageFallbackUsed ? ' (page fallback)' : ''}, ${totalLinked} matched in CRM`);
+  return {
+    imported: totalImported,
+    linked: totalLinked,
+    forms: formIds.length,
+    adsScanned,
+    pageFallbackUsed
+  };
 }
 
 // ─── Per-ad + audience breakdowns (live Graph API, lazy-loaded) ──────────────
