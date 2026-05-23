@@ -978,6 +978,7 @@ import {
     getCampaignAds as metaCampaignAds,
     getCampaignAudience as metaCampaignAudience,
     backfillLeadLinks as metaBackfillLinks,
+    importHistoricalLeads as metaImportHistoricalLeads,
     recordSyncError as metaRecordSyncError,
     bustVerificationCache as metaBustCache
 } from './meta-marketing.js';
@@ -1063,6 +1064,26 @@ app.post('/api/meta/backfill-links', async (req, res) => {
         const result = await metaBackfillLinks();
         return res.json({ success: true, ...result });
     } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// POST /api/meta/import-leads — retroactively pull historical Lead Ad submissions
+// from the Meta Graph API and store them in meta_leads.
+// Body (all optional):
+//   campaignId  — restrict to one campaign (omit for account-wide)
+//   since       — ISO date string to filter leads after this date
+// This doesn't need the Page webhook — it reads directly from the Lead Ads API.
+app.post('/api/meta/import-leads', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { campaignId, since } = req.body || {};
+        console.log(`[META] Historical lead import requested — campaignId=${campaignId || 'all'}, since=${since || 'all time'}`);
+        const result = await metaImportHistoricalLeads({ campaignId, since });
+        console.log(`[META] Import result: ${result.imported} leads, ${result.linked} matched, ${result.forms} forms`);
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[META] Historical import failed:', err.message);
         return res.status(500).json({ success: false, error: err.message });
     }
 });

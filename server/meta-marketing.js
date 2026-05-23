@@ -404,6 +404,128 @@ export async function backfillLeadLinks() {
   return { scanned: unmatched?.length || 0, linked };
 }
 
+// ─── Retroactive (historical) lead import from Meta Lead Ads API ──────────────
+// Pulls all lead-form submissions from Meta directly — without needing the Page
+// webhook. Use this to backfill leads that came in before the webhook was wired,
+// or when the webhook isn't set up at all.
+//
+// Flow:
+//   1. Enumerate ads for the campaign (or all ads in the account) to collect
+//      lead-form IDs — the creative.lead_gen_form_id field.
+//   2. For each form, paginate `GET /{formId}/leads` and store in meta_leads.
+//   3. Run linkToExistingLead() for every new lead so CRM matching happens immediately.
+//
+// Optional params:
+//   campaignId — restrict to one campaign (undefined = account-wide)
+//   since      — ISO date string; only leads created after this date
+export async function importHistoricalLeads({ campaignId, since } = {}) {
+  const creds = await loadCredentials();
+  if (!creds) throw new Error('META_ACCESS_TOKEN not set');
+  const { accountId, token } = creds;
+
+  // Step 1 — collect all lead-form IDs (and the campaign they belong to)
+  const adsPath = campaignId ? `${campaignId}/ads` : `${accountId}/ads`;
+  const formMap = {};   // formId → campaignId (string)
+  let after = null;
+  for (let page = 0; page < 30; page++) {
+    const params = {
+      fields: 'id,campaign_id,creative{lead_gen_form_id}',
+      limit: 500
+    };
+    if (after) params.after = after;
+    let data;
+    try { data = await graphGet(adsPath, params, token); }
+    catch (e) { console.warn(`[META] importHistoricalLeads ads page ${page}: ${e.message}`); break; }
+    for (const ad of (data.data || [])) {
+      const fid = ad.creative?.lead_gen_form_id;
+      if (fid) formMap[fid] = ad.campaign_id;
+    }
+    after = data.paging?.cursors?.after;
+    if (!data.paging?.next || !after) break;
+  }
+
+  const formIds = Object.keys(formMap);
+  if (formIds.length === 0) {
+    return { imported: 0, linked: 0, forms: 0, message: 'No Lead Ad forms found — this campaign may not use Lead Ads (e.g. it drives traffic to a website instead).' };
+  }
+
+  // Step 2 — pull leads from each form
+  let totalImported = 0;
+  let totalLinked = 0;
+
+  for (const formId of formIds) {
+    const cid = formMap[formId];
+    let formAfter = null;
+    for (let page = 0; page < 200; page++) {
+      const params = {
+        fields: 'id,created_time,ad_id,adgroup_id,campaign_id,field_data,platform',
+        limit: 100
+      };
+      // Optional time filter (server-side filtering via the Graph API)
+      if (since) {
+        const sinceTs = Math.floor(new Date(since).getTime() / 1000);
+        params.filtering = JSON.stringify([{ field: 'time_created', operator: 'GREATER_THAN', value: sinceTs }]);
+      }
+      if (formAfter) params.after = formAfter;
+
+      let data;
+      try { data = await graphGet(`${formId}/leads`, params, token); }
+      catch (e) {
+        console.warn(`[META] importHistoricalLeads form ${formId} page ${page}: ${e.message}`);
+        break;
+      }
+
+      const leads = data.data || [];
+      if (leads.length === 0) break;
+
+      // Upsert in chunks of 50
+      const rows = leads.map(lead => {
+        const fields = extractFieldData(lead.field_data);
+        return {
+          meta_lead_id: lead.id,
+          form_id: formId,
+          ad_id: lead.ad_id || null,
+          adgroup_id: lead.adgroup_id || null,
+          campaign_id: lead.campaign_id || cid || null,
+          created_time: lead.created_time || null,
+          phone: fields.phone,
+          name: fields.name,
+          email: fields.email,
+          city: fields.city,
+          field_data: lead.field_data || null,
+          raw_payload: { source: 'historical_import', platform: lead.platform || null },
+          updated_at: new Date().toISOString()
+        };
+      });
+
+      for (let i = 0; i < rows.length; i += 50) {
+        const chunk = rows.slice(i, i + 50);
+        const { error } = await supabaseAdmin
+          .from('meta_leads')
+          .upsert(chunk, { onConflict: 'meta_lead_id' });
+        if (error) {
+          console.error(`[META] importHistoricalLeads upsert error: ${error.message}`);
+          continue;
+        }
+        totalImported += chunk.length;
+        // Run phone linker for each imported lead
+        for (const row of chunk) {
+          if (row.phone) {
+            const link = await linkToExistingLead(row.meta_lead_id, row.phone);
+            if (link) totalLinked++;
+          }
+        }
+      }
+
+      formAfter = data.paging?.cursors?.after;
+      if (!data.paging?.next || !formAfter) break;
+    }
+  }
+
+  console.log(`[META] ✅ Historical import done: ${totalImported} leads from ${formIds.length} forms, ${totalLinked} matched in CRM`);
+  return { imported: totalImported, linked: totalLinked, forms: formIds.length };
+}
+
 // ─── Per-ad + audience breakdowns (live Graph API, lazy-loaded) ──────────────
 // These are NOT cached in Supabase — pulled on-demand when the user drills
 // into a campaign. Tradeoff: slower drill-down (one extra Graph call) but
