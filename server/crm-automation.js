@@ -657,6 +657,90 @@ export async function dumpCrmNewLeadForm() {
   }
 }
 
+// ── Post-create: assign the lead to a teammate via the "Lead assignee" widget ─
+// Refrens's new-lead form has no assignee field. After submit lands on the
+// lead detail page, this fn:
+//   1. Clicks the pencil/edit on the "Lead assignee" widget → modal opens
+//   2. Types target name in the search input → filters collaborators
+//   3. Walks each radio's ancestors looking for one containing the target
+//      name (case-insensitive substring, ancestor inner text < 200 chars to
+//      avoid hitting the whole modal). Clicks that row + the radio.
+//   4. Clicks "Save Changes" → "Transfer Lead?" confirmation appears
+//   5. Clicks "Yes, Transfer Lead" → persists
+// Proven via MCP browser: lead 6a11c9d982c97a0012c7c16c successfully
+// reassigned from "Relive Cure" → "NISHIKANT".
+async function assignLeadToCollaborator(page, assigneeName) {
+  if (!assigneeName) return false;
+  const result = await page.evaluate(async (name) => {
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+
+    // 1. Find "Lead assignee" widget + click edit button
+    const labelEl = Array.from(document.querySelectorAll('span')).find(el => (el.innerText || '').trim() === 'Lead assignee');
+    if (!labelEl) return { ok: false, step: 'find_label', reason: 'no Lead assignee label found' };
+    const editBtn = labelEl.parentElement.querySelector('button');
+    if (!editBtn) return { ok: false, step: 'find_edit_btn' };
+    editBtn.click();
+    await sleep(1500);
+
+    // 2. Type name in search input
+    const input = document.querySelector('input[name="searchCollaborator"]');
+    if (!input) return { ok: false, step: 'search_input_appeared', reason: 'modal may not have opened' };
+    input.focus();
+    setter.call(input, name);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(2500);
+
+    // 3. For each radio, walk up ancestors looking for one whose innerText
+    //    contains the target name (case-insensitive) and is < 200 chars
+    //    (so we get the row, not the whole modal).
+    const nameLower = name.toLowerCase();
+    const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+    let pickedRow = null;
+    let pickedRadio = null;
+    for (const radio of radios) {
+      let cur = radio;
+      for (let i = 0; i < 8; i++) {
+        cur = cur.parentElement;
+        if (!cur) break;
+        const t = (cur.innerText || '');
+        if (t.length < 200 && t.toLowerCase().includes(nameLower)) {
+          pickedRow = cur;
+          pickedRadio = radio;
+          break;
+        }
+      }
+      if (pickedRow) break;
+    }
+    if (!pickedRow) return { ok: false, step: 'match_radio', reason: `no row containing "${name}"`, radioCount: radios.length };
+    pickedRow.click();
+    await sleep(500);
+    if (pickedRadio) pickedRadio.click();
+    await sleep(500);
+
+    // 4. Click "Save Changes"
+    const saveBtn = Array.from(document.querySelectorAll('button')).find(b => /save\s*changes/i.test(b.innerText || ''));
+    if (!saveBtn) return { ok: false, step: 'save_btn' };
+    saveBtn.click();
+    await sleep(2000);
+
+    // 5. Click "Yes, Transfer Lead" confirmation
+    const confirmBtn = Array.from(document.querySelectorAll('button')).find(b => /yes,?\s*transfer/i.test(b.innerText || ''));
+    if (!confirmBtn) return { ok: false, step: 'confirm_btn', reason: 'no Yes, Transfer Lead button found' };
+    confirmBtn.click();
+    await sleep(3500);
+
+    // 6. Verify
+    const finalLabel = Array.from(document.querySelectorAll('span')).find(el => (el.innerText || '').trim() === 'Lead assignee');
+    const finalVal = finalLabel?.parentElement?.querySelector('button span')?.innerText?.trim() || '(?)';
+    const matched = finalVal.toLowerCase().includes(nameLower);
+    return { ok: matched, step: 'verified', finalAssignee: finalVal };
+  }, assigneeName);
+
+  console.log(`[ASSIGN] result:`, JSON.stringify(result));
+  return result.ok === true;
+}
+
 async function processLead(lead) {
   const t_open = Date.now();
   console.log(`[CRM] Starting push for lead_id=${lead.id || 'new'}, phone=${lead.phone_number}`);
@@ -1298,9 +1382,27 @@ async function processLead(lead) {
       throw new Error('Submit clicked but URL did not change. Diag: ' + JSON.stringify(compactDiag).slice(0, 1200));
     }
 
+    // ── 12. Post-create: set Lead Assignee if specified ──────────────────────
+    // Refrens's new-lead form has NO assignee field. After submit, the lead's
+    // detail page has a "Lead assignee" widget that defaults to the workspace
+    // owner ("Relive Cure"). To assign to a teammate, we click the edit
+    // pencil → type name → click radio → "Save Changes" → "Yes, Transfer Lead".
+    if (lead.assignee && typeof lead.assignee === 'string' && lead.assignee.trim().length >= 2) {
+      try {
+        const ok = await assignLeadToCollaborator(page, lead.assignee.trim());
+        if (ok) {
+          console.log(`[CRM] ✅ Assigned to "${lead.assignee}"`);
+        } else {
+          console.warn(`[CRM] ⚠️ Could not assign to "${lead.assignee}" — lead created but assignee left as default`);
+        }
+      } catch(e) {
+        console.warn(`[CRM] Assignee step failed: ${e.message} — lead is still created`);
+      }
+    }
+
     const t_done = Date.now();
     try { page.off('response', netListener); } catch(_) {}
-    console.log(`[CRM] ✅ lead_id=${lead.id} name="${realName}" stage="${stageLabel}" | t_open=${t_fill - t_open}ms t_fill=${t_submit - t_fill}ms t_submit=${t_done - t_submit}ms total=${t_done - t_open}ms`);
+    console.log(`[CRM] ✅ lead_id=${lead.id} name="${realName}" stage="${stageLabel}" assignee="${lead.assignee || '(default)'}" | t_open=${t_fill - t_open}ms t_fill=${t_submit - t_fill}ms t_submit=${t_done - t_submit}ms total=${t_done - t_open}ms`);
 
     return { success: true, id: lead.id };
 
