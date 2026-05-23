@@ -629,15 +629,16 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   }
 
   // If we found forms but couldn't read any leads, the System User token is
-  // missing page-level access. Surface this as an actionable remediation
-  // message rather than letting it look like the campaign has 0 leads.
+  // missing page-level scopes (verified empirically: leads_retrieval alone is
+  // not enough; Meta also requires pages_manage_ads + pages_show_list +
+  // pages_read_engagement on the token). Surface this as actionable remediation.
   let permissionsHint = null;
   if (formIds.length > 0 && totalImported === 0 && formErrorList.length > 0) {
-    const allMissingPermissions = formErrorList.every(([, msg]) =>
-      /does not exist|missing permissions|unsupported get/i.test(msg || '')
+    const anyPermErr = formErrorList.some(([, msg]) =>
+      /does not exist|missing permission|unsupported get|pages_manage_ads|pages_read_engagement|pages_show_list/i.test(msg || '')
     );
-    if (allMissingPermissions) {
-      permissionsHint = 'PAGE_ACCESS_REQUIRED';
+    if (anyPermErr) {
+      permissionsHint = 'PAGE_SCOPES_REQUIRED';
     }
   }
 
