@@ -1099,6 +1099,7 @@ async function processLead(lead) {
     // a clean page and threw the generic "URL did not change" error).
     await page.evaluate(() => {
       window.__crm_errs__ = [];
+      window.__crm_net__ = [];
       // Capture any text node added to the DOM that looks like an error/toast.
       const obs = new MutationObserver(muts => {
         for (const m of muts) {
@@ -1120,6 +1121,48 @@ async function processLead(lead) {
         return origErr.apply(this, args);
       };
     });
+
+    // Capture network requests during submit so we can see if Refrens's
+    // backend rejected the lead-create API call.
+    const submitNetCalls = [];
+    const netListener = (resp) => {
+      try {
+        const u = resp.url();
+        if (u.includes('refrens.com') && (u.includes('lead') || u.includes('graphql') || u.includes('api') || u.includes('save'))) {
+          submitNetCalls.push({ url: u.slice(0, 200), status: resp.status(), method: resp.request().method() });
+        }
+      } catch(_) {}
+    };
+    page.on('response', netListener);
+
+    // Diag: log submit button state + all critical field values right before click
+    const preClickDiag = await page.evaluate(() => {
+      const btn = document.querySelector('button[type="submit"]');
+      const allInputs = {};
+      document.querySelectorAll('input,textarea').forEach(el => {
+        if (el.type === 'hidden' || !el.name) return;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return;
+        allInputs[el.name] = (el.value || '').slice(0, 40);
+      });
+      const allSelects = Array.from(document.querySelectorAll('.disco-select__control')).map((c, i) => {
+        let label = '';
+        let cur = c;
+        for (let d = 0; d < 5 && cur; d++) {
+          cur = cur.parentElement;
+          if (!cur) break;
+          const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+          if (lbl) { label = (lbl.innerText || '').trim().slice(0, 30); break; }
+        }
+        return { i, label, val: c.querySelector('.disco-select__single-value')?.innerText?.trim() || '(empty)' };
+      });
+      return {
+        submitBtn: btn ? { disabled: btn.disabled, text: (btn.innerText || '').trim().slice(0, 40), visible: btn.offsetParent !== null } : null,
+        inputs: allInputs,
+        selects: allSelects
+      };
+    });
+    console.log(`[CRM] Pre-click state:`, JSON.stringify(preClickDiag));
 
     await Promise.all([
       page.waitForNavigation({ timeout: 18000 }).catch(() => {}),
@@ -1212,6 +1255,9 @@ async function processLead(lead) {
         };
       });
 
+      // Include network calls captured during submit
+      diag.networkCalls = submitNetCalls.slice(-12);
+      page.off('response', netListener);
       console.error(`[CRM] Submit failed — diagnostic:`, JSON.stringify(diag));
       try {
         await page.screenshot({ path: `/tmp/crm-submit-fail-${lead.id}.png`, fullPage: true });
@@ -1237,6 +1283,7 @@ async function processLead(lead) {
     }
 
     const t_done = Date.now();
+    try { page.off('response', netListener); } catch(_) {}
     console.log(`[CRM] ✅ lead_id=${lead.id} name="${realName}" stage="${stageLabel}" | t_open=${t_fill - t_open}ms t_fill=${t_submit - t_fill}ms t_submit=${t_done - t_submit}ms total=${t_done - t_open}ms`);
 
     return { success: true, id: lead.id };
