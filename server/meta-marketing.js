@@ -462,6 +462,7 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   const pageIds = new Set();
   let after = null;
   let adsScanned = 0;
+  let lastError = null;
   for (let page = 0; page < 30; page++) {
     const params = {
       // Request the creative as opaque object_story_spec / asset_feed_spec
@@ -477,7 +478,11 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
     if (after) params.after = after;
     let data;
     try { data = await graphGet(adsPath, params, token); }
-    catch (e) { console.warn(`[META] importHistoricalLeads ads page ${page}: ${e.message}`); break; }
+    catch (e) {
+      lastError = e.message;
+      console.warn(`[META] importHistoricalLeads ads page ${page}: ${e.message}`);
+      break;
+    }
     for (const ad of (data.data || [])) {
       adsScanned++;
       const fid = formIdFromCreative(ad.creative);
@@ -520,9 +525,12 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
       imported: 0, linked: 0, forms: 0,
       adsScanned,
       pageIdsFound: pageIds.size,
-      message: pageIds.size === 0
-        ? `No ads with creatives found in this campaign (scanned ${adsScanned}). The campaign may be paused, not yet launched, or use a creative type we don't recognize.`
-        : `Found ${pageIds.size} page(s) but no Lead Forms attached. This campaign may not use Lead Ads (e.g. it drives traffic to a website or WhatsApp instead).`
+      lastError,
+      message: lastError
+        ? `Graph API error while scanning ads: ${lastError}`
+        : pageIds.size === 0
+          ? `No ads with creatives found in this campaign (scanned ${adsScanned}). The campaign may be paused, not yet launched, or use a creative type we don't recognize.`
+          : `Found ${pageIds.size} page(s) but no Lead Forms attached. This campaign may not use Lead Ads (e.g. it drives traffic to a website or WhatsApp instead).`
     };
   }
 
