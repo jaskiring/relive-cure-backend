@@ -979,6 +979,8 @@ import {
     getCampaignAudience as metaCampaignAudience,
     backfillLeadLinks as metaBackfillLinks,
     importHistoricalLeads as metaImportHistoricalLeads,
+    importAllCampaignLeads as metaImportAllCampaignLeads,
+    computeRecommendations as metaComputeRecommendations,
     recordSyncError as metaRecordSyncError,
     bustVerificationCache as metaBustCache
 } from './meta-marketing.js';
@@ -1065,6 +1067,47 @@ app.post('/api/meta/backfill-links', async (req, res) => {
         return res.json({ success: true, ...result });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// POST /api/meta/import-leads-all — bulk import for every synced campaign at once.
+// Body (optional): { since: 'YYYY-MM-DD' }
+// Returns per-campaign results sorted by leads imported, plus aggregate totals.
+app.post('/api/meta/import-leads-all', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { since } = req.body || {};
+        console.log(`[META] Bulk historical import requested — since=${since || 'all time'}`);
+        const result = await metaImportAllCampaignLeads({ since });
+        console.log(`[META] Bulk import done: ${result.imported} leads, ${result.linked} matched, ${result.campaigns} campaigns in ${result.elapsedMs}ms`);
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[META] Bulk historical import failed:', err.message);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// GET /api/meta/campaign/:id/recommendations — actionable suggestions for one campaign
+app.get('/api/meta/campaign/:id/recommendations', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const [detail, leads] = await Promise.all([
+            metaCampaignDetail(req.params.id),
+            metaCampaignLeads(req.params.id)
+        ]);
+        const recs = metaComputeRecommendations({
+            kpis30: detail.kpis30,
+            kpis7: detail.kpis7,
+            wow: detail.wow,
+            breakdowns: leads.breakdowns,
+            funnel: leads.funnel,
+            accountBenchmark: leads.accountBenchmark,
+            campaign: detail.campaign
+        });
+        return res.json({ success: true, recommendations: recs });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({ success: false, error: err.message });
     }
 });
 

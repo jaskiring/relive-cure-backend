@@ -241,13 +241,21 @@ export async function syncRefrensLeads(supabaseAdmin) {
         console.log('[REFRENS SYNC] Step 1: mouse.click fired ✅');
 
         // ── Step 2: Poll every 2s for "ready" modal, click Download ──
+        // Widened recognizer — Refrens occasionally tweaks the copy (ready /
+        // generated / prepared / complete) and the button label can be any of
+        // download / download csv / download file / save / get file. We
+        // recognise all of them and fall back to clicking the most likely
+        // CTA in any visible modal/dialog/popup.
         let modalClicked = false;
+        let modalDiagnostics = null;
+        const READY_PATTERNS = /ready to download|file is ready|file ready|csv is ready|export ready|export complete|download is ready|generated|prepared|completed|file generated/i;
         const tryModal = setInterval(async () => {
             if (capturedCsvText || modalClicked) { clearInterval(tryModal); return; }
             try {
-                const btnInfo = await page.evaluate(() => {
-                    const body = (document.body?.innerText || '').toLowerCase();
-                    if (!body.includes('ready to download') && !body.includes('file is ready')) return null;
+                const btnInfo = await page.evaluate((readyRegexSrc) => {
+                    const body = document.body?.innerText || '';
+                    const readyRe = new RegExp(readyRegexSrc, 'i');
+                    if (!readyRe.test(body)) return null;
 
                     // Re-inject blob interceptor
                     const orig = URL.createObjectURL.bind(URL);
@@ -256,20 +264,40 @@ export async function syncRefrensLeads(supabaseAdmin) {
                         return orig(blob);
                     };
 
-                    const btns = [...document.querySelectorAll('button, a')];
-                    const dlBtn = btns.find(b => {
-                        const t = b.textContent?.trim().toLowerCase();
-                        return t === 'download' || t === 'download file' || t === 'download leads';
-                    }) || (() => {
-                        const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"]');
-                        return modal && [...modal.querySelectorAll('button,a')].find(b => !/(cancel|close|dismiss)/i.test(b.textContent));
-                    })();
+                    const isVisible = el => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const s = window.getComputedStyle(el);
+                        if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false;
+                        return true;
+                    };
 
-                    if (!dlBtn) return { found: false };
+                    const btns = [...document.querySelectorAll('button, a, [role="button"]')].filter(isVisible);
+                    // First pass: exact-label match
+                    let dlBtn = btns.find(b => {
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        return /^(download|download csv|download file|download leads|save file|get file|export now)$/i.test(t);
+                    });
+                    // Second pass: any button with "download" or href ending .csv
+                    if (!dlBtn) {
+                        dlBtn = btns.find(b => /download/i.test(b.textContent || '') && !/cancel|close|dismiss|back/i.test(b.textContent || ''))
+                             || btns.find(b => b.tagName === 'A' && /\.csv(\?|$)/i.test(b.href || ''));
+                    }
+                    // Third pass: pick the primary CTA inside any visible modal
+                    if (!dlBtn) {
+                        const modal = [...document.querySelectorAll('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="popup"]')].find(isVisible);
+                        if (modal) {
+                            const cands = [...modal.querySelectorAll('button,a,[role="button"]')].filter(isVisible);
+                            dlBtn = cands.find(b => !/cancel|close|dismiss|back/i.test(b.textContent || ''));
+                        }
+                    }
+
+                    if (!dlBtn) return { found: false, debug: { btnCount: btns.length, bodySnippet: body.slice(0, 200) } };
                     dlBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
                     const rect = dlBtn.getBoundingClientRect();
-                    return { found: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: dlBtn.textContent?.trim().slice(0,20) };
-                });
+                    return { found: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: (dlBtn.textContent || '').trim().slice(0, 30) };
+                }, READY_PATTERNS.source);
 
                 if (btnInfo?.found) {
                     console.log(`[REFRENS SYNC] Step 2 modal: "${btnInfo.text}" @ (${btnInfo.x},${btnInfo.y})`);
@@ -278,9 +306,12 @@ export async function syncRefrensLeads(supabaseAdmin) {
                     clearInterval(tryModal);
                     console.log('[REFRENS SYNC] Step 2: modal Download clicked ✅');
                 } else if (btnInfo !== null) {
-                    console.log('[REFRENS SYNC] Modal found, waiting for Download btn...');
+                    modalDiagnostics = btnInfo.debug;
+                    console.log(`[REFRENS SYNC] Modal text matched but no Download btn: ${JSON.stringify(btnInfo.debug)}`);
                 }
-            } catch(_) {}
+            } catch(e) {
+                console.warn(`[REFRENS SYNC] Step 2 poll error: ${e.message}`);
+            }
         }, 2000);
 
         // Wait up to 120s
@@ -293,13 +324,53 @@ export async function syncRefrensLeads(supabaseAdmin) {
         }
         clearInterval(tryModal);
 
+        // Before tearing down the browser, capture diagnostic info if we failed
+        let failureDiag = null;
+        if (!capturedCsvText) {
+            try {
+                failureDiag = await page.evaluate(() => {
+                    const visible = el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    return {
+                        bodyText: (document.body?.innerText || '').slice(0, 400),
+                        modalCount: document.querySelectorAll('[class*="modal"],[class*="dialog"],[role="dialog"]').length,
+                        visibleBtns: [...document.querySelectorAll('button,a,[role="button"]')]
+                            .filter(visible)
+                            .map(b => (b.textContent || '').trim().slice(0, 30))
+                            .filter(t => t)
+                            .slice(0, 15),
+                        url: window.location.href
+                    };
+                });
+                console.log('[REFRENS SYNC] Failure diagnostic:', JSON.stringify(failureDiag));
+            } catch (e) {
+                console.warn('[REFRENS SYNC] Could not capture failure diagnostic:', e.message);
+            }
+        }
+
         await context.close();
         await browser.close();
         browser = null;
         console.log('[REFRENS SYNC] Browser closed ✅');
 
         if (!capturedCsvText) {
-            return { success: false, error: `CSV not captured after 120s. modalClicked=${modalClicked}` };
+            // Distinguish the two failure modes so the UI can show a specific fix:
+            //   • modalClicked=false → never saw the "ready" modal at all
+            //     (probably the export request never fired or Refrens needs re-auth)
+            //   • modalClicked=true  → clicked the modal but the CSV blob wasn't intercepted
+            //     (Refrens may have switched away from blob: URLs to a direct download)
+            const reason = modalClicked
+                ? 'CLICKED_NO_CSV'
+                : (modalDiagnostics ? 'MODAL_TEXT_FOUND_NO_BUTTON' : 'NO_MODAL_DETECTED');
+            return {
+                success: false,
+                error: `CSV not captured after 120s. modalClicked=${modalClicked}`,
+                reason,
+                diagnostic: failureDiag,
+                modalDiagnostics
+            };
         }
 
         // ── Parse & upsert ──

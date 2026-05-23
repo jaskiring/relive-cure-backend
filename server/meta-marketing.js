@@ -295,19 +295,43 @@ function normalizePhone(raw) {
   return d;
 }
 
-// Extract phone / name / email / city from a Meta Lead-Form field_data array.
+// Extract structured fields from a Meta Lead-Form field_data array.
 // field_data is an array of { name, values: [string] } objects.
+// We pull canonical fields (phone/name/email/city) AND keep every other custom
+// field in a normalized `custom` map keyed by the form's question label so
+// later breakdowns can chart "eye power", "timeline", "age group" etc.
 function extractFieldData(fieldData) {
-  const out = { phone: null, name: null, email: null, city: null };
+  const out = { phone: null, name: null, email: null, city: null, custom: {} };
   if (!Array.isArray(fieldData)) return out;
   for (const f of fieldData) {
-    const key = String(f.name || '').toLowerCase();
+    const rawKey = String(f.name || '');
+    const key = rawKey.toLowerCase();
     const val = Array.isArray(f.values) && f.values.length ? String(f.values[0]) : '';
     if (!val) continue;
-    if (!out.phone && /phone|mobile|whatsapp/.test(key)) out.phone = normalizePhone(val);
-    else if (!out.email && /email/.test(key)) out.email = val;
-    else if (!out.name && /name|full_name|first_name/.test(key)) out.name = val;
-    else if (!out.city && /city|location/.test(key)) out.city = val;
+    if (!out.phone && /phone|mobile|whatsapp/.test(key)) {
+      out.phone = normalizePhone(val);
+      continue;
+    }
+    if (!out.email && /email/.test(key)) {
+      out.email = val;
+      continue;
+    }
+    if (!out.name && /name|full_name|first_name/.test(key)) {
+      out.name = val;
+      continue;
+    }
+    if (!out.city && /city|location|town/.test(key)) {
+      out.city = val;
+      continue;
+    }
+    // Everything else → custom map. Use a stable normalized key so the same
+    // question across slightly different forms (e.g. "Eye Power", "eye_power")
+    // groups together.
+    const normKey = rawKey
+      .replace(/[\?\.]+$/g, '')
+      .replace(/\s+/g, '_')
+      .toLowerCase();
+    if (normKey) out.custom[normKey] = val;
   }
   return out;
 }
@@ -623,6 +647,10 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   }
 
   const formErrorList = Object.entries(formErrors);
+  // Stash extra custom fields per lead (everything not phone/name/email/city)
+  // so later breakdowns can use eye power, timeline, insurance, etc.
+  // (no-op here — extractFieldData already stores full field_data on the row)
+
   console.log(`[META] ✅ Historical import done: ${totalImported} leads from ${formIds.length} forms${pageFallbackUsed ? ' (page fallback)' : ''}, ${totalLinked} matched in CRM`);
   if (formErrorList.length > 0) {
     console.warn(`[META] Form errors: ${JSON.stringify(formErrors)}`);
@@ -966,6 +994,13 @@ export async function getCampaignLeads(campaignId) {
   for (const i of INTENTS) { intentByStage[i] = {}; for (const s of STAGES) intentByStage[i][s] = 0; }
   const timelineMap    = {};   // YYYY-MM-DD → count
 
+  // Custom form-field harvest — every Lead Form question that isn't the
+  // canonical phone/name/email/city. Each question becomes its own breakdown
+  // keyed by normalized question label, e.g. "eye_power" → { "-2.0":4, "-4.0":3 }.
+  // Surfaced as breakdowns.byCustomField in the API response so the dashboard
+  // can chart audience composition by whatever the form asked.
+  const customFieldMap = {};   // questionKey → { question, values: { answer → { count, surgeries } } }
+
   const leads = metaLeads.map(l => {
     const refrens = l.matched_source === 'refrens' ? refrensMap[l.matched_lead_id] : null;
     const bot     = l.matched_source === 'chatbot' ? botMap[l.matched_lead_id] : null;
@@ -997,6 +1032,21 @@ export async function getCampaignLeads(campaignId) {
       timelineMap[d] = (timelineMap[d] || 0) + 1;
     }
 
+    // Custom form fields — re-extract on the fly from raw field_data so we
+    // don't have to migrate the historical rows. Lightweight (already in JSON).
+    if (Array.isArray(l.field_data)) {
+      const fields = extractFieldData(l.field_data);
+      for (const [qKey, answer] of Object.entries(fields.custom || {})) {
+        const slot = customFieldMap[qKey] = customFieldMap[qKey] || {
+          question: qKey.replace(/_/g, ' '),
+          values: {}
+        };
+        const v = slot.values[answer] = slot.values[answer] || { value: answer, count: 0, surgeries: 0 };
+        v.count++;
+        if (isWon) v.surgeries++;
+      }
+    }
+
     return {
       ...l,
       refrens,
@@ -1026,6 +1076,53 @@ export async function getCampaignLeads(campaignId) {
     pending: leads.filter(l => !l.matched_lead_id).length
   };
 
+  // Refrens-style bifurcation — only counts leads matched to a Refrens record,
+  // so the numbers line up with the Analytics tab definitions exactly.
+  const refrensStatusMap   = {};   // raw refrens status → count
+  const refrensHealthMap   = {};   // bucket: Lost / DNP / SLA Breached / Converted / Active / Other
+  const refrensSlaMap      = { onTime: 0, breached: 0, dnp: 0 };
+  const refrensAssigneeMap = {};
+  for (const l of leads) {
+    if (!l.refrens) continue;
+    const st = l.refrens.status || 'Unknown';
+    refrensStatusMap[st] = (refrensStatusMap[st] || 0) + 1;
+    // Health bucket — same logic as Analytics tab Lead Health donut
+    let bucket = 'Active';
+    if (/lost.*final|^lost$/i.test(st)) bucket = 'Lost — Final';
+    else if (/dnp.*lost/i.test(st)) bucket = 'DNP Lost';
+    else if (/dnp/i.test(st)) bucket = 'DNP';
+    else if (/sla.*breach|breached/i.test(st)) bucket = 'SLA Breached';
+    else if (/deal.*done|won|surgery/i.test(st)) bucket = 'Converted';
+    else if (/recover/i.test(st)) bucket = 'Lost — Recoverable';
+    else if (/no.*follow|stale/i.test(st)) bucket = 'No Follow-up Set';
+    refrensHealthMap[bucket] = (refrensHealthMap[bucket] || 0) + 1;
+    // SLA / DNP
+    if (/dnp/i.test(st)) refrensSlaMap.dnp++;
+    else if (/sla.*breach|breached/i.test(st)) refrensSlaMap.breached++;
+    else refrensSlaMap.onTime++;
+    // Assignee
+    if (l.refrens.assignee) {
+      refrensAssigneeMap[l.refrens.assignee] = (refrensAssigneeMap[l.refrens.assignee] || 0) + 1;
+    }
+  }
+
+  // Custom form-field breakdowns: convert each question into a sorted array
+  // of {value, count, surgeries, surgeryRate}. Cap at top 10 answers per
+  // question to keep the response light.
+  const byCustomField = {};
+  for (const [qKey, slot] of Object.entries(customFieldMap)) {
+    const arr = Object.values(slot.values).sort((a, b) => b.count - a.count);
+    if (arr.length === 0) continue;
+    byCustomField[qKey] = {
+      question: slot.question,
+      values: arr.slice(0, 10).map(v => ({
+        ...v,
+        surgeryRate: v.count > 0 ? Math.round((v.surgeries / v.count) * 1000) / 10 : 0
+      })),
+      total: arr.reduce((s, v) => s + v.count, 0)
+    };
+  }
+
   const breakdowns = {
     byIntent,
     byStage,
@@ -1033,12 +1130,39 @@ export async function getCampaignLeads(campaignId) {
     byCity:     Object.values(byCityMap).sort((a,b) => b.count - a.count).slice(0, 8),
     byPlatform: Object.values(byPlatformMap).sort((a,b) => b.count - a.count),
     intentByStage,
-    timeline
+    timeline,
+    // New: per-form-question harvest (eye power, timeline, insurance, etc.)
+    byCustomField,
+    // New: Refrens-aligned bifurcation so Marketing tab matches Analytics tab
+    refrensHealth:   Object.entries(refrensHealthMap).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count),
+    refrensStatus:   Object.entries(refrensStatusMap).map(([status, count]) => ({ status, count })).sort((a,b) => b.count - a.count),
+    refrensSla:      refrensSlaMap,
+    refrensAssignee: Object.entries(refrensAssigneeMap).map(([assignee, count]) => ({ assignee, count })).sort((a,b) => b.count - a.count)
   };
 
   const accountBenchmark = await getAccountBenchmark();
 
-  return { leads, funnel, breakdowns, accountBenchmark };
+  // Compute recommendations inline so the Leads tab can render them without
+  // a second round-trip. We need the kpis to do this — fetch the campaign
+  // detail once and cache it locally.
+  let recommendations = [];
+  try {
+    const det = await getCampaignDetail(campaignId);
+    recommendations = computeRecommendations({
+      kpis30: det.kpis30,
+      kpis7: det.kpis7,
+      wow: det.wow,
+      breakdowns,
+      funnel,
+      accountBenchmark,
+      campaign: det.campaign
+    });
+  } catch (e) {
+    // Non-fatal — Leads tab still renders without the recs strip.
+    console.warn(`[META] recommendations skipped for ${campaignId}: ${e.message}`);
+  }
+
+  return { leads, funnel, breakdowns, accountBenchmark, recommendations };
 }
 
 // ─── Single-campaign drill-down (used by GET /api/meta/campaign/:id) ─────────
@@ -1143,4 +1267,208 @@ export async function getCampaignDetail(campaignId) {
     wow,       // week-over-week % change
     daily      // raw daily rows for the trend chart
   };
+}
+
+// ─── Bulk import: walk every synced campaign and pull its historical leads ────
+// One-click bulk path so the operator doesn't have to click Import on each of
+// 76 campaigns. Returns a per-campaign report plus aggregate totals so the UI
+// can show "Imported N leads across M campaigns" and call out the campaigns
+// that failed (e.g. with the page-scopes permission error).
+export async function importAllCampaignLeads({ since } = {}) {
+  const { data: campaigns, error } = await supabaseAdmin
+    .from('meta_campaigns')
+    .select('id, name, status');
+  if (error) throw new Error(error.message);
+  if (!campaigns || campaigns.length === 0) {
+    return { imported: 0, linked: 0, campaigns: 0, results: [] };
+  }
+
+  // Filter to ACTIVE + PAUSED — DELETED / ARCHIVED very rarely have new forms
+  const eligible = campaigns.filter(c => /^(ACTIVE|PAUSED)$/i.test(c.status || ''));
+
+  let totalImported = 0, totalLinked = 0;
+  const results = [];
+  const startedAt = Date.now();
+
+  for (const c of eligible) {
+    try {
+      const r = await importHistoricalLeads({ campaignId: c.id, since });
+      totalImported += (r.imported || 0);
+      totalLinked   += (r.linked || 0);
+      results.push({
+        campaignId: c.id,
+        campaignName: c.name,
+        imported: r.imported || 0,
+        linked: r.linked || 0,
+        forms: r.forms || 0,
+        permissionsHint: r.permissionsHint || null,
+        ...(r.message ? { message: r.message } : {})
+      });
+      // brief pause between campaigns to avoid Graph rate limiting
+      await new Promise(res => setTimeout(res, 300));
+    } catch (e) {
+      results.push({ campaignId: c.id, campaignName: c.name, error: e.message });
+    }
+  }
+
+  const elapsedMs = Date.now() - startedAt;
+  console.log(`[META] Bulk import done: ${totalImported} leads / ${totalLinked} matched across ${eligible.length} campaigns in ${(elapsedMs/1000).toFixed(1)}s`);
+  return {
+    imported: totalImported,
+    linked: totalLinked,
+    campaigns: eligible.length,
+    elapsedMs,
+    results: results.sort((a, b) => (b.imported || 0) - (a.imported || 0))
+  };
+}
+
+// ─── Campaign recommendations engine ──────────────────────────────────────────
+// Given the kpis30 + breakdowns + accountBenchmark for a single campaign,
+// produce a ranked list of actionable suggestions. Each suggestion has:
+//   severity : 'critical' | 'warn' | 'info' | 'good'
+//   title    : short imperative ("Reduce CPL", "Scale this campaign")
+//   detail   : one-sentence explanation grounded in the data
+//   metric   : the underlying number that triggered it
+// The UI renders them in order; no auto-action, the operator decides.
+export function computeRecommendations({ kpis30, kpis7, wow, breakdowns, funnel, accountBenchmark, campaign }) {
+  const rec = [];
+  const k30 = kpis30 || {};
+  const k7 = kpis7 || {};
+  const bench = accountBenchmark || {};
+  const b = breakdowns || {};
+  const f = funnel || {};
+
+  const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const fmtPp  = (cur, avg) => avg == null ? '—' : `${((cur - avg) * 100).toFixed(1)} pp`;
+  const fmtRs  = v => v == null ? '—' : `₹${Math.round(v).toLocaleString('en-IN')}`;
+
+  // 1) Surgery rate vs account avg
+  if (f.matched > 8 && bench.surgeryRate != null) {
+    const surgRate = f.matched > 0 ? f.won / f.matched : 0;
+    if (surgRate > bench.surgeryRate * 1.3) {
+      rec.push({ severity: 'good', title: '📈 Scale this campaign',
+        detail: `Surgery rate ${fmtPct(surgRate)} is ${fmtPp(surgRate, bench.surgeryRate)} above account avg (${fmtPct(bench.surgeryRate)}). Same creative, larger budget could compound the conversion.`,
+        metric: { surgRate, benchmark: bench.surgeryRate } });
+    } else if (surgRate < bench.surgeryRate * 0.5 && f.matched >= 20) {
+      rec.push({ severity: 'critical', title: '🛑 Pause and refresh creative',
+        detail: `Surgery rate ${fmtPct(surgRate)} is less than half the account avg (${fmtPct(bench.surgeryRate)}). ${f.matched} leads matched but only ${f.won} closed — the creative is attracting wrong-fit prospects.`,
+        metric: { surgRate, benchmark: bench.surgeryRate } });
+    }
+  }
+
+  // 2) Cost-per-surgery vs account avg
+  if (f.won > 0 && k30.spend > 0 && bench.costPerSurgery != null) {
+    const cps = k30.spend / f.won;
+    if (cps > bench.costPerSurgery * 1.5) {
+      rec.push({ severity: 'warn', title: '💸 Cost per surgery is high',
+        detail: `${fmtRs(cps)} per surgery vs account avg ${fmtRs(bench.costPerSurgery)} — ${Math.round(((cps / bench.costPerSurgery) - 1) * 100)}% above. Consider narrowing audience or testing cheaper placements.`,
+        metric: { cps, benchmark: bench.costPerSurgery } });
+    } else if (cps < bench.costPerSurgery * 0.7) {
+      rec.push({ severity: 'good', title: '✅ Cost per surgery is excellent',
+        detail: `${fmtRs(cps)} per surgery vs account avg ${fmtRs(bench.costPerSurgery)} — ${Math.round((1 - cps / bench.costPerSurgery) * 100)}% below. Increase daily budget while CPL holds.`,
+        metric: { cps, benchmark: bench.costPerSurgery } });
+    }
+  }
+
+  // 3) HOT leads stuck at the contacted/consulted bottleneck
+  if (b.byIntent?.HOT?.count >= 5 && b.intentByStage?.HOT) {
+    const hot = b.byIntent.HOT;
+    const hotDone = b.intentByStage.HOT.done || 0;
+    const hotConsulted = b.intentByStage.HOT.consulted || 0;
+    if (hot.count >= 5 && hotDone === 0) {
+      rec.push({ severity: 'critical', title: '🔥 HOT leads not converting',
+        detail: `${hot.count} HOT-intent leads from this campaign and 0 surgeries closed. Sales handoff is broken — review SLA on first response and HOT-lead routing.`,
+        metric: { hotCount: hot.count, hotDone: 0 } });
+    } else if (hot.count >= 8 && hotConsulted < hot.count * 0.3) {
+      rec.push({ severity: 'warn', title: '🔥 HOT leads stuck before consultation',
+        detail: `Only ${hotConsulted}/${hot.count} HOT leads reached Consulted (${Math.round((hotConsulted / hot.count) * 100)}%). Sales contact rate too low — speed up first call.`,
+        metric: { hotCount: hot.count, hotConsulted } });
+    }
+  }
+
+  // 4) Match-rate vs account avg
+  if (f.total >= 10 && bench.matchRate != null) {
+    const matchRate = f.matched / f.total;
+    if (matchRate < bench.matchRate * 0.6) {
+      rec.push({ severity: 'warn', title: '🔍 Phone-match rate is low',
+        detail: `Only ${Math.round(matchRate * 100)}% of ${f.total} captured leads matched a CRM record (avg ${fmtPct(bench.matchRate)}). Either form phones are dirty (autofilled bad numbers) or Refrens sync is behind.`,
+        metric: { matchRate, benchmark: bench.matchRate } });
+    }
+  }
+
+  // 5) Single-city dominance — diversification opportunity
+  const byCity = b.byCity || [];
+  if (byCity.length > 0 && f.total >= 15) {
+    const topCity = byCity[0];
+    const topShare = topCity.count / f.total;
+    if (topShare > 0.7) {
+      rec.push({ severity: 'info', title: `🗺 ${topCity.city} dominates — test new geos`,
+        detail: `${Math.round(topShare * 100)}% of leads come from ${topCity.city}. Spin up a lookalike for the next 2-3 cities to widen the funnel without diluting CPL.`,
+        metric: { topCity: topCity.city, share: topShare } });
+    }
+  }
+
+  // 6) Single-ad concentration — creative fatigue risk
+  const byAd = b.byAd || [];
+  if (byAd.length >= 1 && f.total >= 15) {
+    const topAd = byAd[0];
+    const topAdShare = topAd.count / f.total;
+    if (byAd.length === 1) {
+      rec.push({ severity: 'info', title: '🎨 Only one ad creative running',
+        detail: `Every lead came from a single ad ("${topAd.ad_name}"). Add 2-3 creative variants to avoid fatigue and learn what hooks work.`,
+        metric: { ads: 1 } });
+    } else if (topAdShare > 0.8) {
+      rec.push({ severity: 'info', title: '🎨 One ad is doing the heavy lifting',
+        detail: `${Math.round(topAdShare * 100)}% of leads from "${topAd.ad_name}". Pause low performers and reallocate budget to the winner.`,
+        metric: { topAd: topAd.ad_name, share: topAdShare } });
+    }
+  }
+
+  // 7) Platform-mix observation
+  const byPlat = b.byPlatform || [];
+  if (byPlat.length >= 2 && f.total >= 15) {
+    const totalP = byPlat.reduce((s, p) => s + p.count, 0);
+    const fb = byPlat.find(p => /facebook|fb/i.test(p.platform))?.count || 0;
+    const ig = byPlat.find(p => /instagram|ig/i.test(p.platform))?.count || 0;
+    const fbShare = totalP > 0 ? fb / totalP : 0;
+    const igShare = totalP > 0 ? ig / totalP : 0;
+    if (igShare > 0.85) {
+      rec.push({ severity: 'info', title: '📱 Almost all leads are from Instagram',
+        detail: `${Math.round(igShare * 100)}% from IG, ${Math.round(fbShare * 100)}% from FB. Consider placement-specific creative or reallocating away from FB if FB CPL is higher.`,
+        metric: { fbShare, igShare } });
+    } else if (fbShare > 0.85) {
+      rec.push({ severity: 'info', title: '📱 Almost all leads are from Facebook',
+        detail: `${Math.round(fbShare * 100)}% from FB. Test Reels/Stories placements on IG — often half the CPL for LASIK leads.`,
+        metric: { fbShare, igShare } });
+    }
+  }
+
+  // 8) Week-over-week direction
+  if (wow?.cpl != null && wow.cpl > 30 && k7.spend > 1000) {
+    rec.push({ severity: 'warn', title: '📈 CPL trending up',
+      detail: `CPL rose ${wow.cpl.toFixed(0)}% week-over-week (₹${Math.round(k7.cpl || 0)} vs prior week). Auction is heating up — refresh creative or shift schedule.`,
+      metric: { wowCpl: wow.cpl } });
+  } else if (wow?.cpl != null && wow.cpl < -20 && k7.leads > 5) {
+    rec.push({ severity: 'good', title: '📉 CPL improving week-over-week',
+      detail: `CPL dropped ${Math.abs(wow.cpl).toFixed(0)}% this week (₹${Math.round(k7.cpl || 0)} vs prior). Lock in budget while the trend holds.`,
+      metric: { wowCpl: wow.cpl } });
+  }
+
+  // 9) Frequency / fatigue (impressions ÷ reach)
+  if (k30.frequency != null && k30.frequency > 3.5 && k30.reach > 500) {
+    rec.push({ severity: 'warn', title: '🔁 Audience fatigue likely',
+      detail: `Frequency is ${k30.frequency.toFixed(1)} (avg user has seen the ad ${k30.frequency.toFixed(1)}× in 30 days). CTR usually craters past 3.0 — rotate creative or expand audience.`,
+      metric: { frequency: k30.frequency } });
+  }
+
+  // 10) Spend with no leads at all
+  if (k30.spend > 1000 && f.total === 0) {
+    rec.push({ severity: 'critical', title: '⚠️ Spending without leads',
+      detail: `${fmtRs(k30.spend)} spent in 30 days with 0 attributed Lead Form submissions. Either the form is broken, or this campaign drives traffic (not Lead Ads) — confirm in Ads Manager.`,
+      metric: { spend: k30.spend, leads: 0 } });
+  }
+
+  // Severity ranking
+  const sevRank = { critical: 0, warn: 1, info: 2, good: 3 };
+  return rec.sort((a, b) => sevRank[a.severity] - sevRank[b.severity]);
 }
