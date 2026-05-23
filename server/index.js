@@ -1092,7 +1092,24 @@ app.get('/api/meta/debug/campaign/:id/ads', async (req, res) => {
         adsUrl.searchParams.set('access_token', creds.token);
         const adsJson = await (await fetch(adsUrl.toString())).json();
 
-        return res.json({ success: true, adsets: adsetsJson, ads: adsJson });
+        // 3) If we know a form id (passed as ?formId=), pull its leads directly
+        let formLeads = null;
+        const formId = req.query.formId;
+        if (formId) {
+            const fUrl = new URL(`https://graph.facebook.com/v21.0/${formId}/leads`);
+            fUrl.searchParams.set('fields', 'id,created_time,ad_id,campaign_id,field_data,platform');
+            fUrl.searchParams.set('limit', '3');
+            fUrl.searchParams.set('access_token', creds.token);
+            const r = await fetch(fUrl.toString());
+            formLeads = await r.json();
+            // Also try form metadata
+            const mUrl = new URL(`https://graph.facebook.com/v21.0/${formId}`);
+            mUrl.searchParams.set('fields', 'id,name,status,leads_count,page_id');
+            mUrl.searchParams.set('access_token', creds.token);
+            const mr = await fetch(mUrl.toString());
+            formLeads.formMeta = await mr.json();
+        }
+        return res.json({ success: true, adsets: adsetsJson, ads: adsJson, formLeads });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
