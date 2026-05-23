@@ -418,18 +418,27 @@ export async function dumpCrmNewLeadForm() {
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
   try {
+    // ── Mirror the working refrens-sync.js auth flow EXACTLY ────────────────
+    // (1) set REFRENS_COOKIES BEFORE any navigation
+    const cookiesRaw = process.env.REFRENS_COOKIES;
+    if (cookiesRaw) {
+      try {
+        const cookies = JSON.parse(cookiesRaw);
+        await page.setCookie(...cookies.filter(c => c.name && c.value && c.domain));
+      } catch (e) {
+        console.warn('[DIAG] REFRENS_COOKIES parse failed:', e.message);
+      }
+    }
+
+    // (2) warm /app first to refresh the __at token (same pattern as processLead)
+    await page.goto('https://www.refrens.com/app', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 2500));
+
+    // (3) now navigate to the lead form
     await page.goto('https://www.refrens.com/app/relivecure/leads/new', {
       waitUntil: 'networkidle2',
       timeout: 60000
     });
-    // Auto-login if redirected to /signin
-    const reAuthed = await ensureRefrensSession(page);
-    if (reAuthed) {
-      await page.goto('https://www.refrens.com/app/relivecure/leads/new', {
-        waitUntil: 'networkidle2',
-        timeout: 60000
-      });
-    }
     // Let React hydrate
     await new Promise(r => setTimeout(r, 4000));
 
