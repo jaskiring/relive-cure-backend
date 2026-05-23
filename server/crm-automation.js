@@ -442,52 +442,115 @@ export async function dumpCrmNewLeadForm() {
     // Let React hydrate
     await new Promise(r => setTimeout(r, 4000));
 
-    // (4) Probe disco-select[1] (Prospect Organisation) with the same
-    //     type-to-search flow processLead uses, so we know whether the
-    //     production push will succeed.
+    // (4) Deep probe of disco-select[1] (Prospect Organisation). The previous
+    //     probe showed typing "rel" doesn't produce options. Drill down to see
+    //     exactly what's happening: does the input exist? does typing change
+    //     its value? are there other related menus rendered? what network
+    //     calls fire when we type?
+    const networkCalls = [];
+    page.on('response', (resp) => {
+      const u = resp.url();
+      if (u.includes('refrens.com') && (u.includes('organi') || u.includes('search') || u.includes('contact') || u.includes('autocomplete') || u.includes('graphql'))) {
+        networkCalls.push({ url: u.slice(0, 160), status: resp.status() });
+      }
+    });
+
     const orgProbe = await (async () => {
       const probe = { steps: [] };
       try {
-        // Click control[1] open
+        // Step 1 — inspect disco-select[1] DOM before any click
+        probe.steps.push(await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          const c = all[1];
+          if (!c) return { step: 'inspect_pre', error: 'control[1] not found' };
+          const input = c.querySelector('input');
+          return {
+            step: 'inspect_pre',
+            classList: c.className,
+            hasInput: !!input,
+            inputDisabled: input?.disabled || false,
+            inputReadOnly: input?.readOnly || false,
+            inputAriaAutocomplete: input?.getAttribute('aria-autocomplete') || null,
+            inputName: input?.name || null,
+            inputId: input?.id || null,
+            // What's inside this control's parent? Is there a wrapper menu?
+            parentClass: c.parentElement?.className?.slice(0, 80) || null,
+            ariaHasPopup: c.getAttribute('aria-haspopup') || null
+          };
+        }));
+
+        // Step 2 — click open
         await page.evaluate(() => {
           const all = Array.from(document.querySelectorAll('.disco-select__control'));
           all[1]?.click();
         });
-        await new Promise(r => setTimeout(r, 700));
-        let opts1 = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
-        );
-        probe.steps.push({ step: 'open_only', options: opts1.length, sample: opts1.slice(0, 4) });
+        await new Promise(r => setTimeout(r, 1000));
+        probe.steps.push(await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          const c = all[1];
+          return {
+            step: 'after_click',
+            isFocused: c?.classList.contains('disco-select__control--is-focused') || false,
+            isOpen: c?.classList.contains('disco-select__control--menu-is-open') || false,
+            menuExists: !!document.querySelector('.disco-select__menu'),
+            menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 120) || null,
+            optionsCount: document.querySelectorAll('.disco-select__option').length,
+            allMenusOnPage: document.querySelectorAll('.disco-select__menu').length
+          };
+        }));
 
-        if (opts1.length === 0) {
-          // Type "rel" into the dropdown's input
-          const inp = await page.evaluateHandle(() => {
+        // Step 3 — focus + type via puppeteer
+        const inp = await page.evaluateHandle(() => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          return all[1]?.querySelector('input') || null;
+        });
+        const inpEl = inp.asElement();
+        if (inpEl) {
+          await inpEl.focus();
+          await inpEl.type('rel', { delay: 120 });
+          await new Promise(r => setTimeout(r, 3500));
+          probe.steps.push(await page.evaluate(() => {
             const all = Array.from(document.querySelectorAll('.disco-select__control'));
-            return all[1]?.querySelector('input') || null;
-          });
-          const inpEl = inp.asElement();
-          if (inpEl) {
-            await inpEl.focus();
-            await inpEl.type('rel', { delay: 80 });
-            try {
-              await page.waitForFunction(
-                () => document.querySelectorAll('.disco-select__option').length > 0,
-                { timeout: 4000 }
-              );
-            } catch(_) {}
-            const opts2 = await page.evaluate(() =>
-              Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
-            );
-            probe.steps.push({ step: 'typed_rel', options: opts2.length, sample: opts2.slice(0, 4) });
-          } else {
-            probe.steps.push({ step: 'typed_rel', error: 'no input handle' });
-          }
+            const c = all[1];
+            const input = c?.querySelector('input');
+            return {
+              step: 'after_type_rel',
+              inputValue: input?.value || '',
+              ariaActivedescendant: input?.getAttribute('aria-activedescendant') || null,
+              isOpen: c?.classList.contains('disco-select__control--menu-is-open') || false,
+              menuExists: !!document.querySelector('.disco-select__menu'),
+              menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 200) || null,
+              optionsCount: document.querySelectorAll('.disco-select__option').length,
+              // Any "Loading..." indicator?
+              loadingShown: /loading|searching|fetching/i.test(document.querySelector('.disco-select__menu')?.innerText || ''),
+              noOptionsMsg: document.querySelector('.disco-select__menu-notice')?.innerText || null
+            };
+          }));
         }
+
+        // Step 4 — try input via native setter (the same technique we use for the subject field)
+        await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          const input = all[1]?.querySelector('input');
+          if (!input) return;
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          setter.call(input, 'lasik');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await new Promise(r => setTimeout(r, 3500));
+        probe.steps.push(await page.evaluate(() => ({
+          step: 'after_native_setter',
+          inputValue: document.querySelectorAll('.disco-select__control')[1]?.querySelector('input')?.value || '',
+          menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 200) || null,
+          optionsCount: document.querySelectorAll('.disco-select__option').length,
+          noOptionsMsg: document.querySelector('.disco-select__menu-notice')?.innerText || null
+        })));
       } catch (e) {
         probe.error = e.message;
       }
-      // Escape so we don't leave the dropdown open in case caller continues
       await page.keyboard.press('Escape').catch(() => {});
+      probe.networkCalls = networkCalls.slice(0, 20);
       return probe;
     })();
 
