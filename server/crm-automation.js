@@ -353,7 +353,42 @@ async function ensureRefrensSession(page) {
     return /401|sign in|log in|login/i.test(title) || /\/signin\b|\/login\b/i.test(location.pathname);
   });
   if (stillLogin) {
-    throw new Error('Refrens login submitted but page still on login screen — credentials may be wrong, MFA enabled, or login flow changed.');
+    // Capture what's on the page so we can tell whether it's bad creds, MFA,
+    // SSO-only, or a different login flow.
+    const diag = await page.evaluate(() => {
+      const visibleErrs = [];
+      document.querySelectorAll('[class*="error"],[class*="invalid"],[role="alert"],[class*="toast"],[class*="alert"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return;
+        const t = (el.innerText || '').trim();
+        if (t && t.length < 200) visibleErrs.push(t);
+      });
+      const visibleButtons = Array.from(document.querySelectorAll('button,a[role="button"]'))
+        .filter(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+        .map(b => (b.innerText || '').trim())
+        .filter(t => t && t.length < 60)
+        .slice(0, 12);
+      const otpLikely = /otp|verification code|2fa|two.?factor|verify your|6.digit/i.test(document.body.innerText || '');
+      const ssoLikely = /continue with google|sign in with google|google|microsoft|sso/i.test(document.body.innerText || '');
+      const hasOtpInput = !!document.querySelector('input[autocomplete="one-time-code"],input[name*="otp" i],input[name*="code" i]');
+      return {
+        url: location.href,
+        title: document.title,
+        visibleErrs: visibleErrs.slice(0, 5),
+        visibleButtons,
+        otpLikely,
+        ssoLikely,
+        hasOtpInput,
+        bodySnippet: (document.body.innerText || '').slice(0, 400)
+      };
+    });
+    console.error('[CRM AUTH] Login failed — diagnostic:', JSON.stringify(diag, null, 2));
+    const reason = diag.hasOtpInput ? 'OTP/MFA prompt — Refrens is asking for a verification code (check email or auth app)'
+                 : diag.otpLikely   ? 'MFA likely — page mentions OTP / verification code'
+                 : diag.ssoLikely && diag.visibleButtons.some(b => /google|microsoft|sso/i.test(b)) ? 'Refrens may require SSO — visible buttons: ' + diag.visibleButtons.join(' | ')
+                 : diag.visibleErrs.length > 0 ? 'Refrens rejected: ' + diag.visibleErrs.join(' | ')
+                 : 'Stayed on login screen — buttons visible: ' + diag.visibleButtons.join(' | ');
+    throw new Error('Refrens auto-login failed: ' + reason);
   }
 
   console.log('[CRM AUTH] ✅ Logged in successfully');
