@@ -288,13 +288,31 @@ function schedulePersist() {
     }, 200);
 }
 
-const NAME_BLACKLIST = new Set(['yes', 'ok', 'okay', 'haan', 'ha', 'no', 'nah', 'start', 'nahi', 'nope', 'sure', 'chalo', 'bilkul', 'haan ji', 'skip', 'next', 'continue', 'hello', 'hi', 'hey', 'theek', 'accha', 'achha', 'thik', 'lasik', 'surgery', 'good', 'fine']);
+const NAME_BLACKLIST = new Set([
+    'yes', 'ok', 'okay', 'haan', 'ha', 'no', 'nah', 'start', 'nahi', 'nope', 'sure', 'chalo', 'bilkul', 'haan ji',
+    'skip', 'next', 'continue', 'hello', 'hi', 'hey', 'theek', 'accha', 'achha', 'thik', 'lasik', 'surgery', 'good', 'fine',
+    // Hinglish/English question words \u2014 never valid names
+    'kya', 'kaise', 'kab', 'kahan', 'kyu', 'kyon', 'kyun', 'kahaan', 'kab tak', 'kaisa',
+    'what', 'how', 'where', 'when', 'why', 'who', 'which',
+]);
+const NAME_QUESTION_PREFIX_RE = /^(kya|kaise|kab|kahan|kyu|kyon|kyun|kahaan|kaisa|what|how|where|when|why|who|which)\b/i;
 function isValidName(str) {
     if (!str || str.trim().length < 2) return false;
-    if (NAME_BLACKLIST.has(str.toLowerCase().trim())) return false;
-    if (/[\u0900-\u097F]/.test(str)) return str.trim().length >= 2;
-    if (!/^[a-zA-Z\s]+$/.test(str.trim())) return false;
-    return str.trim().split(/\s+/).some(w => w.length >= 2);
+    const trimmed = str.trim();
+    const low = trimmed.toLowerCase();
+    if (NAME_BLACKLIST.has(low)) return false;
+    // Reject anything that looks like a question
+    if (trimmed.includes('?')) return false;
+    if (NAME_QUESTION_PREFIX_RE.test(trimmed)) return false;
+    if (/\u0915\u094D\u092F\u093E|\u0915\u0948\u0938\u0947|\u0915\u092C|\u0915\u0939\u093E\u0901|\u0915\u0939\u093E\u0902|\u0915\u094D\u092F\u094B\u0902|\u0915\u094D\u092F\u0942/.test(trimmed)) return false;
+    // Names are typically 1-2 words; 3+ words is almost always a sentence
+    if (trimmed.split(/\s+/).length >= 3) return false;
+    // Reject if FIRST word is a blacklisted question word (covers "kya hota he ye proccess")
+    const firstWord = low.split(/\s+/)[0];
+    if (NAME_BLACKLIST.has(firstWord)) return false;
+    if (/[\u0900-\u097F]/.test(trimmed)) return trimmed.length >= 2;
+    if (!/^[a-zA-Z\s]+$/.test(trimmed)) return false;
+    return trimmed.split(/\s+/).some(w => w.length >= 2);
 }
 
 const NOT_INTERESTED_TRIGGERS = ['not interested', 'no thanks', 'don\'t want', 'dont want', 'wrong number', 'galat number', 'nahi chahiye', 'band karo', 'mat bhejo', 'unsubscribe', 'stop messaging', 'please stop', 'remove me'];
@@ -315,6 +333,20 @@ function passiveExtract(message, session) {
         for (const city of INDIAN_CITIES) { if (m.includes(city)) { d.city = city.charAt(0).toUpperCase() + city.slice(1); break; } }
         const fromMatch = m.match(/(?:from|i'm from|i am from|main.*se hoon|main.*se hun)\s+([a-z]+)/i);
         if (fromMatch && !d.city && fromMatch[1].length > 2) d.city = fromMatch[1].charAt(0).toUpperCase() + fromMatch[1].slice(1);
+        // Permissive: when the bot JUST asked CITY, accept any 1-2 word letter
+        // reply as a city (covers Bharatpur, Sikar, Bareilly — anything not in
+        // the hardcoded list). Devanagari and roman both accepted.
+        if (!d.city && d.lastAskedField === 'CITY') {
+            const t = message.trim();
+            const words = t.split(/\s+/);
+            const isShort = t.length >= 2 && t.length <= 30 && words.length <= 2;
+            const isLetters = /^[a-zA-Zऀ-ॿ\s.'-]+$/.test(t);
+            // Don't accept short generic replies — those are handled by other paths
+            const notGeneric = !['yes','no','ok','haan','nahi','sure','hi','hello','start','later','baad mein','baad'].includes(t.toLowerCase());
+            if (isShort && isLetters && notGeneric) {
+                d.city = words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+            }
+        }
         if (d.city && d.lastAskedField === 'CITY') d.lastAskedField = null;
     }
     if (!d.eyePower) {
