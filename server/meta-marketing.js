@@ -418,21 +418,22 @@ export async function backfillLeadLinks() {
 // Optional params:
 //   campaignId — restrict to one campaign (undefined = account-wide)
 //   since      — ISO date string; only leads created after this date
-// Extract lead_gen_form_id from an ad creative — Meta stores it at different
-// nesting depths depending on the creative type (link ad / video ad / dynamic /
-// IG story). Walk all the known paths.
+// Extract lead_gen_form_id from an ad creative. Verified empirically against
+// the Mumbai 14/4/26 campaign: Meta nests the form id inside the CTA's value
+// object, NOT as a direct field of link_data / video_data / creative. The
+// "lead_gen_form_id" identifiers on those parent objects are invalid Graph
+// API field names — requesting them returns a 100 error that invalidates the
+// entire creative subfield, which is what caused the original 0-results bug.
 function formIdFromCreative(creative) {
   if (!creative) return null;
-  if (creative.lead_gen_form_id) return creative.lead_gen_form_id;
-  const linkData = creative.object_story_spec?.link_data;
-  if (linkData?.lead_gen_form_id) return linkData.lead_gen_form_id;
-  if (linkData?.call_to_action?.value?.lead_gen_form_id) return linkData.call_to_action.value.lead_gen_form_id;
-  const videoData = creative.object_story_spec?.video_data;
-  if (videoData?.lead_gen_form_id) return videoData.lead_gen_form_id;
-  if (videoData?.call_to_action?.value?.lead_gen_form_id) return videoData.call_to_action.value.lead_gen_form_id;
-  // Asset feed (dynamic / advantage+) creatives put the form id in call_to_action_types
+  const link = creative.object_story_spec?.link_data;
+  if (link?.call_to_action?.value?.lead_gen_form_id) return link.call_to_action.value.lead_gen_form_id;
+  const video = creative.object_story_spec?.video_data;
+  if (video?.call_to_action?.value?.lead_gen_form_id) return video.call_to_action.value.lead_gen_form_id;
+  // Asset feed (dynamic / advantage+) creatives carry the form id in
+  // asset_feed_spec.call_to_actions[i].value.lead_gen_form_id
   const asf = creative.asset_feed_spec;
-  if (asf?.call_to_action_types && Array.isArray(asf.call_to_actions)) {
+  if (Array.isArray(asf?.call_to_actions)) {
     for (const cta of asf.call_to_actions) {
       if (cta?.value?.lead_gen_form_id) return cta.value.lead_gen_form_id;
     }
@@ -463,25 +464,23 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   let adsScanned = 0;
   for (let page = 0; page < 30; page++) {
     const params = {
-      // Request all known nesting paths in one shot. Graph silently drops
-      // fields that don't exist on a given creative type. NOTE: this is a
-      // single comma-joined string — earlier I had it broken across an array
-      // join('') without commas, which produced "idcampaign_idcreative{...}"
-      // and Meta silently kept only "id".
+      // ONLY valid Graph API fields — empirically verified against the
+      // Mumbai 14/4/26 campaign. Including invalid fields (e.g. lead_gen_form_id
+      // at the creative or link_data level) returns a 100 error and silently
+      // nulls out the entire creative subfield.
       fields:
-        'id,campaign_id,status,effective_status,' +
+        'id,campaign_id,' +
         'creative{' +
-          'id,name,' +
-          'lead_gen_form_id,' +
+          'id,' +
           'effective_object_story_id,' +
           'object_story_spec{' +
             'page_id,' +
-            'link_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}},' +
-            'video_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}}' +
+            'link_data{call_to_action{type,value{lead_gen_form_id}}},' +
+            'video_data{call_to_action{type,value{lead_gen_form_id}}}' +
           '},' +
-          'asset_feed_spec{call_to_action_types,call_to_actions{type,value{lead_gen_form_id}}}' +
+          'asset_feed_spec{call_to_actions{type,value{lead_gen_form_id}}}' +
         '}',
-      // Include ARCHIVED + PAUSED ads so we still find form ids for past leads.
+      // Include PAUSED / ARCHIVED ads so we still find form ids for past leads.
       effective_status: JSON.stringify(['ACTIVE','PAUSED','ARCHIVED','IN_PROCESS','WITH_ISSUES','PREAPPROVED','PENDING_REVIEW']),
       limit: 200
     };
