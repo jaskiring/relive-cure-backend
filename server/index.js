@@ -99,6 +99,18 @@ app.get('/api/export-refrens-cookies', async (req, res) => {
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Diagnostic: dump the live Refrens new-lead form structure. Read-only.
+app.get('/api/diag/crm-form', async (req, res) => {
+    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        const { dumpCrmNewLeadForm } = await import('./crm-automation.js');
+        const dump = await dumpCrmNewLeadForm();
+        res.json({ success: true, ...dump });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message, stack: e.stack?.split('\n').slice(0, 5) });
+    }
+});
+
 // ─── CRM Push ─────────────────────────────────────────────────────────────────
 app.post('/api/push-to-crm-form', async (req, res) => {
     const crmKey = req.headers['x-crm-key'];

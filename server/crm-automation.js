@@ -301,6 +301,118 @@ export async function getBrowserCookies() {
   }
 }
 
+// ─── Diagnostic: dump the structure of the new-lead form ─────────────────────
+// Opens /leads/new (re-uses the existing puppeteer session that already has
+// Refrens cookies), waits for the form to render, then returns a structural
+// dump: every disco-select with its current value/placeholder/required-marker,
+// every input/textarea, and the visible labels. Used to figure out what the
+// form looks like right now without driving it manually.
+export async function dumpCrmNewLeadForm() {
+  const browser = await getBrowser();
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  try {
+    await page.goto('https://www.refrens.com/app/relivecure/leads/new', {
+      waitUntil: 'networkidle2',
+      timeout: 60000
+    });
+    // Let React hydrate
+    await new Promise(r => setTimeout(r, 4000));
+
+    const dump = await page.evaluate(() => {
+      const txt = el => (el?.innerText || el?.textContent || '').trim().slice(0, 80);
+      // Every disco-select control with index, current value, and its closest label
+      const selects = Array.from(document.querySelectorAll('.disco-select__control')).map((c, i) => {
+        // Closest label = nearest preceding label/heading text within ~4 parents
+        let label = '';
+        let cur = c;
+        for (let d = 0; d < 5 && cur; d++) {
+          cur = cur.parentElement;
+          if (!cur) break;
+          const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+          if (lbl && lbl !== c && txt(lbl)) { label = txt(lbl); break; }
+        }
+        // Also try parent's text before the dropdown
+        if (!label && c.parentElement) {
+          const sib = c.parentElement.previousElementSibling;
+          if (sib) label = txt(sib);
+        }
+        return {
+          index: i,
+          label: label || '(no label)',
+          currentValue: c.querySelector('.disco-select__single-value')?.innerText?.trim() || '',
+          placeholder: c.querySelector('.disco-select__placeholder')?.innerText?.trim() || '',
+          isMulti: c.classList.contains('disco-select__control--is-multi') || !!c.querySelector('.disco-select__multi-value'),
+          isFocused: c.classList.contains('disco-select__control--is-focused'),
+          hasError: !!c.closest('[class*="error"],[class*="invalid"]'),
+          requiredMarker: !!(c.closest('div')?.querySelector('[class*="required"],span.text-danger,span.required'))
+        };
+      });
+
+      // Visible inputs + textareas
+      const inputs = Array.from(document.querySelectorAll('input,textarea')).map((el, i) => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return null;
+        if (el.type === 'hidden') return null;
+        // Closest label
+        let label = '';
+        if (el.id) {
+          const lbl = document.querySelector(`label[for="${el.id}"]`);
+          if (lbl) label = txt(lbl);
+        }
+        if (!label) {
+          const parentLabel = el.closest('label');
+          if (parentLabel) label = txt(parentLabel);
+        }
+        return {
+          index: i,
+          tag: el.tagName,
+          type: el.type || '',
+          name: el.name || '',
+          id: el.id || '',
+          placeholder: el.placeholder || '',
+          value: (el.value || '').slice(0, 40),
+          required: el.required || el.getAttribute('aria-required') === 'true',
+          label: label || '(no label)'
+        };
+      }).filter(Boolean);
+
+      // Any visible elements marked required or with asterisks
+      const requiredLabels = [];
+      document.querySelectorAll('label,h4,h5,h6,span').forEach(el => {
+        const t = (el.innerText || '').trim();
+        if (!t || t.length > 80) return;
+        if (/\*\s*$|required/i.test(t)) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) requiredLabels.push(t.slice(0, 80));
+        }
+      });
+
+      // URL + page title
+      return {
+        url: location.href,
+        title: document.title,
+        bodyChars: (document.body.innerText || '').length,
+        selectsCount: selects.length,
+        inputsCount: inputs.length,
+        selects,
+        inputs: inputs.slice(0, 30),
+        requiredLabels: [...new Set(requiredLabels)].slice(0, 20),
+        // First 500 chars of any visible form errors
+        formErrors: Array.from(document.querySelectorAll('[class*="error"],[class*="invalid"],[role="alert"]'))
+          .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+          .map(el => (el.innerText || '').trim())
+          .filter(t => t && t.length < 200)
+          .slice(0, 10)
+      };
+    });
+
+    return dump;
+  } finally {
+    await context.close();
+  }
+}
+
 async function processLead(lead) {
   const t_open = Date.now();
   console.log(`[CRM] Starting push for lead_id=${lead.id || 'new'}, phone=${lead.phone_number}`);
