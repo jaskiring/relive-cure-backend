@@ -146,12 +146,13 @@ async function fillField(page, selector, value) {
   }
 }
 
-// ── F4: Set a React-controlled input via React's onChange handler ──────────────
-// Refrens's form uses controlled inputs. Native `el.value = X` + dispatchEvent
-// updates the DOM but NOT React's internal state, so submit reads contact.name
-// as "" even though the visible value is filled. This walks the React fiber
-// tree, finds the onChange handler, and calls it directly with a synthetic
-// event so React's state is actually updated.
+// ── F4: Set a React-controlled input — minimal, MCP-verified approach ─────────
+// Proven via MCP-in-Chrome on the live Refrens form: native setter + a single
+// "input" event is sufficient to update React state for both the regular
+// inputs (name, city, subject) AND the phone-input library. The previous
+// fiber-walk + onChange-double-fire actually BROKE the phone-input by
+// invoking the parent form's onChange with a stale target, causing React
+// to clear the phone value.
 async function setReactInputValue(page, selector, value) {
   try {
     await page.waitForSelector(selector, { timeout: 3000 });
@@ -159,33 +160,10 @@ async function setReactInputValue(page, selector, value) {
       const el = document.querySelector(sel);
       if (!el) return { ok: false, reason: 'not_found' };
       el.focus();
-      // 1. Native setter — triggers React's input event listener
       const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
       setter.call(el, val);
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      // 2. Defensive — walk fiber tree, call onChange directly
-      const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps') || k.startsWith('__reactEventHandlers'));
-      if (propsKey) {
-        const handler = el[propsKey]?.onChange;
-        if (typeof handler === 'function') {
-          try { handler({ target: el, currentTarget: el, type: 'change' }); } catch(_) {}
-        }
-      }
-      // 3. Walk fiber upward in case onChange is on a parent
-      const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-      if (fiberKey) {
-        let fiber = el[fiberKey];
-        for (let i = 0; i < 8 && fiber; i++) {
-          const onChange = fiber.memoizedProps?.onChange;
-          if (typeof onChange === 'function' && fiber.stateNode !== el) {
-            try { onChange({ target: el, currentTarget: el, type: 'change' }); } catch(_) {}
-            break;
-          }
-          fiber = fiber.return;
-        }
-      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
       return { ok: true, value: el.value };
     }, selector, String(value));
     if (!result.ok) console.warn(`[CRM] setReactInputValue ${selector} failed: ${result.reason}`);
