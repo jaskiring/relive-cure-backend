@@ -1076,25 +1076,23 @@ app.get('/api/meta/debug/campaign/:id/ads', async (req, res) => {
         const { loadCredentials } = await import('./meta-marketing.js');
         const creds = await loadCredentials();
         if (!creds) return res.status(400).json({ success: false, error: 'No META credentials' });
-        // 1) List ads + creative_id
+        // 1) List ad sets — promoted_object.lead_form_id is THE canonical place
+        //    Meta stores the form id for Lead Generation campaigns
+        const adsetsUrl = new URL(`https://graph.facebook.com/v21.0/${req.params.id}/adsets`);
+        adsetsUrl.searchParams.set('fields', 'id,name,status,promoted_object,destination_type,optimization_goal');
+        adsetsUrl.searchParams.set('limit', '10');
+        adsetsUrl.searchParams.set('access_token', creds.token);
+        const adsetsJson = await (await fetch(adsetsUrl.toString())).json();
+
+        // 2) List ads + creative spec (NO lead_gen_form_id — invalid field)
         const adsUrl = new URL(`https://graph.facebook.com/v21.0/${req.params.id}/ads`);
-        adsUrl.searchParams.set('fields', 'id,name,status,effective_status,creative{id}');
+        adsUrl.searchParams.set('fields', 'id,name,status,effective_status,creative{id,object_story_spec,asset_feed_spec,effective_object_story_id,object_type}');
         adsUrl.searchParams.set('effective_status', JSON.stringify(['ACTIVE','PAUSED','ARCHIVED','IN_PROCESS','WITH_ISSUES','PREAPPROVED','PENDING_REVIEW']));
-        adsUrl.searchParams.set('limit', '10');
+        adsUrl.searchParams.set('limit', '5');
         adsUrl.searchParams.set('access_token', creds.token);
-        const adsRes = await fetch(adsUrl.toString());
-        const adsJson = await adsRes.json();
-        // 2) For each unique creative_id, fetch full creative spec
-        const creativeIds = [...new Set((adsJson.data || []).map(a => a.creative?.id).filter(Boolean))];
-        const creatives = {};
-        for (const cid of creativeIds.slice(0, 5)) {
-            const cUrl = new URL(`https://graph.facebook.com/v21.0/${cid}`);
-            cUrl.searchParams.set('fields', 'id,name,lead_gen_form_id,effective_object_story_id,object_story_spec,asset_feed_spec,object_type');
-            cUrl.searchParams.set('access_token', creds.token);
-            const r = await fetch(cUrl.toString());
-            creatives[cid] = await r.json();
-        }
-        return res.json({ success: true, ads: adsJson, creatives });
+        const adsJson = await (await fetch(adsUrl.toString())).json();
+
+        return res.json({ success: true, adsets: adsetsJson, ads: adsJson });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
