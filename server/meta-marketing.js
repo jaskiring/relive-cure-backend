@@ -464,22 +464,12 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   let adsScanned = 0;
   for (let page = 0; page < 30; page++) {
     const params = {
-      // ONLY valid Graph API fields — empirically verified against the
-      // Mumbai 14/4/26 campaign. Including invalid fields (e.g. lead_gen_form_id
-      // at the creative or link_data level) returns a 100 error and silently
-      // nulls out the entire creative subfield.
-      fields:
-        'id,campaign_id,' +
-        'creative{' +
-          'id,' +
-          'effective_object_story_id,' +
-          'object_story_spec{' +
-            'page_id,' +
-            'link_data{call_to_action{type,value{lead_gen_form_id}}},' +
-            'video_data{call_to_action{type,value{lead_gen_form_id}}}' +
-          '},' +
-          'asset_feed_spec{call_to_actions{type,value{lead_gen_form_id}}}' +
-        '}',
+      // Request the creative as opaque object_story_spec / asset_feed_spec
+      // sub-objects — Graph returns their full JSON including the nested
+      // call_to_action.value.lead_gen_form_id. Aggressive subfield drilling
+      // (value{lead_gen_form_id}) silently errors on Graph and nulls the
+      // creative — keep it simple.
+      fields: 'id,campaign_id,creative{id,effective_object_story_id,object_story_spec,asset_feed_spec}',
       // Include PAUSED / ARCHIVED ads so we still find form ids for past leads.
       effective_status: JSON.stringify(['ACTIVE','PAUSED','ARCHIVED','IN_PROCESS','WITH_ISSUES','PREAPPROVED','PENDING_REVIEW']),
       limit: 200
