@@ -289,6 +289,77 @@ async function assertValue(page, selector, expected) {
   }
 }
 
+// ─── Auto-login to Refrens when the session has expired ──────────────────────
+// Returns true if the page is currently on a Refrens login screen and we
+// successfully logged in (caller should re-navigate to the original target).
+// Returns false if the page is NOT on a login screen (caller continues as-is).
+// Throws if we detect login required but credentials are missing or login fails.
+async function ensureRefrensSession(page) {
+  const isLogin = await page.evaluate(() => {
+    const title = (document.title || '').toLowerCase();
+    if (/401|sign in|log in|login to refrens/i.test(title)) return true;
+    if (/\/signin\b|\/login\b|\/sign-in\b/i.test(location.pathname)) return true;
+    // Heuristic — page has an email + password input and ~no other form fields
+    const inputs = Array.from(document.querySelectorAll('input')).filter(i => i.type !== 'hidden');
+    const hasEmail = inputs.some(i => i.type === 'email' || /email/i.test(i.name || i.placeholder || ''));
+    const hasPwd   = inputs.some(i => i.type === 'password');
+    return hasEmail && hasPwd && inputs.length <= 4;
+  });
+  if (!isLogin) return false;
+
+  const email = process.env.REFRENS_EMAIL;
+  const password = process.env.REFRENS_PASSWORD;
+  if (!email || !password) {
+    throw new Error('Refrens session expired and REFRENS_EMAIL / REFRENS_PASSWORD env vars not set in Railway. Add them and redeploy — the bot will auto-login on the next push.');
+  }
+
+  console.log(`[CRM AUTH] Session expired — logging in as ${email}`);
+
+  // Find the email + password inputs and the submit button
+  const filled = await page.evaluate((creds) => {
+    const setNative = (el, val) => {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(el, val);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const emailInput = inputs.find(i => i.type === 'email' || /email/i.test(i.name || i.placeholder || ''));
+    const passInput  = inputs.find(i => i.type === 'password');
+    if (!emailInput || !passInput) return { ok: false, reason: 'inputs_not_found' };
+    setNative(emailInput, creds.email);
+    setNative(passInput, creds.password);
+    return { ok: true };
+  }, { email, password });
+  if (!filled.ok) throw new Error(`Refrens login: ${filled.reason}`);
+
+  // Click the submit button (look for a button labelled Login/Sign in or just type="submit")
+  await Promise.all([
+    page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle2' }).catch(() => {}),
+    page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button,input[type="submit"]'));
+      const submit = btns.find(b => /sign in|log in|login|submit/i.test(b.textContent || b.value || ''))
+                  || document.querySelector('button[type="submit"]')
+                  || document.querySelector('input[type="submit"]');
+      if (submit) submit.click();
+    })
+  ]);
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Verify login succeeded
+  const stillLogin = await page.evaluate(() => {
+    const title = (document.title || '').toLowerCase();
+    return /401|sign in|log in|login/i.test(title) || /\/signin\b|\/login\b/i.test(location.pathname);
+  });
+  if (stillLogin) {
+    throw new Error('Refrens login submitted but page still on login screen — credentials may be wrong, MFA enabled, or login flow changed.');
+  }
+
+  console.log('[CRM AUTH] ✅ Logged in successfully');
+  return true;
+}
+
 export async function getBrowserCookies() {
   const browser = await getBrowser();
   const context = await browser.createBrowserContext();
@@ -316,6 +387,14 @@ export async function dumpCrmNewLeadForm() {
       waitUntil: 'networkidle2',
       timeout: 60000
     });
+    // Auto-login if redirected to /signin
+    const reAuthed = await ensureRefrensSession(page);
+    if (reAuthed) {
+      await page.goto('https://www.refrens.com/app/relivecure/leads/new', {
+        waitUntil: 'networkidle2',
+        timeout: 60000
+      });
+    }
     // Let React hydrate
     await new Promise(r => setTimeout(r, 4000));
 
@@ -445,6 +524,16 @@ async function processLead(lead) {
 
     // ── 2. Load the Add New Lead form ────────────────────────────────────────
     await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // Refrens may have redirected us to /signin if the session expired.
+    // ensureRefrensSession() detects that and logs back in using REFRENS_EMAIL
+    // / REFRENS_PASSWORD env vars, then we re-navigate to the new-lead form.
+    const reAuthed = await ensureRefrensSession(page);
+    if (reAuthed) {
+      console.log('[CRM] Re-authenticated — re-navigating to new-lead form');
+      await page.goto(CRM_FORM_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    }
+
     await page.evaluate((token) => {
       try { sessionStorage.setItem('__at', token); } catch(e) {}
     }, capturedToken);
