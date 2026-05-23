@@ -688,27 +688,95 @@ export async function getCampaignAudience(campaignId) {
 }
 
 // Return leads attributed to a specific campaign, joined with their Refrens / chatbot status.
+// Account-wide benchmark — surgery rate, CPL, match rate, HOT % across the last 30
+// days. Used by getCampaignLeads() to show "vs account avg" deltas in the metrics
+// banner. Cached in-process for 5 min.
+let accountBenchmarkCache = null;
+const BENCHMARK_TTL_MS = 5 * 60 * 1000;
+async function getAccountBenchmark() {
+  if (accountBenchmarkCache && Date.now() - accountBenchmarkCache.fetchedAt < BENCHMARK_TTL_MS) {
+    return accountBenchmarkCache.data;
+  }
+  const since30 = new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10);
+
+  // 1) Account-wide insights — total spend + total on-platform leads (last 30d)
+  const { data: insights } = await supabaseAdmin
+    .from('meta_ad_insights')
+    .select('spend, leads')
+    .gte('date', since30);
+  let spend = 0, leads = 0;
+  for (const r of (insights || [])) { spend += Number(r.spend || 0); leads += Number(r.leads || 0); }
+
+  // 2) Account-wide meta_leads — match rate, HOT %, surgery rate
+  const { data: ml } = await supabaseAdmin
+    .from('meta_leads')
+    .select('matched_lead_id, matched_source')
+    .gte('created_time', since30);
+  const total = ml?.length || 0;
+  const matched = (ml || []).filter(l => l.matched_lead_id).length;
+
+  // 3) For HOT % and surgery rate, fetch the matched refrens leads in bulk
+  const refrensIds = (ml || []).filter(l => l.matched_source === 'refrens' && l.matched_lead_id).map(l => l.matched_lead_id);
+  let hot = 0, surgeries = 0;
+  if (refrensIds.length > 0) {
+    const { data: rls } = await supabaseAdmin
+      .from('refrens_leads')
+      .select('id, intent_band, status')
+      .in('id', refrensIds);
+    for (const r of (rls || [])) {
+      if (r.intent_band === 'HOT' || /hot/i.test(r.intent_band || '')) hot++;
+      if (/deal done|won|surgery done|surgery booked/i.test(r.status || '')) surgeries++;
+    }
+  }
+
+  const data = {
+    spend,
+    leads,                                          // on-platform leads (Meta)
+    metaLeadsTotal: total,                          // form-form attributed leads
+    matchRate:   total > 0 ? matched / total : null,
+    hotPct:      matched > 0 ? hot / matched : null,
+    surgeryRate: matched > 0 ? surgeries / matched : null,
+    cpl:         leads > 0 ? spend / leads : null,
+    costPerSurgery: surgeries > 0 ? spend / surgeries : null,
+    asOf: new Date().toISOString()
+  };
+  accountBenchmarkCache = { fetchedAt: Date.now(), data };
+  return data;
+}
+
+// Pulls the leads attributed to a single campaign + a stack of breakdowns:
+//   funnel        — flat counts (total/matched/hot/consulted/won/lost/pending)
+//   breakdowns    — { byIntent, byStage, byAd, byCity, byPlatform, intentByStage, timeline }
+//   accountBenchmark — for "vs account avg" deltas in the metrics banner
+//
+// All breakdowns are computed in-process from the same lead rows — no extra DB
+// hits except the cached benchmark + a cached getCampaignAds() call for ad names.
 export async function getCampaignLeads(campaignId) {
   const { data: metaLeads, error } = await supabaseAdmin
     .from('meta_leads')
-    .select('meta_lead_id, name, phone, email, city, created_time, ad_id, adgroup_id, matched_lead_id, matched_source')
+    .select('meta_lead_id, name, phone, email, city, created_time, ad_id, adgroup_id, matched_lead_id, matched_source, raw_payload')
     .eq('campaign_id', campaignId)
     .order('created_time', { ascending: false });
   if (error) throw new Error(error.message);
 
   if (!metaLeads || metaLeads.length === 0) {
-    return { leads: [], funnel: { total: 0, matched: 0, hot: 0, consulted: 0, won: 0, lost: 0, pending: 0 } };
+    return {
+      leads: [],
+      funnel: { total: 0, matched: 0, hot: 0, consulted: 0, won: 0, lost: 0, pending: 0 },
+      breakdowns: null,
+      accountBenchmark: await getAccountBenchmark()
+    };
   }
 
-  // Bulk-fetch the matched Refrens leads
+  // Bulk-fetch matched refrens + chatbot rows
   const refrensIds = metaLeads.filter(l => l.matched_source === 'refrens' && l.matched_lead_id).map(l => l.matched_lead_id);
-  const botIds = metaLeads.filter(l => l.matched_source === 'chatbot' && l.matched_lead_id).map(l => l.matched_lead_id);
+  const botIds     = metaLeads.filter(l => l.matched_source === 'chatbot' && l.matched_lead_id).map(l => l.matched_lead_id);
 
   let refrensMap = {};
   if (refrensIds.length > 0) {
     const { data } = await supabaseAdmin
       .from('refrens_leads')
-      .select('id, status, intent_band, assignee, last_internal_note, date_closed')
+      .select('id, status, intent_band, intent_score, assignee, last_internal_note, date_closed, lead_source, customer_city')
       .in('id', refrensIds);
     for (const r of (data || [])) refrensMap[r.id] = r;
   }
@@ -717,37 +785,133 @@ export async function getCampaignLeads(campaignId) {
   if (botIds.length > 0) {
     const { data } = await supabaseAdmin
       .from('leads_surgery')
-      .select('id, status, parameters_completed, contact_name, last_user_message')
+      .select('id, status, parameters_completed, intent_level, intent_score, contact_name, last_user_message')
       .in('id', botIds);
     for (const r of (data || [])) botMap[r.id] = r;
   }
 
+  // Resolve ad names via the cached Graph API call. Best-effort — if it fails
+  // (e.g. Meta API blip), the By-ad chart falls back to raw ad_ids.
+  let adNameById = {};
+  try {
+    const { ads } = await getCampaignAds(campaignId);
+    for (const a of (ads || [])) adNameById[a.id] = a.name;
+  } catch { /* non-fatal */ }
+
+  // Derive intent + stage per lead, then collect aggregations in one pass.
+  function intentOf(lead, refrens, bot) {
+    const band = refrens?.intent_band;
+    if (band === 'HOT' || /hot/i.test(band || '')) return 'HOT';
+    if (band === 'WARM' || /warm/i.test(band || '')) return 'WARM';
+    if (band === 'COLD' || /cold/i.test(band || '')) return 'COLD';
+    // Fallback to chatbot's derived intent
+    const lvl = (bot?.intent_level || '').toUpperCase();
+    if (lvl === 'HOT' || lvl === 'WARM' || lvl === 'COLD') return lvl;
+    return 'Unknown';
+  }
+  function stageOf(lead, refrens, bot) {
+    const status = refrens?.status || bot?.status || '';
+    if (/deal done|won|surgery done|surgery booked/i.test(status)) return 'done';
+    if (/booked|appointment|consultation booked/i.test(status))    return 'booked';
+    if (/consult|consulted|interested/i.test(status))              return 'consulted';
+    if (/contacted|in[- ]progress/i.test(status))                  return 'contacted';
+    if (/lost|dnp|not interested|not serviceable/i.test(status))   return 'lost';
+    if (lead.matched_lead_id)                                       return 'matched';
+    return 'captured';
+  }
+  function platformOf(lead) {
+    const rp = lead.raw_payload || {};
+    return rp.platform || rp.detail?.platform || 'unknown';
+  }
+  function cityOf(lead, refrens) {
+    return refrens?.customer_city || lead.city || 'Unknown';
+  }
+
+  const STAGES = ['captured','matched','contacted','consulted','booked','done','lost'];
+  const INTENTS = ['HOT','WARM','COLD','Unknown'];
+
+  const byIntent       = { HOT:{count:0,surgeries:0}, WARM:{count:0,surgeries:0}, COLD:{count:0,surgeries:0}, Unknown:{count:0,surgeries:0} };
+  const byStage        = { captured:0, matched:0, contacted:0, consulted:0, booked:0, done:0, lost:0 };
+  const byAdMap        = {};   // ad_id → { count, surgeries }
+  const byCityMap      = {};
+  const byPlatformMap  = {};
+  const intentByStage  = {};   // intent → { stage: count }
+  for (const i of INTENTS) { intentByStage[i] = {}; for (const s of STAGES) intentByStage[i][s] = 0; }
+  const timelineMap    = {};   // YYYY-MM-DD → count
+
   const leads = metaLeads.map(l => {
     const refrens = l.matched_source === 'refrens' ? refrensMap[l.matched_lead_id] : null;
-    const bot = l.matched_source === 'chatbot' ? botMap[l.matched_lead_id] : null;
-    const status = refrens?.status || bot?.status || (l.matched_source ? 'matched' : 'pending');
+    const bot     = l.matched_source === 'chatbot' ? botMap[l.matched_lead_id] : null;
+    const status  = refrens?.status || bot?.status || (l.matched_source ? 'matched' : 'pending');
+    const intent  = intentOf(l, refrens, bot);
+    const stage   = stageOf(l, refrens, bot);
+    const isWon   = stage === 'done';
+    const isLost  = stage === 'lost';
+    const isHot   = intent === 'HOT';
+    const platform = platformOf(l);
+    const city     = cityOf(l, refrens);
+
+    // Aggregations
+    byIntent[intent].count++;
+    if (isWon) byIntent[intent].surgeries++;
+    byStage[stage] = (byStage[stage] || 0) + 1;
+    if (l.ad_id) {
+      const k = l.ad_id;
+      const e = byAdMap[k] = byAdMap[k] || { ad_id: k, ad_name: adNameById[k] || k, count: 0, surgeries: 0 };
+      e.count++; if (isWon) e.surgeries++;
+    }
+    const ce = byCityMap[city] = byCityMap[city] || { city, count: 0, surgeries: 0 };
+    ce.count++; if (isWon) ce.surgeries++;
+    const pe = byPlatformMap[platform] = byPlatformMap[platform] || { platform, count: 0, surgeries: 0 };
+    pe.count++; if (isWon) pe.surgeries++;
+    intentByStage[intent][stage] = (intentByStage[intent][stage] || 0) + 1;
+    if (l.created_time) {
+      const d = String(l.created_time).slice(0, 10);
+      timelineMap[d] = (timelineMap[d] || 0) + 1;
+    }
+
     return {
       ...l,
       refrens,
       bot,
       status,
-      isWon: /deal done|won|surgery done|surgery booked/i.test(status),
-      isLost: /lost|dnp|not interested/i.test(status),
-      isHot: refrens?.intent_band === 'HOT' || /hot/i.test(refrens?.intent_band || '')
+      intent,
+      stage,
+      isWon, isLost, isHot
     };
   });
+
+  // Build the timeline array for the last 30 days, zero-filled
+  const timeline = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400 * 1000).toISOString().slice(0, 10);
+    timeline.push({ date: d, count: timelineMap[d] || 0 });
+  }
 
   const funnel = {
     total: leads.length,
     matched: leads.filter(l => l.matched_lead_id).length,
-    hot: leads.filter(l => l.isHot).length,
-    consulted: leads.filter(l => /consult|consulted|interested/i.test(l.refrens?.status || '')).length,
-    won: leads.filter(l => l.isWon).length,
-    lost: leads.filter(l => l.isLost).length,
+    hot: byIntent.HOT.count,
+    consulted: byStage.consulted || 0,
+    booked: byStage.booked || 0,
+    won: byStage.done || 0,
+    lost: byStage.lost || 0,
     pending: leads.filter(l => !l.matched_lead_id).length
   };
 
-  return { leads, funnel };
+  const breakdowns = {
+    byIntent,
+    byStage,
+    byAd:       Object.values(byAdMap).sort((a,b) => b.count - a.count).slice(0, 8),
+    byCity:     Object.values(byCityMap).sort((a,b) => b.count - a.count).slice(0, 8),
+    byPlatform: Object.values(byPlatformMap).sort((a,b) => b.count - a.count),
+    intentByStage,
+    timeline
+  };
+
+  const accountBenchmark = await getAccountBenchmark();
+
+  return { leads, funnel, breakdowns, accountBenchmark };
 }
 
 // ─── Single-campaign drill-down (used by GET /api/meta/campaign/:id) ─────────
