@@ -1162,10 +1162,20 @@ async function processLead(lead) {
     });
     console.log(`[CRM] Pre-click state:`, JSON.stringify(preClickDiag));
 
-    await Promise.all([
-      page.waitForNavigation({ timeout: 18000 }).catch(() => {}),
-      page.click(SEL.submit)
-    ]);
+    // Submit click: same root cause as the org option — page.click()'s real
+    // mouse event does NOT fire React's onClick in headless context. Use
+    // the DOM .click() method via page.evaluate (proven by MCP test: lead
+    // 6a11c9d982c97a0012c7c16c was created with this exact path).
+    const clickResult = await page.evaluate((sel) => {
+      const btn = document.querySelector(sel);
+      if (!btn) return { ok: false, reason: 'btn_not_found' };
+      if (btn.disabled) return { ok: false, reason: 'btn_disabled' };
+      btn.click();
+      return { ok: true };
+    }, SEL.submit);
+    console.log(`[CRM] Submit click via DOM:`, JSON.stringify(clickResult));
+    // Give it a beat then wait for navigation
+    await page.waitForNavigation({ timeout: 18000 }).catch(() => {});
 
     // After clicking, wait a beat — Refrens may run async client-side validation
     // (e.g. dedup check, phone format) before either showing an error or routing.
