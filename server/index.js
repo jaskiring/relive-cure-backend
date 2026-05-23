@@ -434,7 +434,7 @@ const KB = {
     SAFETY: { EN: '😊 LASIK is one of the *safest* eye procedures worldwide:\n\n• 98%+ success rate\n• No general anesthesia\n• Takes only 10–15 minutes\n• Full evaluation done before surgery', HI: '😊 LASIK दुनिया के *सबसे safe* procedures में से एक है:\n\n• 98%+ success rate\n• General anesthesia नहीं\n• सिर्फ 10–15 मिनट\n• Surgery से पहले पूरी evaluation' },
     TIMELINE: { EN: '📅 *LASIK at Relive Cure:*\n\n• Surgery: 10–15 mins (both eyes)\n• Same day discharge\n• Back to work next day\n• Driving: after 1–2 days', HI: '📅 *Relive Cure में LASIK:*\n\n• Surgery: 10–15 मिनट\n• Same day discharge\n• अगले दिन काम पर वापस\n• Driving: 1–2 दिन बाद' },
     REFERRAL: { EN: '🎁 Refer a friend → Earn *₹1,000* per surgery. No limit!\n\nOur team will share details when you book 😊', HI: '🎁 एक दोस्त refer करें → *₹1,000* कमाएँ। कोई limit नहीं!\n\nBooking पर team details देगी 😊' },
-    LOCATION: { EN: '📍 *Relive Cure:*\nUnitech Cyber Hub, Gurugram\n\n• Near Cyber Hub Metro\n• Free parking\n• Mon–Sat: 9 AM – 7 PM', HI: '📍 *Relive Cure:*\nUnitech Cyber Hub, Gurugram\n\n• Cyber Hub Metro के पास\n• Free parking\n• सोम–शनि: सुबह 9 – शाम 7' },
+    LOCATION: { EN: "I'll share the clinic details once we lock a slot for you 😊\n\nFirst — are you exploring LASIK, specs removal, or just checking options right now?", HI: "स्लॉट तय होने पर पूरी details शेयर कर दूँगी 😊\n\nपहले बताइए — LASIK करवाना है, चश्मा हटवाना है, या अभी सिर्फ options देख रहे हैं?" },
     ALTERNATIVES: { EN: '👓 LASIK vs Glasses:\n\n• LASIK → one-time cost, permanent freedom\n• Glasses → recurring cost, daily hassle\n• Sports / swimming → no glasses with LASIK ✅', HI: '👓 LASIK vs Chashma:\n\n• LASIK → एक बार का खर्च, हमेशा की आज़ादी\n• Chashma → बार-बार खर्च, रोज़ की परेशानी' },
     CONCERN: { EN: '😊 I hear you — blurry vision and being dependent on glasses is exactly what LASIK is designed to fix. Most patients become completely glasses-free after the procedure.\n\nOur specialist can check your eligibility properly — let me grab a couple of quick details first.', HI: '😊 मैं समझता हूँ — धुंधला दिखना और चश्मे पर निर्भर रहना, LASIK इसी के लिए बना है। ज़्यादातर patients procedure के बाद पूरी तरह चश्मा-मुक्त हो जाते हैं।\n\nSpecialist आपकी eligibility ठीक से check कर सकते हैं — पहले कुछ quick details ले लेता हूँ।' }
 };
@@ -675,8 +675,24 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         else if (state === 'NAME') {
             if (!isValidName(message)) {
-                if (session.repeat_count['NAME'] > 2) { session.data.contactName = 'WhatsApp Lead'; session.state = 'CORE_CONSULT'; setReply({ EN: 'No problem 😊\nAre you exploring LASIK, specs removal, or just checking options right now?', HI: 'कोई बात नहीं 😊\nक्या आप LASIK, specs removal, या सिर्फ options देख रहे हैं?' }[lang]); }
-                else { setReply(t('INVALID_NAME', lang)); }
+                // F7: If the user opened with their concern instead of a name
+                // (e.g. "Lasik", "surgery", "chashma hatana"), acknowledge it
+                // warmly and ask for the name again — don't sound robotic.
+                // Capture the stated intent so CORE_CONSULT doesn't re-ask.
+                if (isHighIntentFirst(msgLow) && (session.repeat_count['NAME'] || 0) <= 2) {
+                    session.data.stated_intent = msgLow;
+                    const ack = {
+                        EN: "I see you want to explore LASIK 👁️ — can I catch your name first so I can help you better?",
+                        HI: "समझ गया, आप LASIK करवाना चाहते हैं 👁️ — पहले आपका नाम बता दीजिए, फिर आगे बात करते हैं 😊"
+                    };
+                    setReply(ack[lang] || ack.EN);
+                    // Stay in NAME state — next message should be the name.
+                } else if ((session.repeat_count['NAME'] || 0) > 2) {
+                    session.data.contactName = 'WhatsApp Lead'; session.state = 'CORE_CONSULT';
+                    setReply({ EN: 'No problem 😊\nAre you exploring LASIK, specs removal, or just checking options right now?', HI: 'कोई बात नहीं 😊\nक्या आप LASIK, specs removal, या सिर्फ options देख रहे हैं?' }[lang]);
+                } else {
+                    setReply(t('INVALID_NAME', lang));
+                }
             } else {
                 if (message && message !== 'WhatsApp Lead' && (!session.data.contactName || session.data.contactName === 'WhatsApp Lead')) session.data.contactName = message;
                 const fn = (session.data.contactName || message).split(' ')[0];

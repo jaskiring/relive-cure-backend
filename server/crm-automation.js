@@ -146,6 +146,56 @@ async function fillField(page, selector, value) {
   }
 }
 
+// ── F4: Set a React-controlled input via React's onChange handler ──────────────
+// Refrens's form uses controlled inputs. Native `el.value = X` + dispatchEvent
+// updates the DOM but NOT React's internal state, so submit reads contact.name
+// as "" even though the visible value is filled. This walks the React fiber
+// tree, finds the onChange handler, and calls it directly with a synthetic
+// event so React's state is actually updated.
+async function setReactInputValue(page, selector, value) {
+  try {
+    await page.waitForSelector(selector, { timeout: 3000 });
+    const result = await page.evaluate((sel, val) => {
+      const el = document.querySelector(sel);
+      if (!el) return { ok: false, reason: 'not_found' };
+      el.focus();
+      // 1. Native setter — triggers React's input event listener
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(el, val);
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      // 2. Defensive — walk fiber tree, call onChange directly
+      const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps') || k.startsWith('__reactEventHandlers'));
+      if (propsKey) {
+        const handler = el[propsKey]?.onChange;
+        if (typeof handler === 'function') {
+          try { handler({ target: el, currentTarget: el, type: 'change' }); } catch(_) {}
+        }
+      }
+      // 3. Walk fiber upward in case onChange is on a parent
+      const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+      if (fiberKey) {
+        let fiber = el[fiberKey];
+        for (let i = 0; i < 8 && fiber; i++) {
+          const onChange = fiber.memoizedProps?.onChange;
+          if (typeof onChange === 'function' && fiber.stateNode !== el) {
+            try { onChange({ target: el, currentTarget: el, type: 'change' }); } catch(_) {}
+            break;
+          }
+          fiber = fiber.return;
+        }
+      }
+      return { ok: true, value: el.value };
+    }, selector, String(value));
+    if (!result.ok) console.warn(`[CRM] setReactInputValue ${selector} failed: ${result.reason}`);
+    return result.ok;
+  } catch (e) {
+    console.warn(`[CRM] setReactInputValue ${selector} error: ${e.message}`);
+    return false;
+  }
+}
+
 async function fillCustomField(page, labelText, value) {
   if (!value && value !== 0) return false;
   try {
@@ -780,7 +830,18 @@ async function processLead(lead) {
         if (pickedNow) return { picked: pickedNow, reason: `search:${term}` };
       }
 
-      // Last resort: click first available option with real mouse events
+      // ── Last resort per user instruction ──────────────────────────────────
+      // "try relive cure first if can't find it then add any other after
+      //  removing everything from the field, find anything else in the
+      //  dropdown and add that"
+      // → Clear the input fully so the dropdown shows the FULL prospect list
+      //   (currently it's filtered to "relive" which returned 0 in the search
+      //   loop). Then pick the first prospect that appears.
+      await inpEl.focus();
+      await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+      await page.keyboard.press('Backspace');
+      await new Promise(r => setTimeout(r, 700));   // wait for unfiltered list
+
       const firstOptRect = await page.evaluate(() => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option'));
         if (opts.length === 0) return null;
@@ -789,8 +850,8 @@ async function processLead(lead) {
       });
       if (firstOptRect) {
         await page.mouse.click(firstOptRect.x, firstOptRect.y);
-        console.log(`[ORG] fell back to first available option: "${firstOptRect.text}"`);
-        return { picked: firstOptRect.text, reason: 'first_available' };
+        console.warn(`[ORG] ⚠️ "Relive cure" not matched in any search — fell back to first prospect: "${firstOptRect.text}". Investigate why Refrens isn't returning it.`);
+        return { picked: firstOptRect.text, reason: 'first_available_after_clear' };
       }
 
       await page.keyboard.press('Escape').catch(() => {});
@@ -830,15 +891,34 @@ async function processLead(lead) {
 
     const t_fill = Date.now();
 
-    // ── 4. Stage (disco-select[3]) — set via React fiber ─────────────────────
-    // The stage dropdown options don't render in headless DOM but ARE in React state.
-    // We bypass the DOM and call the React Select onChange handler directly.
+    // ── 4. Stage — find dropdown by LABEL (not positional index) ─────────────
+    // The form was reordered (May 2026); index 3 is no longer guaranteed to be
+    // the Stage dropdown. Find it by its "Select Stage" label.
     const stageLabel = getStage(lead.intent_level);
     const stageId    = STAGE_ID_MAP[stageLabel] || STAGE_ID_MAP['Open'];
-    const stageSet   = await setDiscoSelectByIndex(page, 3, stageId, stageLabel);
-    if (!stageSet) {
-      // Fallback: leave as default "Open" — do NOT throw, just warn
-      console.warn('[CRM] Stage fiber set failed — leaving default "Open"');
+    const stageIdx = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('.disco-select__control'));
+      for (let i = 0; i < all.length; i++) {
+        let cur = all[i];
+        for (let d = 0; d < 6 && cur; d++) {
+          cur = cur.parentElement;
+          if (!cur) break;
+          const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+          if (lbl && /select\s*stage|^stage\s*$|^stage\s*\*/i.test(lbl.innerText || lbl.textContent || '')) {
+            return i;
+          }
+        }
+      }
+      return -1;
+    });
+    console.log(`[CRM] Stage dropdown found at index ${stageIdx}`);
+    if (stageIdx >= 0) {
+      const stageSet = await setDiscoSelectByIndex(page, stageIdx, stageId, stageLabel);
+      if (!stageSet) {
+        console.warn('[CRM] Stage fiber set failed — leaving default "Open"');
+      }
+    } else {
+      console.warn('[CRM] Stage dropdown not found by label — leaving default "Open"');
     }
     await new Promise(r => setTimeout(r, 300));
 
@@ -899,9 +979,16 @@ async function processLead(lead) {
     }
 
     // ── 6. Fill contact text fields ──────────────────────────────────────────
-    await fillField(page, SEL.contactName, realName);
-    await fillField(page, SEL.contactPhone, cleanPhone);
-    await fillField(page, SEL.customerCity, lead.city || 'Delhi');
+    // F4: Use React-aware setter — native value + dispatchEvent isn't enough
+    // for Refrens's controlled inputs; React reads its own state on submit.
+    const nameSet  = await setReactInputValue(page, SEL.contactName, realName);
+    const phoneSet = await setReactInputValue(page, SEL.contactPhone, cleanPhone);
+    const citySet  = await setReactInputValue(page, SEL.customerCity, lead.city || 'Delhi');
+    console.log(`[CRM] React-aware fill: name=${nameSet} phone=${phoneSet} city=${citySet}`);
+    // Fallback if the React-aware setter failed (unknown form variant)
+    if (!nameSet)  await fillField(page, SEL.contactName, realName);
+    if (!phoneSet) await fillField(page, SEL.contactPhone, cleanPhone);
+    if (!citySet)  await fillField(page, SEL.customerCity, lead.city || 'Delhi');
 
     // ── 7. Lead Subject ───────────────────────────────────────────────────────
     // IMPORTANT: subject is REQUIRED by Refrens. On Railway (no saved session),
@@ -1039,13 +1126,13 @@ async function processLead(lead) {
     let postUrl = page.url();
     let urlChanged = !postUrl.endsWith('/new') && !postUrl.endsWith('/new/');
 
-    // Second-chance: some Refrens deploys finish async, so give it one more
-    // 4-second window before giving up.
+    // Second-chance: Refrens may finish the lead-create async (network roundtrip
+    // to backend before the redirect). Wait up to 8s for the URL to change.
     if (!urlChanged) {
       try {
         await page.waitForFunction(
           () => !location.href.endsWith('/new') && !location.href.endsWith('/new/'),
-          { timeout: 4000 }
+          { timeout: 8000 }
         );
         postUrl = page.url();
         urlChanged = !postUrl.endsWith('/new') && !postUrl.endsWith('/new/');
@@ -1076,14 +1163,42 @@ async function processLead(lead) {
           visibleErrs.push(t);
           if (visibleErrs.length >= 10) break;
         }
+        // F1: tighter "required" detection. The old body-wide /required/i scan
+        // matched field-label helper text on EVERY page load (false positive).
+        // Now we only flag `required` when an INLINE validation element shows
+        // the word — i.e. an actual validation message after failed submit.
+        const inlineValidationEls = Array.from(document.querySelectorAll(
+          '.form-error,.invalid-feedback,[class*="error-msg"],[class*="errorText"],[class*="error-message"],.disco-select__control--is-invalid,[class*="field-error"],[role="alert"],[class*="ant-form-item-explain-error"]'
+        )).filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        const inlineText = inlineValidationEls.map(el => (el.innerText || '').trim()).join(' | ');
+        // Which specific fields are flagged invalid?
+        const invalidFields = [];
+        document.querySelectorAll('.disco-select__control--is-invalid,input.is-invalid,input[aria-invalid="true"]').forEach(el => {
+          let cur = el;
+          for (let d = 0; d < 6 && cur; d++) {
+            cur = cur.parentElement;
+            if (!cur) break;
+            const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+            if (lbl) {
+              const t = (lbl.innerText || '').trim();
+              if (t) { invalidFields.push(t.slice(0, 60)); break; }
+            }
+          }
+        });
         return {
           errs,
           visibleErrs,
+          inlineText: inlineText.slice(0, 400),
+          invalidFields: [...new Set(invalidFields)].slice(0, 8),
           bodyHas: {
-            required: /required/i.test(document.body.innerText),
-            invalid:  /invalid/i.test(document.body.innerText),
-            duplicate:/already exist|duplicate/i.test(document.body.innerText),
-            phone:    /phone|mobile/i.test(document.body.innerText) && /invalid|incorrect|format/i.test(document.body.innerText)
+            // ONLY true if an inline validation element actually said it
+            required: /required|cannot be empty|please (?:fill|enter|select)/i.test(inlineText),
+            invalid:  /invalid|incorrect format/i.test(inlineText),
+            duplicate:/already exist|duplicate/i.test(inlineText) || /already exist|duplicate/i.test(document.body.innerText),
+            phone:    /phone|mobile/i.test(inlineText) && /invalid|incorrect|format/i.test(inlineText)
           },
           url: location.href
         };
@@ -1104,7 +1219,8 @@ async function processLead(lead) {
         throw new Error(`Refrens rejected: phone format invalid (phone="${preSubmitCheck.phone}")${surfaced ? ' — ' + surfaced : ''}`);
       }
       if (diag.bodyHas.required) {
-        throw new Error(`Refrens rejected: required field missing${surfaced ? ' — ' + surfaced : ''}`);
+        const fieldsList = (diag.invalidFields || []).join(', ');
+        throw new Error(`Refrens rejected: required field missing${fieldsList ? ' (' + fieldsList + ')' : ''}${surfaced ? ' — ' + surfaced : ''}`);
       }
       if (surfaced) {
         throw new Error(`Refrens rejected submit: ${surfaced}`);
