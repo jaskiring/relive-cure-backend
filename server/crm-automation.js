@@ -340,14 +340,101 @@ async function processLead(lead) {
     await new Promise(r => setTimeout(r, 1500)); // let React hydrate
 
     // ── 3. Prospect Organisation (REQUIRED by Refrens) ──────────────────────────
-    // On Railway (fresh browser) the org dropdown is an async search.
-    // Must type directly INTO the dropdown's own <input> — page.keyboard.type()
-    // won't work because headless Chrome loses focus after clicking the control.
+    // On Railway (fresh browser session) the org dropdown is async-search:
+    // clicking it sometimes returns 0 options until a character is typed to
+    // trigger the search. Production logs proved this — May 23 run got
+    // `options available (0)` and submit failed with required-field error.
+    //
+    // Resilient flow:
+    //   1) read current value; if non-empty, skip
+    //   2) click to open
+    //   3) try options() — if >=1 option, pick it
+    //   4) if 0 options, type "rel" into the dropdown's own input to trigger
+    //      async search, wait up to 4s for options to appear, pick first
+    //   5) if still 0, type "a" (broadest match), wait, pick first
+    //   6) if STILL nothing, escape and continue (the assert below will throw
+    //      a precise error so the dashboard knows what to retry)
+    async function tryOpenAndPick(controlIdx, label) {
+      const control = await page.evaluateHandle((idx) => {
+        const all = Array.from(document.querySelectorAll('.disco-select__control'));
+        return all[idx] || null;
+      }, controlIdx);
+      const el = control.asElement();
+      if (!el) return { picked: null, optionsCount: 0 };
+
+      // Open
+      await el.click();
+      await new Promise(r => setTimeout(r, 600));
+
+      // First attempt — options may already be there
+      let opts = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+      );
+
+      // If empty, type "rel" into the actual input to trigger async search
+      if (opts.length === 0) {
+        const inputHandle = await page.evaluateHandle((idx) => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          return all[idx]?.querySelector('input') || null;
+        }, controlIdx);
+        const inp = inputHandle.asElement();
+        if (inp) {
+          await inp.focus();
+          await inp.type('rel', { delay: 80 });
+          // Wait for async options
+          try {
+            await page.waitForFunction(
+              () => document.querySelectorAll('.disco-select__option').length > 0,
+              { timeout: 4000 }
+            );
+          } catch(_) {}
+          opts = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+          );
+        }
+      }
+
+      // If still empty, try a broader char
+      if (opts.length === 0) {
+        const inputHandle = await page.evaluateHandle((idx) => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          return all[idx]?.querySelector('input') || null;
+        }, controlIdx);
+        const inp = inputHandle.asElement();
+        if (inp) {
+          // Clear and try "a" (matches almost any org/name)
+          await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+          await page.keyboard.press('Backspace');
+          await inp.type('a', { delay: 80 });
+          try {
+            await page.waitForFunction(
+              () => document.querySelectorAll('.disco-select__option').length > 0,
+              { timeout: 4000 }
+            );
+          } catch(_) {}
+          opts = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+          );
+        }
+      }
+
+      console.log(`[${label}] options available (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
+
+      const picked = await page.evaluate(() => {
+        const options = Array.from(document.querySelectorAll('.disco-select__option'));
+        const match = options.find(o => o.innerText.toLowerCase().includes('relive')) || options[0];
+        if (match) { match.click(); return match.innerText.trim(); }
+        return null;
+      });
+      if (!picked) await page.keyboard.press('Escape');
+      await new Promise(r => setTimeout(r, 400));
+      return { picked, optionsCount: opts.length };
+    }
+
     try {
       const controls = await page.$$('.disco-select__control');
       console.log(`[ORG] ${controls.length} disco-select controls`);
 
-      // Step A: check if already selected (saved-session path)
       const alreadySelected = await page.evaluate(() => {
         const controls = Array.from(document.querySelectorAll('.disco-select__control'));
         return controls.length >= 2
@@ -356,27 +443,31 @@ async function processLead(lead) {
       });
       console.log(`[ORG] current value: "${alreadySelected}"`);
 
-      if (!alreadySelected) {
-        // Step B: click to open the dropdown — options appear immediately on click
-        if (controls.length >= 2) await controls[1].click();
-        await new Promise(r => setTimeout(r, 1000)); // wait for options to render
+      if (!alreadySelected && controls.length >= 2) {
+        const r = await tryOpenAndPick(1, 'ORG');
+        console.log(`[ORG] clicked: "${r.picked}"`);
 
-        // Step C: pick the first available option (no typing/search needed)
-        const opts = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
-        );
-        console.log(`[ORG] options available (${opts.length}): ${opts.slice(0, 5).join(' | ')}`);
-
-        const clicked = await page.evaluate(() => {
-          const options = Array.from(document.querySelectorAll('.disco-select__option'));
-          // Prefer "Relive" match, otherwise just take whatever first option is there
-          const match = options.find(o => o.innerText.toLowerCase().includes('relive')) || options[0];
-          if (match) { match.click(); return match.innerText.trim(); }
-          return null;
-        });
-        console.log(`[ORG] clicked: "${clicked}"`);
-        if (!clicked) await page.keyboard.press('Escape');
-        await new Promise(r => setTimeout(r, 500));
+        // Fallback: if index-1 truly has no options, scan EVERY empty disco-select
+        // and try the same flow — Refrens may have reordered the form.
+        if (!r.picked) {
+          console.warn('[ORG] index-1 dropdown empty after typing — scanning all controls');
+          const emptyIdxs = await page.evaluate(() => {
+            const ctrls = Array.from(document.querySelectorAll('.disco-select__control'));
+            const out = [];
+            ctrls.forEach((c, i) => {
+              const v = c.querySelector('.disco-select__single-value')?.innerText?.trim() || '';
+              if (!v) out.push(i);
+            });
+            return out;
+          });
+          console.log(`[ORG] empty dropdown indexes: ${JSON.stringify(emptyIdxs)}`);
+          for (const idx of emptyIdxs) {
+            if (idx === 1 || idx === 3) continue; // 1 already tried, 3 is stage (handled below)
+            const r2 = await tryOpenAndPick(idx, `ORG-FALLBACK[${idx}]`);
+            console.log(`[ORG-FALLBACK[${idx}]] clicked: "${r2.picked}"`);
+            if (r2.picked) break;
+          }
+        }
       }
     } catch (e) {
       console.warn(`[ORG] error: ${e.message}`);
@@ -611,15 +702,23 @@ async function processLead(lead) {
       const diag = await page.evaluate(() => {
         const errs = (window.__crm_errs__ || []).slice(-8);
         // Look for visible error/toast/alert spans on the page right now
+        // Tight filter — skip breadcrumbs / URLs / nav elements that happen to
+        // match a class containing "error" (e.g. "errorBoundary" wrappers).
         const visibleErrs = [];
         const candidates = document.querySelectorAll(
-          '[class*="error"],[class*="Error"],[class*="invalid"],[class*="toast"],[class*="alert"],[role="alert"],[class*="helper-text"]'
+          '[class*="error"],[class*="Error"],[class*="invalid"],[class*="toast"],[class*="alert"],[role="alert"],[class*="helper-text"],[class*="ant-form-item-explain"]'
         );
         for (const el of candidates) {
           const r = el.getBoundingClientRect();
           if (r.width === 0 || r.height === 0) continue;
+          // Skip the breadcrumb / nav / link-shaped text — only keep real validation messages
+          if (el.closest('nav,header,a,[role="navigation"],[class*="breadcrumb"]')) continue;
           const t = (el.innerText || el.textContent || '').trim();
-          if (t && t.length < 200 && !/^\s*$/.test(t)) visibleErrs.push(t);
+          if (!t || t.length > 200 || /^\s*$/.test(t)) continue;
+          if (/^\/?[a-z0-9_-]+\//i.test(t)) continue;        // looks like a URL path
+          if (/^https?:\/\//i.test(t)) continue;             // is a URL
+          if (t.length < 4) continue;                        // too short to be useful
+          visibleErrs.push(t);
           if (visibleErrs.length >= 10) break;
         }
         return {
