@@ -1068,6 +1068,52 @@ app.post('/api/meta/backfill-links', async (req, res) => {
     }
 });
 
+// GET /api/meta/debug/page/:pageId — diagnostic: does the token have page-level leads access?
+// Checks three things: (a) token permissions (b) listing the page's lead forms (c) reading the
+// page itself. If (b) errors with code 100, the token needs leads_retrieval scope; if (a) errors,
+// the token doesn't have access to the page at all.
+app.get('/api/meta/debug/page/:pageId', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { loadCredentials } = await import('./meta-marketing.js');
+        const creds = await loadCredentials();
+        if (!creds) return res.status(400).json({ success: false, error: 'No META credentials' });
+        const { pageId } = req.params;
+
+        // 1) Token permissions
+        const permsUrl = new URL(`https://graph.facebook.com/v21.0/me/permissions`);
+        permsUrl.searchParams.set('access_token', creds.token);
+        const perms = await (await fetch(permsUrl.toString())).json();
+
+        // 2) Page metadata
+        const pageUrl = new URL(`https://graph.facebook.com/v21.0/${pageId}`);
+        pageUrl.searchParams.set('fields', 'id,name,access_token,tasks');
+        pageUrl.searchParams.set('access_token', creds.token);
+        const page = await (await fetch(pageUrl.toString())).json();
+
+        // 3) List forms on the page
+        const formsUrl = new URL(`https://graph.facebook.com/v21.0/${pageId}/leadgen_forms`);
+        formsUrl.searchParams.set('fields', 'id,name,status,leads_count');
+        formsUrl.searchParams.set('limit', '5');
+        formsUrl.searchParams.set('access_token', creds.token);
+        const forms = await (await fetch(formsUrl.toString())).json();
+
+        // 4) Try using the page access token (if returned) to read forms
+        let formsViaPageToken = null;
+        if (page.access_token) {
+            const f2 = new URL(`https://graph.facebook.com/v21.0/${pageId}/leadgen_forms`);
+            f2.searchParams.set('fields', 'id,name,leads_count');
+            f2.searchParams.set('limit', '5');
+            f2.searchParams.set('access_token', page.access_token);
+            formsViaPageToken = await (await fetch(f2.toString())).json();
+        }
+
+        return res.json({ success: true, perms, page, forms, formsViaPageToken });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // POST /api/meta/import-leads — retroactively pull historical Lead Ad submissions
 // from the Meta Graph API and store them in meta_leads.
 // Body (all optional):
