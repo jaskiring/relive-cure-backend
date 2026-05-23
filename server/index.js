@@ -1068,6 +1068,27 @@ app.post('/api/meta/backfill-links', async (req, res) => {
     }
 });
 
+// GET /api/meta/debug/campaign/:id/ads — diagnostic: raw ad payload (creative spec)
+// Used to figure out where lead_gen_form_id is nested for this account's ad
+// creatives. Auth-gated; not for end users.
+app.get('/api/meta/debug/campaign/:id/ads', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { loadCredentials } = await import('./meta-marketing.js');
+        const creds = await loadCredentials();
+        if (!creds) return res.status(400).json({ success: false, error: 'No META credentials' });
+        const url = new URL(`https://graph.facebook.com/v21.0/${req.params.id}/ads`);
+        url.searchParams.set('fields', 'id,name,status,effective_status,campaign_id,adset_id,creative');
+        url.searchParams.set('limit', '5');
+        url.searchParams.set('access_token', creds.token);
+        const r = await fetch(url.toString());
+        const j = await r.json();
+        return res.json({ success: true, raw: j });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // POST /api/meta/import-leads — retroactively pull historical Lead Ad submissions
 // from the Meta Graph API and store them in meta_leads.
 // Body (all optional):
