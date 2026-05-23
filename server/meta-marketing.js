@@ -537,6 +537,7 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   // Step 2 — pull leads from each form
   let totalImported = 0;
   let totalLinked = 0;
+  const formErrors = {};
 
   for (const formId of formIds) {
     const cid = formMap[formId];
@@ -556,6 +557,7 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
       let data;
       try { data = await graphGet(`${formId}/leads`, params, token); }
       catch (e) {
+        formErrors[formId] = e.message;
         console.warn(`[META] importHistoricalLeads form ${formId} page ${page}: ${e.message}`);
         break;
       }
@@ -620,13 +622,18 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
     }
   }
 
+  const formErrorList = Object.entries(formErrors);
   console.log(`[META] ✅ Historical import done: ${totalImported} leads from ${formIds.length} forms${pageFallbackUsed ? ' (page fallback)' : ''}, ${totalLinked} matched in CRM`);
+  if (formErrorList.length > 0) {
+    console.warn(`[META] Form errors: ${JSON.stringify(formErrors)}`);
+  }
   return {
     imported: totalImported,
     linked: totalLinked,
     forms: formIds.length,
     adsScanned,
-    pageFallbackUsed
+    pageFallbackUsed,
+    ...(formErrorList.length > 0 ? { formErrors } : {})
   };
 }
 
