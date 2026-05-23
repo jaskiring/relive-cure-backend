@@ -552,21 +552,110 @@ async function processLead(lead) {
       await page.screenshot({ path: `/tmp/crm-presubmit-${lead.id}.png`, fullPage: false });
     } catch(_) {}
 
+    // Hook into client-side toast/error layers BEFORE clicking submit so we
+    // capture the first error/toast Refrens emits (some are transient and
+    // disappear within ~2s, which is why the previous post-click scan saw
+    // a clean page and threw the generic "URL did not change" error).
+    await page.evaluate(() => {
+      window.__crm_errs__ = [];
+      // Capture any text node added to the DOM that looks like an error/toast.
+      const obs = new MutationObserver(muts => {
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (!n || n.nodeType !== 1) continue;
+            const t = (n.innerText || n.textContent || '').trim();
+            if (!t || t.length > 300) continue;
+            if (/required|invalid|already exist|duplicate|please|error|cannot|must be|enter a valid|incorrect/i.test(t)) {
+              window.__crm_errs__.push(t.slice(0, 200));
+            }
+          }
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+      // Also tee console.error
+      const origErr = console.error;
+      console.error = function(...args) {
+        try { window.__crm_errs__.push('[console.error] ' + args.map(a => String(a)).join(' ').slice(0, 200)); } catch(_) {}
+        return origErr.apply(this, args);
+      };
+    });
+
     await Promise.all([
-      page.waitForNavigation({ timeout: 12000 }).catch(() => {}),
+      page.waitForNavigation({ timeout: 18000 }).catch(() => {}),
       page.click(SEL.submit)
     ]);
 
+    // After clicking, wait a beat — Refrens may run async client-side validation
+    // (e.g. dedup check, phone format) before either showing an error or routing.
+    await new Promise(r => setTimeout(r, 1500));
+
     // ── 11. Validate success (URL should change from /new) ────────────────────
-    const postUrl = page.url();
-    const urlChanged = !postUrl.endsWith('/new') && !postUrl.endsWith('/new/');
+    let postUrl = page.url();
+    let urlChanged = !postUrl.endsWith('/new') && !postUrl.endsWith('/new/');
+
+    // Second-chance: some Refrens deploys finish async, so give it one more
+    // 4-second window before giving up.
+    if (!urlChanged) {
+      try {
+        await page.waitForFunction(
+          () => !location.href.endsWith('/new') && !location.href.endsWith('/new/'),
+          { timeout: 4000 }
+        );
+        postUrl = page.url();
+        urlChanged = !postUrl.endsWith('/new') && !postUrl.endsWith('/new/');
+      } catch(_) {}
+    }
 
     if (!urlChanged) {
-      const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
-      if (bodyText.includes('required field') || bodyText.includes('invalid')) {
-        throw new Error('Form validation error on submit');
+      // Pull the captured client-side errors + a broader body scan.
+      const diag = await page.evaluate(() => {
+        const errs = (window.__crm_errs__ || []).slice(-8);
+        // Look for visible error/toast/alert spans on the page right now
+        const visibleErrs = [];
+        const candidates = document.querySelectorAll(
+          '[class*="error"],[class*="Error"],[class*="invalid"],[class*="toast"],[class*="alert"],[role="alert"],[class*="helper-text"]'
+        );
+        for (const el of candidates) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const t = (el.innerText || el.textContent || '').trim();
+          if (t && t.length < 200 && !/^\s*$/.test(t)) visibleErrs.push(t);
+          if (visibleErrs.length >= 10) break;
+        }
+        return {
+          errs,
+          visibleErrs,
+          bodyHas: {
+            required: /required/i.test(document.body.innerText),
+            invalid:  /invalid/i.test(document.body.innerText),
+            duplicate:/already exist|duplicate/i.test(document.body.innerText),
+            phone:    /phone|mobile/i.test(document.body.innerText) && /invalid|incorrect|format/i.test(document.body.innerText)
+          },
+          url: location.href
+        };
+      });
+
+      console.error(`[CRM] Submit failed — diagnostic:`, JSON.stringify(diag));
+      try {
+        await page.screenshot({ path: `/tmp/crm-submit-fail-${lead.id}.png`, fullPage: true });
+      } catch(_) {}
+
+      // Build a precise error message so the queue's retry logic + the dashboard
+      // know whether this is a transient issue worth retrying or a hard reject.
+      const surfaced = [...(diag.visibleErrs || []), ...(diag.errs || [])].slice(0, 3).join(' | ').slice(0, 300);
+      if (diag.bodyHas.duplicate) {
+        throw new Error(`Refrens rejected: duplicate lead${surfaced ? ' — ' + surfaced : ''}`);
       }
-      throw new Error('Submit clicked but URL did not change — form may have validation errors');
+      if (diag.bodyHas.phone) {
+        throw new Error(`Refrens rejected: phone format invalid (phone="${preSubmitCheck.phone}")${surfaced ? ' — ' + surfaced : ''}`);
+      }
+      if (diag.bodyHas.required) {
+        throw new Error(`Refrens rejected: required field missing${surfaced ? ' — ' + surfaced : ''}`);
+      }
+      if (surfaced) {
+        throw new Error(`Refrens rejected submit: ${surfaced}`);
+      }
+      throw new Error('Submit clicked but URL did not change — no visible error captured. Likely Refrens changed validation rules silently. See /tmp/crm-submit-fail-' + lead.id + '.png on Railway.');
     }
 
     const t_done = Date.now();
