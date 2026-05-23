@@ -464,17 +464,25 @@ export async function importHistoricalLeads({ campaignId, since } = {}) {
   for (let page = 0; page < 30; page++) {
     const params = {
       // Request all known nesting paths in one shot. Graph silently drops
-      // fields that don't exist on a given creative type.
-      fields: [
-        'id', 'campaign_id',
-        'creative{',
-          'id,name,',
-          'lead_gen_form_id,',
-          'effective_object_story_id,',
-          'object_story_spec{page_id,link_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}},video_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}}},',
-          'asset_feed_spec{call_to_action_types,call_to_actions{type,value{lead_gen_form_id}}}',
-        '}'
-      ].join(''),
+      // fields that don't exist on a given creative type. NOTE: this is a
+      // single comma-joined string — earlier I had it broken across an array
+      // join('') without commas, which produced "idcampaign_idcreative{...}"
+      // and Meta silently kept only "id".
+      fields:
+        'id,campaign_id,status,effective_status,' +
+        'creative{' +
+          'id,name,' +
+          'lead_gen_form_id,' +
+          'effective_object_story_id,' +
+          'object_story_spec{' +
+            'page_id,' +
+            'link_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}},' +
+            'video_data{lead_gen_form_id,call_to_action{type,value{lead_gen_form_id}}}' +
+          '},' +
+          'asset_feed_spec{call_to_action_types,call_to_actions{type,value{lead_gen_form_id}}}' +
+        '}',
+      // Include ARCHIVED + PAUSED ads so we still find form ids for past leads.
+      effective_status: JSON.stringify(['ACTIVE','PAUSED','ARCHIVED','IN_PROCESS','WITH_ISSUES','PREAPPROVED','PENDING_REVIEW']),
       limit: 200
     };
     if (after) params.after = after;
