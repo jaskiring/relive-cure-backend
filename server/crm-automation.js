@@ -1124,8 +1124,10 @@ async function processLead(lead) {
     const netListener = (resp) => {
       try {
         const u = resp.url();
-        if (u.includes('refrens.com') && (u.includes('lead') || u.includes('graphql') || u.includes('api') || u.includes('save'))) {
-          submitNetCalls.push({ url: u.slice(0, 200), status: resp.status(), method: resp.request().method() });
+        const method = resp.request().method();
+        // Capture every refrens.com POST/PUT — submit might use any endpoint name
+        if (u.includes('refrens.com') && method !== 'GET' && method !== 'OPTIONS') {
+          submitNetCalls.push({ url: u.slice(0, 200), status: resp.status(), method });
         }
       } catch(_) {}
     };
@@ -1281,8 +1283,9 @@ async function processLead(lead) {
         url: diag.url,
         inv: diag.invalidFields,
         net: (diag.networkCalls || []).map(n => `${n.method} ${n.status} ${n.url.slice(-60)}`),
+        pre: preClickDiag,
       };
-      throw new Error('Submit clicked but URL did not change — no visible error captured. Diag: ' + JSON.stringify(compactDiag).slice(0, 600));
+      throw new Error('Submit clicked but URL did not change. Diag: ' + JSON.stringify(compactDiag).slice(0, 1200));
     }
 
     const t_done = Date.now();
