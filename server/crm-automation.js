@@ -733,10 +733,16 @@ async function processLead(lead) {
       const inpEl = inpHandle.asElement();
       if (!inpEl) return { picked: null, reason: 'no_input' };
 
-      // Scroll the control into view, then focus the input
+      // Scroll the control into view, then open menu with a real mouse click.
+      // inpEl.focus() does NOT open the React-Select menu — only mousedown does.
+      // Without the menu open, loadOptions never fires and the API is never called.
       await ctrl.evaluate(c => c.scrollIntoView({ behavior: 'instant', block: 'center' }));
       await new Promise(r => setTimeout(r, 200));
-      await inpEl.focus();
+      const ctrlRect = await ctrl.evaluate(c => {
+        const r = c.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+      await page.mouse.click(ctrlRect.x, ctrlRect.y);
       await new Promise(r => setTimeout(r, 600));
 
       // Check if options loaded on focus alone (Refrens sometimes loads all)
