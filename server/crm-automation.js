@@ -442,6 +442,55 @@ export async function dumpCrmNewLeadForm() {
     // Let React hydrate
     await new Promise(r => setTimeout(r, 4000));
 
+    // (4) Probe disco-select[1] (Prospect Organisation) with the same
+    //     type-to-search flow processLead uses, so we know whether the
+    //     production push will succeed.
+    const orgProbe = await (async () => {
+      const probe = { steps: [] };
+      try {
+        // Click control[1] open
+        await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll('.disco-select__control'));
+          all[1]?.click();
+        });
+        await new Promise(r => setTimeout(r, 700));
+        let opts1 = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+        );
+        probe.steps.push({ step: 'open_only', options: opts1.length, sample: opts1.slice(0, 4) });
+
+        if (opts1.length === 0) {
+          // Type "rel" into the dropdown's input
+          const inp = await page.evaluateHandle(() => {
+            const all = Array.from(document.querySelectorAll('.disco-select__control'));
+            return all[1]?.querySelector('input') || null;
+          });
+          const inpEl = inp.asElement();
+          if (inpEl) {
+            await inpEl.focus();
+            await inpEl.type('rel', { delay: 80 });
+            try {
+              await page.waitForFunction(
+                () => document.querySelectorAll('.disco-select__option').length > 0,
+                { timeout: 4000 }
+              );
+            } catch(_) {}
+            const opts2 = await page.evaluate(() =>
+              Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
+            );
+            probe.steps.push({ step: 'typed_rel', options: opts2.length, sample: opts2.slice(0, 4) });
+          } else {
+            probe.steps.push({ step: 'typed_rel', error: 'no input handle' });
+          }
+        }
+      } catch (e) {
+        probe.error = e.message;
+      }
+      // Escape so we don't leave the dropdown open in case caller continues
+      await page.keyboard.press('Escape').catch(() => {});
+      return probe;
+    })();
+
     const dump = await page.evaluate(() => {
       const txt = el => (el?.innerText || el?.textContent || '').trim().slice(0, 80);
       // Every disco-select control with index, current value, and its closest label
@@ -530,7 +579,7 @@ export async function dumpCrmNewLeadForm() {
       };
     });
 
-    return dump;
+    return { ...dump, orgProbe };
   } finally {
     await context.close();
   }
