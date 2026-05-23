@@ -458,94 +458,75 @@ export async function dumpCrmNewLeadForm() {
     const orgProbe = await (async () => {
       const probe = { steps: [] };
       try {
-        // Step 1 — inspect disco-select[1] DOM before any click
-        probe.steps.push(await page.evaluate(() => {
+        // Find Prospect Organisation by label (the production code does the same)
+        const ctrlHandle = await page.evaluateHandle(() => {
           const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          const c = all[1];
-          if (!c) return { step: 'inspect_pre', error: 'control[1] not found' };
+          for (const c of all) {
+            let cur = c;
+            for (let d = 0; d < 6 && cur; d++) {
+              cur = cur.parentElement;
+              if (!cur) break;
+              const lbl = cur.querySelector('label,h4,h5,h6,.form-label,[class*="label"]');
+              if (lbl && /prospect\s*organi[sz]ation/i.test(lbl.innerText || lbl.textContent || '')) return c;
+            }
+          }
+          return null;
+        });
+        const ctrl = ctrlHandle.asElement();
+        if (!ctrl) {
+          probe.steps.push({ step: 'find', error: 'no dropdown matching Prospect Organisation label' });
+          return probe;
+        }
+        probe.steps.push({ step: 'find', found: true });
+
+        // Step 1 — inspect DOM before click
+        probe.steps.push(await ctrl.evaluate(c => {
           const input = c.querySelector('input');
           return {
             step: 'inspect_pre',
             classList: c.className,
             hasInput: !!input,
-            inputDisabled: input?.disabled || false,
-            inputReadOnly: input?.readOnly || false,
-            inputAriaAutocomplete: input?.getAttribute('aria-autocomplete') || null,
-            inputName: input?.name || null,
-            inputId: input?.id || null,
-            // What's inside this control's parent? Is there a wrapper menu?
-            parentClass: c.parentElement?.className?.slice(0, 80) || null,
-            ariaHasPopup: c.getAttribute('aria-haspopup') || null
+            inputId: input?.id || null
           };
         }));
 
-        // Step 2 — click open
-        await page.evaluate(() => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          all[1]?.click();
+        // Open with REAL mouse event at rect center
+        const rect = await ctrl.evaluate(c => {
+          const r = c.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
         });
-        await new Promise(r => setTimeout(r, 1000));
-        probe.steps.push(await page.evaluate(() => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          const c = all[1];
-          return {
-            step: 'after_click',
-            isFocused: c?.classList.contains('disco-select__control--is-focused') || false,
-            isOpen: c?.classList.contains('disco-select__control--menu-is-open') || false,
-            menuExists: !!document.querySelector('.disco-select__menu'),
-            menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 120) || null,
-            optionsCount: document.querySelectorAll('.disco-select__option').length,
-            allMenusOnPage: document.querySelectorAll('.disco-select__menu').length
-          };
-        }));
-
-        // Step 3 — focus + type via puppeteer
-        const inp = await page.evaluateHandle(() => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          return all[1]?.querySelector('input') || null;
-        });
-        const inpEl = inp.asElement();
-        if (inpEl) {
-          await inpEl.focus();
-          await inpEl.type('rel', { delay: 120 });
-          await new Promise(r => setTimeout(r, 3500));
-          probe.steps.push(await page.evaluate(() => {
-            const all = Array.from(document.querySelectorAll('.disco-select__control'));
-            const c = all[1];
-            const input = c?.querySelector('input');
-            return {
-              step: 'after_type_rel',
-              inputValue: input?.value || '',
-              ariaActivedescendant: input?.getAttribute('aria-activedescendant') || null,
-              isOpen: c?.classList.contains('disco-select__control--menu-is-open') || false,
-              menuExists: !!document.querySelector('.disco-select__menu'),
-              menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 200) || null,
-              optionsCount: document.querySelectorAll('.disco-select__option').length,
-              // Any "Loading..." indicator?
-              loadingShown: /loading|searching|fetching/i.test(document.querySelector('.disco-select__menu')?.innerText || ''),
-              noOptionsMsg: document.querySelector('.disco-select__menu-notice')?.innerText || null
-            };
-          }));
-        }
-
-        // Step 4 — try input via native setter (the same technique we use for the subject field)
-        await page.evaluate(() => {
-          const all = Array.from(document.querySelectorAll('.disco-select__control'));
-          const input = all[1]?.querySelector('input');
-          if (!input) return;
-          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-          setter.call(input, 'lasik');
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await new Promise(r => setTimeout(r, 3500));
+        await ctrl.scrollIntoView();
+        await new Promise(r => setTimeout(r, 200));
+        await page.mouse.click(rect.x, rect.y);
+        await new Promise(r => setTimeout(r, 1200));
         probe.steps.push(await page.evaluate(() => ({
-          step: 'after_native_setter',
-          inputValue: document.querySelectorAll('.disco-select__control')[1]?.querySelector('input')?.value || '',
-          menuText: document.querySelector('.disco-select__menu')?.innerText?.slice(0, 200) || null,
+          step: 'after_real_mouse_click',
           optionsCount: document.querySelectorAll('.disco-select__option').length,
-          noOptionsMsg: document.querySelector('.disco-select__menu-notice')?.innerText || null
+          menuExists: !!document.querySelector('.disco-select__menu'),
+          firstFewOptions: Array.from(document.querySelectorAll('.disco-select__option')).slice(0, 8).map(o => o.innerText.trim())
         })));
+
+        // If initial open didn't load options, try typing
+        const initialCount = await page.evaluate(() => document.querySelectorAll('.disco-select__option').length);
+        if (initialCount === 0) {
+          const input = await ctrl.evaluateHandle(c => c.querySelector('input'));
+          const inpEl = input.asElement();
+          if (inpEl) {
+            for (const term of ['re', 'rel', 'relive']) {
+              await inpEl.focus();
+              await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+              await page.keyboard.press('Backspace');
+              await new Promise(r => setTimeout(r, 200));
+              await inpEl.type(term, { delay: 120 });
+              await new Promise(r => setTimeout(r, 2500));
+              const opts = await page.evaluate(() =>
+                Array.from(document.querySelectorAll('.disco-select__option')).slice(0, 8).map(o => o.innerText.trim())
+              );
+              probe.steps.push({ step: `typed_${term}`, optionsCount: opts.length, options: opts });
+              if (opts.length > 0) break;
+            }
+          }
+        }
       } catch (e) {
         probe.error = e.message;
       }
