@@ -724,28 +724,23 @@ async function processLead(lead) {
         return { picked: existing, reason: 'already_filled' };
       }
 
-      // Open with a REAL mouse click at the rect center (synthetic .click()
-      // doesn't reliably trigger React-Select's open handler).
-      const rect = await ctrl.evaluate(c => {
-        const r = c.getBoundingClientRect();
+      // Probe (May 2026) showed: clicking the outer control center does NOT
+      // open the menu in headless Puppeteer. Clicking the INPUT directly does.
+      // Get the input's own bounding rect and click that.
+      const inpHandle = await ctrl.evaluateHandle(c => c.querySelector('input'));
+      const inpEl = inpHandle.asElement();
+      if (!inpEl) return { picked: null, reason: 'no_input' };
+
+      const inpRect = await inpEl.evaluate(el => {
+        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+        const r = el.getBoundingClientRect();
         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
       });
-      await ctrl.scrollIntoView();
-      await new Promise(r => setTimeout(r, 200));
-      await page.mouse.click(rect.x, rect.y);
+      await new Promise(r => setTimeout(r, 300));
+      await page.mouse.click(inpRect.x, inpRect.y);
 
-      // Wait for the menu to render — Refrens shows all prospects on open,
-      // no typing needed for the initial list (user confirmed via screenshot).
-      try {
-        await page.waitForFunction(
-          () => {
-            const opts = document.querySelectorAll('.disco-select__option');
-            const menu = document.querySelector('.disco-select__menu');
-            return opts.length > 0 || (menu && menu.innerText.length > 5);
-          },
-          { timeout: 5000 }
-        );
-      } catch (_) {}
+      // Short wait — Refrens may show all prospects immediately on open
+      await new Promise(r => setTimeout(r, 800));
 
       const initialOpts = await page.evaluate(() =>
         Array.from(document.querySelectorAll('.disco-select__option')).map(o => o.innerText.trim())
@@ -756,25 +751,20 @@ async function processLead(lead) {
       let pickedNow = await tryClickReliveMatch();
       if (pickedNow) return { picked: pickedNow, reason: 'open_only' };
 
-      // No match in initial list — progressively search per user's guidance:
-      // type "re" then "rel" then backspace+retry, with the dropdown's own input.
-      const input = await ctrl.evaluateHandle(c => c.querySelector('input'));
-      const inpEl = input.asElement();
-      if (!inpEl) return { picked: null, reason: 'no_input' };
-
+      // No match yet — progressively type to trigger the async search.
+      // Probe confirmed 're' → 0 opts, 'rel' → 1 opt ("Relive cure").
       const searchAttempts = ['re', 'rel', 'reli', 'relive'];
       for (const term of searchAttempts) {
-        // Clear input — select all + backspace
-        await inpEl.focus();
-        await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+        // Triple-click to select all text, then Backspace to clear
+        await page.mouse.click(inpRect.x, inpRect.y, { clickCount: 3 });
         await page.keyboard.press('Backspace');
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise(r => setTimeout(r, 150));
 
-        await inpEl.type(term, { delay: 120 });
+        await page.keyboard.type(term, { delay: 100 });
         try {
           await page.waitForFunction(
             () => document.querySelectorAll('.disco-select__option').length > 0,
-            { timeout: 3500 }
+            { timeout: 4000 }
           );
         } catch(_) {}
         const opts = await page.evaluate(() =>
@@ -786,35 +776,41 @@ async function processLead(lead) {
         if (pickedNow) return { picked: pickedNow, reason: `search:${term}` };
       }
 
-      // Last resort: if any option is visible at all, pick the first one
-      // (so the lead at least gets ASSIGNED to something rather than failing).
-      const anyPick = await page.evaluate(() => {
+      // Last resort: click first available option with real mouse events
+      const firstOptRect = await page.evaluate(() => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option'));
-        if (opts.length > 0) {
-          opts[0].click();
-          return opts[0].innerText.trim();
-        }
-        return null;
+        if (opts.length === 0) return null;
+        const r = opts[0].getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: opts[0].innerText.trim() };
       });
-      if (anyPick) {
-        console.log(`[ORG] fell back to first available option: "${anyPick}"`);
-        return { picked: anyPick, reason: 'first_available' };
+      if (firstOptRect) {
+        await page.mouse.click(firstOptRect.x, firstOptRect.y);
+        console.log(`[ORG] fell back to first available option: "${firstOptRect.text}"`);
+        return { picked: firstOptRect.text, reason: 'first_available' };
       }
 
       await page.keyboard.press('Escape').catch(() => {});
       return { picked: null, reason: 'no_options_at_all' };
     }
 
-    // Looks at currently rendered options and clicks the one that matches
-    // "Relive cure" (or any case-insensitive variant containing "relive").
+    // Clicks whichever visible option matches "Relive cure" using REAL mouse
+    // events (page.mouse.click) so React-Select's onMouseDown fires.
+    // Synthetic element.click() inside page.evaluate only dispatches a click
+    // event — React-Select ignores it. page.mouse.click dispatches the full
+    // mousedown + mouseup + click sequence.
     async function tryClickReliveMatch() {
-      return await page.evaluate(() => {
+      const optRect = await page.evaluate(() => {
         const opts = Array.from(document.querySelectorAll('.disco-select__option'));
         const match = opts.find(o => /relive\s*cure/i.test(o.innerText))
                    || opts.find(o => /relive/i.test(o.innerText));
-        if (match) { match.click(); return match.innerText.trim(); }
-        return null;
+        if (!match) return null;
+        const r = match.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return null;
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: match.innerText.trim() };
       });
+      if (!optRect) return null;
+      await page.mouse.click(optRect.x, optRect.y);
+      return optRect.text;
     }
 
     try {
