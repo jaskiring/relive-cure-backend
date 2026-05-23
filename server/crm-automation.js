@@ -979,16 +979,24 @@ async function processLead(lead) {
     }
 
     // ── 6. Fill contact text fields ──────────────────────────────────────────
-    // F4: Use React-aware setter — native value + dispatchEvent isn't enough
-    // for Refrens's controlled inputs; React reads its own state on submit.
+    // F4: Strategy varies by field:
+    //  - Name / City: use React-aware setter (native value+dispatchEvent
+    //    doesn't reach Refrens's controlled state, so submit reads "" even
+    //    though DOM is filled).
+    //  - Phone: Refrens uses a wrapped phone input that rejects bulk-set
+    //    and resets to "+91" prefix only. Char-by-char typing IS accepted
+    //    (proven by prior pre-submit log showing "+91 72899-88493"), so
+    //    use the typing path here.
     const nameSet  = await setReactInputValue(page, SEL.contactName, realName);
-    const phoneSet = await setReactInputValue(page, SEL.contactPhone, cleanPhone);
-    const citySet  = await setReactInputValue(page, SEL.customerCity, lead.city || 'Delhi');
-    console.log(`[CRM] React-aware fill: name=${nameSet} phone=${phoneSet} city=${citySet}`);
-    // Fallback if the React-aware setter failed (unknown form variant)
     if (!nameSet)  await fillField(page, SEL.contactName, realName);
-    if (!phoneSet) await fillField(page, SEL.contactPhone, cleanPhone);
+
+    // Phone: type char-by-char so the phone-input formatter accepts each digit
+    await fillField(page, SEL.contactPhone, cleanPhone);
+
+    const citySet  = await setReactInputValue(page, SEL.customerCity, lead.city || 'Delhi');
     if (!citySet)  await fillField(page, SEL.customerCity, lead.city || 'Delhi');
+
+    console.log(`[CRM] Field fill: name=${nameSet} (react) phone=typed city=${citySet} (react)`);
 
     // ── 7. Lead Subject ───────────────────────────────────────────────────────
     // IMPORTANT: subject is REQUIRED by Refrens. On Railway (no saved session),
