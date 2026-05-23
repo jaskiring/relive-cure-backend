@@ -1069,21 +1069,32 @@ app.post('/api/meta/backfill-links', async (req, res) => {
 });
 
 // GET /api/meta/debug/campaign/:id/ads — diagnostic: raw ad payload (creative spec)
-// Used to figure out where lead_gen_form_id is nested for this account's ad
-// creatives. Auth-gated; not for end users.
+// Drills two levels: ads → creative_id → full creative.
 app.get('/api/meta/debug/campaign/:id/ads', async (req, res) => {
     if (!requireCrmKey(req, res)) return;
     try {
         const { loadCredentials } = await import('./meta-marketing.js');
         const creds = await loadCredentials();
         if (!creds) return res.status(400).json({ success: false, error: 'No META credentials' });
-        const url = new URL(`https://graph.facebook.com/v21.0/${req.params.id}/ads`);
-        url.searchParams.set('fields', 'id,name,status,effective_status,campaign_id,adset_id,creative');
-        url.searchParams.set('limit', '5');
-        url.searchParams.set('access_token', creds.token);
-        const r = await fetch(url.toString());
-        const j = await r.json();
-        return res.json({ success: true, raw: j });
+        // 1) List ads + creative_id
+        const adsUrl = new URL(`https://graph.facebook.com/v21.0/${req.params.id}/ads`);
+        adsUrl.searchParams.set('fields', 'id,name,status,effective_status,creative{id}');
+        adsUrl.searchParams.set('effective_status', JSON.stringify(['ACTIVE','PAUSED','ARCHIVED','IN_PROCESS','WITH_ISSUES','PREAPPROVED','PENDING_REVIEW']));
+        adsUrl.searchParams.set('limit', '10');
+        adsUrl.searchParams.set('access_token', creds.token);
+        const adsRes = await fetch(adsUrl.toString());
+        const adsJson = await adsRes.json();
+        // 2) For each unique creative_id, fetch full creative spec
+        const creativeIds = [...new Set((adsJson.data || []).map(a => a.creative?.id).filter(Boolean))];
+        const creatives = {};
+        for (const cid of creativeIds.slice(0, 5)) {
+            const cUrl = new URL(`https://graph.facebook.com/v21.0/${cid}`);
+            cUrl.searchParams.set('fields', 'id,name,lead_gen_form_id,effective_object_story_id,object_story_spec,asset_feed_spec,object_type');
+            cUrl.searchParams.set('access_token', creds.token);
+            const r = await fetch(cUrl.toString());
+            creatives[cid] = await r.json();
+        }
+        return res.json({ success: true, ads: adsJson, creatives });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
