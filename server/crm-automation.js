@@ -1402,9 +1402,15 @@ async function processLead(lead) {
 
     const t_done = Date.now();
     try { page.off('response', netListener); } catch(_) {}
-    console.log(`[CRM] ✅ lead_id=${lead.id} name="${realName}" stage="${stageLabel}" assignee="${lead.assignee || '(default)'}" | t_open=${t_fill - t_open}ms t_fill=${t_submit - t_fill}ms t_submit=${t_done - t_submit}ms total=${t_done - t_open}ms`);
 
-    return { success: true, id: lead.id };
+    // Capture the Refrens lead URL + ID for deep-linking from the dashboard
+    const refrensUrl = page.url();
+    const refrensIdMatch = refrensUrl.match(/\/leads\/([a-f0-9]{20,})/i);
+    const refrensId = refrensIdMatch ? refrensIdMatch[1] : null;
+
+    console.log(`[CRM] ✅ lead_id=${lead.id} name="${realName}" stage="${stageLabel}" assignee="${lead.assignee || '(default)'}" refrens="${refrensUrl}" | t_open=${t_fill - t_open}ms t_fill=${t_submit - t_fill}ms t_submit=${t_done - t_submit}ms total=${t_done - t_open}ms`);
+
+    return { success: true, id: lead.id, refrens_url: refrensUrl, refrens_id: refrensId };
 
   } catch (error) {
     console.error(`[CRM ERROR] lead_id=${lead.id}:`, error.message);

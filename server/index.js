@@ -122,11 +122,25 @@ app.post('/api/push-to-crm-form', async (req, res) => {
     if (pendingLeads.length > 20) return res.status(400).json({ status: 'error', message: 'Max 20 leads per batch.' });
     try {
         const results = await processQueue(pendingLeads);
-        const successfulLeads = results.filter(r => r.success).map(r => r.id);
         const failedLeads = results.filter(r => !r.success);
-        if (successfulLeads.length > 0) {
-            await supabaseAdmin.from('leads_surgery').update({ pushed_to_crm: true, status: 'PUSHED_TO_CRM' }).in('id', successfulLeads);
+        // Per-lead update so we can persist the per-lead Refrens URL/ID returned by processLead
+        const successResults = results.filter(r => r.success);
+        for (const r of successResults) {
+          const patch = {
+            pushed_to_crm: true,
+            status: 'PUSHED_TO_CRM',
+          };
+          if (r.refrens_url) patch.refrens_lead_url = r.refrens_url;
+          if (r.refrens_id)  patch.refrens_lead_id  = r.refrens_id;
+          try {
+            const { error } = await supabaseAdmin.from('leads_surgery').update(patch).eq('id', r.id);
+            if (error) console.warn(`[CRM] Failed to persist refrens URL for lead ${r.id}:`, error.message);
+          } catch (e) {
+            console.warn(`[CRM] Persist error for lead ${r.id}:`, e.message);
+          }
         }
+        // Keep the existing successfulLeads computation for the response
+        const successfulLeads = successResults.map(r => r.id);
         res.json({ status: 'success', processed: results.length, success_count: successfulLeads.length, failed_count: failedLeads.length, failed_leads: failedLeads });
     } catch (error) { res.status(500).json({ status: 'error', message: error.message }); }
 });
