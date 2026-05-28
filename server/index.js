@@ -20,6 +20,7 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
+import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import multer from 'multer';
 
 // In-memory upload (we re-stream to Meta immediately; files are bounded to ~25MB).
@@ -143,6 +144,51 @@ app.post('/api/push-to-crm-form', async (req, res) => {
         const successfulLeads = successResults.map(r => r.id);
         res.json({ status: 'success', processed: results.length, success_count: successfulLeads.length, failed_count: failedLeads.length, failed_leads: failedLeads });
     } catch (error) { res.status(500).json({ status: 'error', message: error.message }); }
+});
+
+// ─── Web Push subscribe / unsubscribe (mobile companion app) ────────────────
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ key: VAPID_PUBLIC_KEY, configured: isPushConfigured() });
+});
+
+app.post('/api/push/subscribe', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const { subscription, user_id, user_agent } = req.body || {};
+    await saveSubscription(supabaseAdmin, subscription, { user_id, user_agent });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/push/unsubscribe', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+    await removeSubscription(supabaseAdmin, endpoint);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Test endpoint — manually trigger a notification to confirm setup
+app.post('/api/push/test', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const result = await fanout(supabaseAdmin, {
+      title: 'Test notification',
+      body: 'Push is working ✓',
+      lead_id: null,
+      intent: '',
+      phone: '',
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── Ingest Lead ──────────────────────────────────────────────────────────────
@@ -1343,4 +1389,26 @@ app.listen(PORT, '0.0.0.0', () => {
     setTimeout(runMetaSync, 5 * 60 * 1000);
     setInterval(runMetaSync, 60 * 60 * 1000);
     console.log('[SCHEDULER] Meta sync: first run in 5 min, then every 1h');
+
+    // ─── Mobile push: fanout on new lead inserts (Phase M3) ─────────────────
+    supabaseAdmin
+      .channel('m-lead-push')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'leads_surgery' }, async (payload) => {
+        const lead = payload.new;
+        if (!lead) return;
+        try {
+          const intent = (lead.intent_level || '').toUpperCase();
+          await fanout(supabaseAdmin, {
+            title: intent === 'HOT' ? '🔥 HOT lead just landed!' : 'New lead',
+            body: `${lead.contact_name || lead.phone_number}${lead.city ? ' · ' + lead.city : ''}`,
+            lead_id: lead.id,
+            intent,
+            phone: lead.phone_number,
+          });
+        } catch (e) {
+          console.warn('[PUSH] lead fanout failed:', e.message);
+        }
+      })
+      .subscribe();
+    console.log('[PUSH] Lead-insert push fanout active');
 });
