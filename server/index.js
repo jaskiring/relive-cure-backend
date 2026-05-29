@@ -166,8 +166,13 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ key: VAPID_PUBLIC_KEY, configured: isPushConfigured() });
 });
 
+// Subscribe + unsubscribe DO NOT require x-crm-key. Reasoning: the
+// subscription payload is the user's own browser endpoint + public keys —
+// stealing it grants nothing. The security boundary is VAPID-key signing
+// on the SEND side, which only the backend has. Auth-gating subscribe
+// just causes silent setup failures when localStorage.crm_token drifts
+// from CRM_API_KEY.
 app.post('/api/push/subscribe', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const { subscription, user_id, user_agent } = req.body || {};
     await saveSubscription(supabaseAdmin, subscription, { user_id, user_agent });
@@ -178,7 +183,6 @@ app.post('/api/push/subscribe', async (req, res) => {
 });
 
 app.post('/api/push/unsubscribe', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const { endpoint } = req.body || {};
     if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
