@@ -491,6 +491,20 @@ async function sendToAPI(phone, session, trigger = 'update') {
         const { data, action } = await ingestLead(supabaseAdmin, payload);
         console.log(`[BOT→DB] ✅ ${action.toUpperCase()} | id=${data.id} | phone=${phone}`);
         session.ingested = true; session.first_ingest_done = true; schedulePersist();
+        // Inline lead-INSERT push fanout — only on first ingest (not updates).
+        // More reliable than Supabase realtime in the Node client.
+        if (action === 'upserted' && data?.id && isPushConfigured()) {
+            const intent = (data.intent_level || '').toUpperCase();
+            fanout(supabaseAdmin, {
+                title: intent === 'HOT' ? '🔥 HOT lead just landed!' : 'New lead',
+                body: `${data.contact_name || data.phone_number}${data.city ? ' · ' + data.city : ''}`,
+                lead_id: data.id,
+                intent,
+                phone: data.phone_number,
+                url: `/m?lead=${data.id}`,
+                kind: 'lead',
+            }).catch(e => console.warn('[PUSH] inline lead fanout failed:', e.message));
+        }
     } catch (err) { console.error('[BOT→DB] ❌ Direct ingest failed:', err.message); }
 }
 

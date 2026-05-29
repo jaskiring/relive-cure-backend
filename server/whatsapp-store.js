@@ -1,4 +1,5 @@
 import { supabaseAdmin } from './supabase-admin.js';
+import { fanout, isPushConfigured } from './push.js';
 
 /**
  * Best-effort capture of a WhatsApp message into our own store.
@@ -56,6 +57,22 @@ export async function saveWhatsAppMessage({ phone, direction, body = null, msgTy
     await supabaseAdmin
       .from('whatsapp_conversations')
       .upsert(convoRow, { onConflict: 'phone' });
+
+    // 3. Push notification — inbound only. Fires inline (not via Supabase
+    // realtime which is unreliable in the Node client). Best-effort; never
+    // throws. The browser SW dedupes by tag so duplicates from any other
+    // path collapse into one toast.
+    if (direction === 'inbound' && isPushConfigured()) {
+      const who = contactName || phone;
+      const text = (body || '').slice(0, 80) || `[${msgType}]`;
+      fanout(supabaseAdmin, {
+        title: `💬 ${who}`,
+        body: text,
+        phone,
+        url: `/m?phone=${encodeURIComponent(phone)}`,
+        kind: 'message',
+      }).catch(e => console.warn('[PUSH] inline message fanout failed:', e.message));
+    }
   } catch (err) {
     console.error('[WA CAPTURE] ❌', err.message);
   }
