@@ -147,6 +147,21 @@ app.post('/api/push-to-crm-form', async (req, res) => {
 });
 
 // ─── Web Push subscribe / unsubscribe (mobile companion app) ────────────────
+// Diagnostic — verify push is fully wired (no auth so it can be hit easily).
+// Returns whether VAPID env is set + current subscriber count. Used by the
+// dashboard sidebar to show "Notifications on/off" status accurately.
+app.get('/api/push/status', async (req, res) => {
+  try {
+    const configured = isPushConfigured();
+    const { count } = await supabaseAdmin
+      .from('push_subscriptions')
+      .select('endpoint', { count: 'exact', head: true });
+    res.json({ configured, subscribers: count ?? 0 });
+  } catch (e) {
+    res.status(500).json({ configured: isPushConfigured(), error: e.message });
+  }
+});
+
 app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ key: VAPID_PUBLIC_KEY, configured: isPushConfigured() });
 });
