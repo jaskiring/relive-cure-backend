@@ -1390,7 +1390,10 @@ app.listen(PORT, '0.0.0.0', () => {
     setInterval(runMetaSync, 60 * 60 * 1000);
     console.log('[SCHEDULER] Meta sync: first run in 5 min, then every 1h');
 
-    // ─── Mobile push: fanout on new lead inserts (Phase M3) ─────────────────
+    // ─── Push fanout (Phase M3 + extended): new leads + inbound messages ────
+    // Two watchers, same fanout helper. The notification payload always
+    // carries a `url` so the SW knows where to navigate on click; the URL
+    // works for both /m (mobile companion) and / (desktop dashboard).
     supabaseAdmin
       .channel('m-lead-push')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'leads_surgery' }, async (payload) => {
@@ -1404,11 +1407,42 @@ app.listen(PORT, '0.0.0.0', () => {
             lead_id: lead.id,
             intent,
             phone: lead.phone_number,
+            url: `/m?lead=${lead.id}`,
+            kind: 'lead',
           });
         } catch (e) {
           console.warn('[PUSH] lead fanout failed:', e.message);
         }
       })
       .subscribe();
-    console.log('[PUSH] Lead-insert push fanout active');
+
+    supabaseAdmin
+      .channel('m-msg-push')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'whatsapp_messages' }, async (payload) => {
+        const msg = payload.new;
+        // Only notify on inbound (skip outbound — that's the user's own send)
+        if (!msg || msg.direction !== 'inbound') return;
+        try {
+          // Look up the conversation row for the name (best-effort)
+          const { data: conv } = await supabaseAdmin
+            .from('whatsapp_conversations')
+            .select('contact_name')
+            .eq('phone', msg.phone)
+            .maybeSingle();
+          const who = conv?.contact_name || msg.phone;
+          const text = (msg.text_body || msg.body || msg.caption || '').slice(0, 80) || '[media]';
+          await fanout(supabaseAdmin, {
+            title: `💬 ${who}`,
+            body: text,
+            phone: msg.phone,
+            url: `/m?phone=${encodeURIComponent(msg.phone)}`,
+            kind: 'message',
+          });
+        } catch (e) {
+          console.warn('[PUSH] message fanout failed:', e.message);
+        }
+      })
+      .subscribe();
+
+    console.log('[PUSH] fanout active — INSERT on leads_surgery + whatsapp_messages');
 });
