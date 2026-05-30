@@ -671,15 +671,48 @@ export async function dumpCrmNewLeadForm() {
 // reassigned from "Relive Cure" → "NISHIKANT".
 async function assignLeadToCollaborator(page, assigneeName) {
   if (!assigneeName) return false;
+
+  // Wait for lead detail page to fully load after submit redirect
+  try {
+    await page.waitForSelector('span', { timeout: 8000 });
+    // Give React time to render the full lead detail page
+    await new Promise(r => setTimeout(r, 3000));
+  } catch(_) {}
+
   const result = await page.evaluate(async (name) => {
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
 
     // 1. Find "Lead assignee" widget + click edit button
-    const labelEl = Array.from(document.querySelectorAll('span')).find(el => (el.innerText || '').trim() === 'Lead assignee');
-    if (!labelEl) return { ok: false, step: 'find_label', reason: 'no Lead assignee label found' };
-    const editBtn = labelEl.parentElement.querySelector('button');
-    if (!editBtn) return { ok: false, step: 'find_edit_btn' };
+    //    Case-insensitive search — Refrens may capitalize inconsistently
+    let labelEl = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      labelEl = Array.from(document.querySelectorAll('span')).find(el => {
+        const t = (el.innerText || '').trim().toLowerCase();
+        return t === 'lead assignee' || t === 'lead assignee:';
+      });
+      if (labelEl) break;
+      await sleep(2000); // wait for page to render
+    }
+    if (!labelEl) {
+      // Debug: list all span texts to help diagnose
+      const allSpans = Array.from(document.querySelectorAll('span'))
+        .map(el => (el.innerText || '').trim())
+        .filter(t => t.length > 3 && t.length < 60 && /lead|assign|owner/i.test(t));
+      return { ok: false, step: 'find_label', reason: 'no Lead assignee label found', debugSpans: allSpans.slice(0, 10), url: location.href };
+    }
+
+    // Try the parent element first, then walk up to find the edit button
+    let editBtn = labelEl.parentElement?.querySelector('button');
+    if (!editBtn) {
+      // Walk up 3 levels looking for any edit/pencil button
+      let container = labelEl.parentElement;
+      for (let i = 0; i < 3 && container && !editBtn; i++) {
+        container = container.parentElement;
+        if (container) editBtn = container.querySelector('button');
+      }
+    }
+    if (!editBtn) return { ok: false, step: 'find_edit_btn', reason: 'no edit button near Lead assignee label' };
     editBtn.click();
     await sleep(1500);
 
@@ -731,7 +764,8 @@ async function assignLeadToCollaborator(page, assigneeName) {
     await sleep(3500);
 
     // 6. Verify
-    const finalLabel = Array.from(document.querySelectorAll('span')).find(el => (el.innerText || '').trim() === 'Lead assignee');
+    const finalLabel = Array.from(document.querySelectorAll('span')).find(el =>
+      (el.innerText || '').trim().toLowerCase().startsWith('lead assignee'));
     const finalVal = finalLabel?.parentElement?.querySelector('button span')?.innerText?.trim() || '(?)';
     const matched = finalVal.toLowerCase().includes(nameLower);
     return { ok: matched, step: 'verified', finalAssignee: finalVal };
