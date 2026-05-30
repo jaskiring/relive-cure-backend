@@ -1115,7 +1115,7 @@ async function processLead(lead) {
     if (!nameSet)  await fillField(page, SEL.contactName, realName);
 
     // Phone: ALWAYS prepend +91 for India (Refrens's phone-input requires E.164)
-    const phoneE164 = '+91' + cleanPhone.replace(/\D/g, '').replace(/^91/, '');
+    const phoneE164 = '+91' + cleanPhone.replace(/\D/g, '');
     const phoneSet = await setReactInputValue(page, SEL.contactPhone, phoneE164);
     if (!phoneSet) await fillField(page, SEL.contactPhone, phoneE164);
 
