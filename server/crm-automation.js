@@ -312,8 +312,20 @@ async function selectDropdownByLabel(page, keywords, value) {
 
 async function assertValue(page, selector, expected) {
   const val = await page.$eval(selector, el => el.value || el.innerText);
-  if (!val || !val.toString().toLowerCase().includes(expected.toString().toLowerCase().slice(0,4))) {
-    throw new Error(`Validation failed for ${selector}. Expected ${expected}, got ${val}`);
+  if (!val) {
+    throw new Error(`Validation failed for ${selector}. Expected ${expected}, got empty`);
+  }
+  
+  if (selector.includes('phone') || selector.includes('contactPhone')) {
+    const cleanVal = val.toString().replace(/\D/g, '');
+    const cleanExp = expected.toString().replace(/\D/g, '');
+    if (!cleanVal.includes(cleanExp.slice(-10))) {
+      throw new Error(`Validation failed for ${selector}. Expected ${expected}, got ${val}`);
+    }
+  } else {
+    if (!val.toString().toLowerCase().includes(expected.toString().toLowerCase().slice(0,4))) {
+      throw new Error(`Validation failed for ${selector}. Expected ${expected}, got ${val}`);
+    }
   }
 }
 
