@@ -1,8 +1,25 @@
 export const calculateParametersCompleted = (lead) => {
-    const fields = ['city', 'insurance', 'preferred_surgery_city', 'timeline'];
-    return fields.reduce((count, field) => {
-        return lead[field] && String(lead[field]).trim() !== '' ? count + 1 : count;
-    }, 0);
+    // Count ALL fields the bot actively collects + passively captures.
+    // The bot flow asks: Name → City → Eye Power → (Power Stability)
+    // Passive captures: insurance, timeline, preferred_surgery_city
+    const fields = [
+        'contact_name',            // Bot asks first
+        'city',                    // Bot asks second
+        'eye_power',               // Bot asks third (main qualifying question)
+        'insurance',               // Passive capture from user messages
+        'timeline',                // Passive capture from user messages
+    ];
+    let count = 0;
+    for (const field of fields) {
+        const val = lead[field];
+        if (!val) continue;
+        const str = String(val).trim();
+        if (!str || str === 'WhatsApp Lead') continue;
+        // For eye_power, it might be a JSON object from parseEyePower
+        if (field === 'eye_power' && typeof val === 'object' && val.raw) { count++; continue; }
+        if (str) count++;
+    }
+    return count;
 };
 
 export const checkDuplicate = async (supabaseClient, phoneNumber) => {

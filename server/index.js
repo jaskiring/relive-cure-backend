@@ -578,10 +578,19 @@ function passiveExtract(message, session) {
 
 function scoreSession(session) {
     const d = session.data;
-    const params = ['city', 'insurance', 'eyePower', 'timeline'].filter(f => d[f] && String(d[f]).trim()).length;
+    // Count the same fields that parameters_completed tracks
+    const hasName = d.contactName && d.contactName !== 'WhatsApp Lead';
+    const hasCity = !!d.city;
+    const hasPower = !!d.eyePower;
+    const hasInsurance = !!d.insurance;
+    const hasTimeline = !!d.timeline;
+    const params = [hasName, hasCity, hasPower, hasInsurance, hasTimeline].filter(Boolean).length;
     const urgency = d.urgency || '';
-    const band = (params >= 3 && urgency === 'high') ? 'HOT' : (params >= 2) ? 'WARM' : 'COLD';
-    return { intent_score: params, intent_band: band, interest_cost: !!d.interest_cost, interest_recovery: !!d.interest_recovery, concern_pain: !!d.concern_pain, concern_safety: !!d.concern_safety, urgency_level: urgency || (params >= 3 ? 'medium' : 'low'), is_returning: !!d.is_returning };
+    // HOT: 4+ params with high urgency (has insurance/timeline = actively engaged)
+    // WARM: 3+ params (name + city + eyePower = completed bot flow)
+    // COLD: <3 params (still in early stages)
+    const band = (params >= 4 && urgency === 'high') ? 'HOT' : (params >= 3) ? 'WARM' : 'COLD';
+    return { intent_score: params, intent_band: band, interest_cost: !!d.interest_cost, interest_recovery: !!d.interest_recovery, concern_pain: !!d.concern_pain, concern_safety: !!d.concern_safety, urgency_level: urgency || (params >= 4 ? 'medium' : 'low'), is_returning: !!d.is_returning };
 }
 
 // ─── DIRECT DB INGEST — no HTTP ───────────────────────────────────────────────
@@ -601,6 +610,7 @@ async function sendToAPI(phone, session, trigger = 'update') {
         phone_number: phone, contact_name: d.contactName || 'WhatsApp Lead',
         channel: 'whatsapp',
         city: d.city || '', preferred_surgery_city: d.city || '',
+        eye_power: eyePowerStr || '', eye_power_numeric: eyePowerNum,
         timeline: d.timeline || '', insurance: d.insurance || '',
         interest_cost: scored.interest_cost, interest_recovery: scored.interest_recovery,
         concern_pain: scored.concern_pain, concern_safety: scored.concern_safety,
