@@ -1073,10 +1073,14 @@ async function processLead(lead) {
     const phoneSet = await setReactInputValue(page, SEL.contactPhone, phoneE164);
     if (!phoneSet) await fillField(page, SEL.contactPhone, phoneE164);
 
-    const citySet  = await setReactInputValue(page, SEL.customerCity, lead.city || 'Delhi');
-    if (!citySet)  await fillField(page, SEL.customerCity, lead.city || 'Delhi');
+    const cityVal = (lead.city && lead.city.trim()) ? lead.city.trim() : '';
+    let citySet = false;
+    if (cityVal) {
+        citySet = await setReactInputValue(page, SEL.customerCity, cityVal);
+        if (!citySet) await fillField(page, SEL.customerCity, cityVal);
+    }
 
-    console.log(`[CRM] Field fill: name=${nameSet} phone=${phoneSet}(E164="${phoneE164}") city=${citySet}`);
+    console.log(`[CRM] Field fill: name=${nameSet} phone=${phoneSet}(E164="${phoneE164}") city=${citySet}(val="${cityVal}")`);
 
     // ── 7. Lead Subject ───────────────────────────────────────────────────────
     // IMPORTANT: subject is REQUIRED by Refrens. On Railway (no saved session),

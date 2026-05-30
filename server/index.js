@@ -370,16 +370,43 @@ function schedulePersist() {
 const NAME_BLACKLIST = new Set([
     'yes', 'ok', 'okay', 'haan', 'ha', 'no', 'nah', 'start', 'nahi', 'nope', 'sure', 'chalo', 'bilkul', 'haan ji',
     'skip', 'next', 'continue', 'hello', 'hi', 'hey', 'theek', 'accha', 'achha', 'thik', 'lasik', 'surgery', 'good', 'fine',
-    // Hinglish/English question words \u2014 never valid names
+    // Hinglish/English question words — never valid names
     'kya', 'kaise', 'kab', 'kahan', 'kyu', 'kyon', 'kyun', 'kahaan', 'kab tak', 'kaisa',
     'what', 'how', 'where', 'when', 'why', 'who', 'which',
 ]);
+
+// ─── SAFETY NET: Medical + common word blacklists ────────────────────────────
+const MEDICAL_BLACKLIST = new Set([
+    'lipoma', 'cancer', 'motiyabind', 'cataract', 'tumor', 'tumour',
+    'diabetes', 'thyroid', 'hernia', 'asthma', 'malaria', 'dengue',
+    'typhoid', 'jaundice', 'migraine', 'epilepsy', 'arthritis',
+    'pneumonia', 'cholesterol', 'infection', 'allergy', 'fracture',
+    'appendix', 'ulcer', 'piles', 'fistula', 'gallstone', 'kidney',
+    'liver', 'heart', 'brain', 'stomach', 'spine', 'knee', 'shoulder'
+]);
+const COMMON_WORD_BLACKLIST = new Set([
+    'morning', 'evening', 'night', 'afternoon', 'today', 'tomorrow',
+    'mr', 'mrs', 'miss', 'sir', 'madam', 'dear', 'bhai', 'bhaiya',
+    'didi', 'ji', 'sahab', 'sahib', 'love', 'thanks', 'thank',
+    'please', 'location', 'rate', 'price', 'cost', 'address',
+    'number', 'glass', 'glasses', 'lens', 'lenses', 'specs',
+    'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
+    'specs removal', 'option', 'options', 'checking',
+    // Hindi filler/pronouns that aren't names
+    'इस', 'यह', 'वह', 'मैं', 'तुम', 'आप', 'हम', 'ये', 'वो',
+    'कोई', 'कुछ', 'अभी', 'बस', 'हां', 'ना', 'जी'
+]);
+
 const NAME_QUESTION_PREFIX_RE = /^(kya|kaise|kab|kahan|kyu|kyon|kyun|kahaan|kaisa|what|how|where|when|why|who|which)\b/i;
 function isValidName(str) {
     if (!str || str.trim().length < 2) return false;
     const trimmed = str.trim();
     const low = trimmed.toLowerCase();
     if (NAME_BLACKLIST.has(low)) return false;
+    if (MEDICAL_BLACKLIST.has(low)) return false;
+    if (COMMON_WORD_BLACKLIST.has(low)) return false;
+    // Reject single-word titles
+    if (['mr', 'mrs', 'ms', 'dr', 'sir', 'madam'].includes(low)) return false;
     // Reject anything that looks like a question
     if (trimmed.includes('?')) return false;
     if (NAME_QUESTION_PREFIX_RE.test(trimmed)) return false;
@@ -392,6 +419,86 @@ function isValidName(str) {
     if (/[\u0900-\u097F]/.test(trimmed)) return trimmed.length >= 2;
     if (!/^[a-zA-Z\s]+$/.test(trimmed)) return false;
     return trimmed.split(/\s+/).some(w => w.length >= 2);
+}
+
+// ─── SAFETY NET: Disengagement + abuse detection ─────────────────────────────
+const DISENGAGE_TRIGGERS = [
+    'bye', 'bye bye', 'good bye', 'goodbye', 'block', 'i block you',
+    'stop', 'bakwas band', 'bar bar', 'good night', 'so jao', 'ruko',
+    'mat bhejo', 'message mat', 'mat karo', 'leave me', 'chhod do',
+    'go away', 'get lost'
+];
+const ABUSE_WORDS = [
+    'chutiya', 'chutiye', 'madarchod', 'bhenchod',
+    'bhosdike', 'gandu', 'sale', 'saale', 'bewakoof',
+    'idiot', 'stupid', 'fool', 'pagal', 'kamina', 'harami'
+];
+// Match abuse words including obfuscated variants (chhu..tiye, ch*tiya, etc.)
+const ABUSE_RE = new RegExp(
+    ABUSE_WORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') +
+    '|ch+u+\\.*(t|d)i?y[ae]|bh?o?s[dk]', 'i'
+);
+function isDisengaged(msg) {
+    const m = msg.toLowerCase();
+    return DISENGAGE_TRIGGERS.some(t => m.includes(t));
+}
+function isAbusive(msg) {
+    return ABUSE_RE.test(msg);
+}
+
+// ─── SAFETY NET: Name correction detector ────────────────────────────────────
+const NAME_CORRECTION_NEG = /(?:mera naam|my name|mera nam)\s+(?:nahi hai|nhi hai|isn'?t|is not|nahi h|nhi h)/i;
+const NAME_INTRO_RE = /(?:mera naam|my name|i am|i'm|myself|my self|main|mai|i'm)\s+(?:hai|is|h|)\s*(.+)/i;
+function checkNameCorrection(message, session) {
+    if (NAME_CORRECTION_NEG.test(message)) {
+        session.data.contactName = null;
+        session.state = 'NAME';
+        return 'cleared';
+    }
+    const posMatch = message.match(NAME_INTRO_RE);
+    if (posMatch && posMatch[1].trim().length >= 2) {
+        const newName = posMatch[1].trim().split(/\s+/).slice(0, 2).join(' ');
+        if (isValidName(newName)) {
+            session.data.contactName = newName;
+            return 'captured';
+        }
+    }
+    return false;
+}
+
+// ─── SAFETY NET: Off-topic condition/body part ───────────────────────────────
+const OFF_TOPIC_RE = /\b(back side|peeth|kamar|waist|knee|ghutna|stomach|pet|skin|hair|baal|shoulder|kandha|leg|foot|hand|lipoma|hernia|piles)\b.*\b(problem|issue|pain|dard|ho gyi|ho gayi|hai|h|me hai|mein hai)\b/i;
+// Secondary pattern: "my problem/issue is <condition>"
+const OFF_TOPIC_RE2 = /\b(problem|issue|bimari|rog)\b.*\b(lipoma|hernia|piles|kamar|peeth|knee|ghutna|stomach|pet|skin|hair|baal|shoulder)\b/i;
+function isOffTopic(msg) { return OFF_TOPIC_RE.test(msg) || OFF_TOPIC_RE2.test(msg); }
+
+// ─── SAFETY NET: City validation blacklist ───────────────────────────────────
+const CITY_BLACKLIST = new Set([
+    'lasik', 'specs removal', 'specs', 'surgery', 'option', 'options',
+    'checking', 'number', 'number h', 'glass', 'glasses', 'lens',
+    'lenses', 'but', 'and', 'mr', 'yes please', 'rate', 'cost',
+    'price', 'love', 'operation', 'eye', 'eyes', 'chashma', 'ok',
+    'yes', 'no', 'haan', 'nahi'
+]);
+
+// ─── SAFETY NET: Loop guard ──────────────────────────────────────────────────
+const recentOutbound = {};  // phone → [hash1, hash2, hash3]
+function hashMsg(text) { return crypto.createHash('md5').update(text || '').digest('hex'); }
+function isLooping(phone, reply) {
+    const recent = recentOutbound[phone] || [];
+    return recent.includes(hashMsg(reply));
+}
+function trackOutbound(phone, reply) {
+    if (!recentOutbound[phone]) recentOutbound[phone] = [];
+    recentOutbound[phone].push(hashMsg(reply));
+    if (recentOutbound[phone].length > 3) recentOutbound[phone].shift();
+}
+
+// ─── Helper: safe first name (never "WhatsApp") ─────────────────────────────
+function safeFirstName(session) {
+    const cn = session.data?.contactName;
+    if (!cn || cn === 'WhatsApp Lead') return '';
+    return cn.split(' ')[0];
 }
 
 const NOT_INTERESTED_TRIGGERS = ['not interested', 'no thanks', 'don\'t want', 'dont want', 'wrong number', 'galat number', 'nahi chahiye', 'band karo', 'mat bhejo', 'unsubscribe', 'stop messaging', 'please stop', 'remove me'];
@@ -422,7 +529,9 @@ function passiveExtract(message, session) {
             const isLetters = /^[a-zA-Zऀ-ॿ\s.'-]+$/.test(t);
             // Don't accept short generic replies — those are handled by other paths
             const notGeneric = !['yes','no','ok','haan','nahi','sure','hi','hello','start','later','baad mein','baad'].includes(t.toLowerCase());
-            if (isShort && isLetters && notGeneric) {
+            // Don't accept LASIK intent words, medical terms, or other non-city answers as cities
+            const notBlacklisted = !CITY_BLACKLIST.has(t.toLowerCase());
+            if (isShort && isLetters && notGeneric && notBlacklisted) {
                 d.city = words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
             }
         }
@@ -433,7 +542,22 @@ function passiveExtract(message, session) {
         const hasContext = powerContext.some(w => m.includes(w)) || /[-+]\d/.test(message);
         const powerMatch = message.match(/[-+]?\d+(\.\d+)?/);
         const justAskedPower = d.lastAskedField === 'EYE_POWER';
-        if (powerMatch && (hasContext || session.state === 'EYE_POWER' || justAskedPower)) {
+        // ─── SAFETY: "No glasses/lens" handler ───
+        // User says "no lens", "no glasses", "nahi pehanta" etc. when asked about eye power
+        // → They likely mean "no contact lenses, only glasses". Clarify instead of looping.
+        // But if they clearly say "no glasses no lens" or "bina chashma", accept as no-power.
+        const noGlassesStrong = /\b(no glass|no lens|bina chashma|chashma nahi|chasma nahi|nahi pehanta|nahi pehnta|nahi lagata|without glass)\b/i.test(m);
+        const noLensOnly = /^no\s*lens(es)?$/i.test(message.trim()) || /^no$/i.test(message.trim());
+        if (justAskedPower && noGlassesStrong && !noLensOnly) {
+            // Strong "no glasses" signal — mark as no-power and move on
+            d.eyePower = { raw: 'No glasses/lenses', parsed: 'none', numeric: null, confidence: 'user_stated' };
+            d.lastAskedField = null;
+        } else if (justAskedPower && noLensOnly) {
+            // "No lens" alone = probably means no contacts, might still have glasses
+            // Don't capture yet — the bot will clarify via getNextQuestion
+            // Just mark as a partial response so we don't loop
+            d._noLensStated = true;
+        } else if (powerMatch && (hasContext || session.state === 'EYE_POWER' || justAskedPower)) {
             d.eyePower = parseEyePower(message);
             d.concern_power = true;
             d.lastAskedField = null; // clear so it doesn't keep matching
@@ -521,33 +645,15 @@ async function checkExistingLead(phone) {
     } catch (e) { console.error('[BOT] checkExistingLead error:', e.message); return null; }
 }
 
-// ─── INACTIVITY TIMER ────────────────────────────────────────────────────────
-function getPersonalizedFollowup(session) {
-    const d = session.data; const lang = session.lang || 'EN';
-    const name = d.contactName && d.contactName !== 'WhatsApp Lead' ? `, ${d.contactName.split(' ')[0]}` : '';
-    const powerNum = getEyePowerNumeric(d.eyePower);
-    if (powerNum !== null && powerNum <= -5) return { EN: `Hey${name} 😊 Many people with higher powers explore ICL too — our specialist can guide you on the best option!`, HI: `नमस्ते${name} 😊 High power वाले लोग ICL भी explore करते हैं — specialist best option बता सकते हैं!` }[lang];
-    if (d.interest_cost) return { EN: `Hey${name} 😊 LASIK costs vary by technology — our specialist can give you an exact quote!`, HI: `नमस्ते${name} 😊 LASIK की cost technology पर depend करती है — specialist exact quote दे सकते हैं!` }[lang];
-    if (d.interest_recovery) return { EN: `Hey${name} 😊 Most LASIK patients are back to normal the very next day. Quick and easy 😊`, HI: `नमस्ते${name} 😊 ज़्यादातर LASIK patients अगले दिन से normal हो जाते हैं। जल्दी और आसान 😊` }[lang];
-    return { EN: `Hey${name} 😊 Still thinking about LASIK? Feel free to ask me anything!`, HI: `नमस्ते${name} 😊 अभी भी LASIK के बारे में सोच रहे हैं? कुछ भी पूछें!` }[lang];
-}
-
+// ─── INACTIVITY TIMER — DISABLED ─────────────────────────────────────────────
+// The 10-minute followup was too aggressive for a ₹15K-90K decision with a
+// 31-day median cycle. It also risked re-engaging angry/disengaged leads.
+// Leads are now handled by the sales rep after CRM push.
 function resetInactivityTimer(phone) {
     const session = botSessions[phone];
     if (!session) return;
-    if (session.inactivityTimer) clearTimeout(session.inactivityTimer);
-    session.inactivityTimer = setTimeout(async () => {
-        const s = botSessions[phone];
-        if (!s || s.data.opted_out) return;
-        if (s.data.followup_sent_count >= 1) return;
-        s.inactivityTimer = null;
-        const today = new Date().toISOString().slice(0, 10);
-        if (s.data.last_followup_date === today) { await sendToAPI(phone, s, 'timeout'); return; }
-        await sendWhatsAppReply(phone, getPersonalizedFollowup(s));
-        s.data.last_followup_date = today;
-        s.data.followup_sent_count = (s.data.followup_sent_count || 0) + 1;
-        await sendToAPI(phone, s, 'timeout'); schedulePersist();
-    }, INACTIVITY_MS);
+    if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
+    // No new timer — inactivity followup removed per founder decision.
 }
 
 // ─── KNOWLEDGE BASE ───────────────────────────────────────────────────────────
@@ -624,7 +730,7 @@ function buildKnowledgeResponse(message, session) {
         if (shouldOfferCallback(session) && !isCallbackAlreadyOffered) {
             if (!session.data.callback_offered) session.data.callback_offered = true;
             session.data.request_call = true; session.data.human_handoff_started = true; session.data.callback_source = 'knowledge_trigger'; session.state = 'COMPLETE';
-            const fn = session.data.contactName ? session.data.contactName.split(' ')[0] : '';
+            const fn = safeFirstName(session);
             baseReply += `\n\n${getEscalationMessage('candidate', lang, fn)}`;
         } else {
             const nextStep = getNextQuestion(session, 'resume');
@@ -646,6 +752,22 @@ function buildKnowledgeResponse(message, session) {
 
 // ─── WHATSAPP SEND (uses polyfilled globalThis.fetch) ────────────────────────
 async function sendWhatsAppReply(phone, reply) {
+    // ─── LOOP GUARD: block byte-identical replies ───
+    if (isLooping(phone, reply)) {
+        console.warn(`[LOOP] 🔁 Blocked repeated reply to ${phone} — pausing bot`);
+        try {
+            await supabaseAdmin.from('whatsapp_conversations')
+                .upsert({ phone, bot_paused: true, updated_at: new Date().toISOString() }, { onConflict: 'phone' });
+        } catch(e) { console.warn('[LOOP] pause-write failed:', e.message); }
+        if (isPushConfigured()) {
+            fanout(supabaseAdmin, {
+                title: '🔁 Bot loop detected',
+                body: `Bot was repeating to ${phone} — auto-paused`,
+                phone, url: `/m?phone=${encodeURIComponent(phone)}`, kind: 'escalation'
+            }).catch(() => {});
+        }
+        return;
+    }
     const url = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
     let rawText = '';
     try {
@@ -655,6 +777,7 @@ async function sendWhatsAppReply(phone, reply) {
         if (rawText.trim().startsWith('{')) {
             const data = JSON.parse(rawText);
             console.log('[WA SEND] ✅', JSON.stringify(data));
+            trackOutbound(phone, reply); // track hash for loop detection
             // ─── WhatsApp Engine: capture every outbound message ───
             const _sentId = data.messages?.[0]?.id || null;
             saveWhatsAppMessage({
@@ -764,7 +887,60 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         session.repeat_count = session.repeat_count || {};
 
-        if (isNotInterested(msgLow)) { session.data.opted_out = true; if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; } setReply(t('NOT_INTERESTED', lang)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
+        // ─── SAFETY NET: Not interested → pause bot in DB so restarts don't re-engage ───
+        if (isNotInterested(msgLow)) {
+            session.data.opted_out = true;
+            if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
+            supabaseAdmin.from('whatsapp_conversations')
+                .upsert({ phone, bot_paused: true, updated_at: new Date().toISOString() }, { onConflict: 'phone' }).catch(() => {});
+            setReply(t('NOT_INTERESTED', lang));
+            return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
+        }
+
+        // ─── SAFETY NET: Disengagement + abuse detection ───
+        if (isDisengaged(msgLow) || isAbusive(msgLow)) {
+            const abuse = isAbusive(msgLow);
+            session.data.opted_out = true;
+            if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
+            supabaseAdmin.from('whatsapp_conversations')
+                .upsert({ phone, bot_paused: true, updated_at: new Date().toISOString() }, { onConflict: 'phone' }).catch(() => {});
+            if (isPushConfigured()) {
+                fanout(supabaseAdmin, {
+                    title: abuse ? '🚨 Angry lead — bot paused' : '⏸️ Lead disengaged',
+                    body: `${safeFirstName(session) || phone}: "${message.slice(0, 60)}"`,
+                    phone, url: `/m?phone=${encodeURIComponent(phone)}`, kind: 'escalation'
+                }).catch(() => {});
+            }
+            setReply(lang === 'HI'
+                ? 'समझ गया 🙏 ख्याल रखें! कभी भी बात करना चाहें तो message करें।'
+                : 'Got it 🙏 Take care! Message us anytime you want to talk.');
+            return finalizeWithIngest(phone, session, 'disengaged', finalize, isTestChat);
+        }
+
+        // ─── SAFETY NET: Name correction ("my name isn't lipoma") ───
+        const nameCorr = checkNameCorrection(message, session);
+        if (nameCorr === 'cleared') {
+            setReply(lang === 'HI'
+                ? 'माफ़ कीजिए! 🙏 आपका नाम क्या है?'
+                : 'Sorry about that! 🙏 What should I call you?');
+            return finalizeWithIngest(phone, session, 'name_correction', finalize, isTestChat);
+        }
+        if (nameCorr === 'captured') {
+            const fn = safeFirstName(session);
+            const next = getNextQuestion(session);
+            const ack = lang === 'HI' ? `धन्यवाद, ${fn}! 😊` : `Thanks, ${fn}! 😊`;
+            setReply(next.text ? `${ack}\n\n${next.text}` : ack);
+            session.state = 'CORE_CONSULT';
+            return finalizeWithIngest(phone, session, 'name_correction', finalize, isTestChat);
+        }
+
+        // ─── SAFETY NET: Off-topic body condition ("lipoma ho gyi hai") ───
+        if (isOffTopic(message)) {
+            setReply(lang === 'HI'
+                ? 'मैं Relive Cure का vision assistant हूँ — इस concern के लिए सही specialist से मिलें 🙏\n\nक्या आपकी आँखों से जुड़ा कोई सवाल है?'
+                : 'I\'m Relive Cure\'s vision assistant — for that concern, please consult the right specialist 🙏\n\nDo you have any questions about your eyes?');
+            return finalizeWithIngest(phone, session, 'off_topic', finalize, isTestChat);
+        }
 
         const restartWords = ['hi', 'hello', 'hey', 'start', 'hii', 'helo', 'नमस्ते', 'हेलो', 'शुरू'];
         if (restartWords.some(w => msgLow === w || message === w)) {
@@ -773,9 +949,9 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
         }
 
-        if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = session.data.contactName ? session.data.contactName.split(' ')[0] : ''; setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
+        if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = safeFirstName(session); setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
-        if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = session.data.contactName ? session.data.contactName.split(' ')[0] : ''; setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
+        if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = safeFirstName(session); setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
         const knowledge = buildKnowledgeResponse(message, session);
         if (knowledge) { setReply(knowledge); return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat); }
@@ -793,7 +969,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         else if (state === 'RETURNING') {
             const lead = await checkExistingLead(phone);
-            const fn = session.data.contactName ? session.data.contactName.split(' ')[0] : '';
+            const fn = safeFirstName(session);
             if (lead && lead.pushed_to_crm) { session.state = 'COMPLETE'; const r = { EN: `Welcome back${fn ? `, ${fn}` : ''}! 👋 Your details are saved ✅\n\nHow can I help?\n• Ask about cost or recovery\n• Or say *call* for a specialist`, HI: `वापस आए${fn ? `, ${fn}` : ''}! 👋 Details saved हैं ✅\n\nकैसे help करूँ?\n• Cost या recovery जानें\n• Specialist के लिए *call* लिखें` }; setReply(r[lang] || r.EN); }
             else { const next = getNextQuestion(session); if (next.field) { const r = { EN: `Welcome back! Let's continue.\n\n${next.text}`, HI: `वापस आए! जारी रखते हैं।\n\n${next.text}` }; setReply(r[lang] || r.EN); session.state = 'CORE_CONSULT'; } else { session.state = 'COMPLETE'; setReply(getRandomCompleteReply(lang)); session.data.request_call = true; } }
         }
@@ -820,7 +996,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 }
             } else {
                 if (message && message !== 'WhatsApp Lead' && (!session.data.contactName || session.data.contactName === 'WhatsApp Lead')) session.data.contactName = message;
-                const fn = (session.data.contactName || message).split(' ')[0];
+                const fn = safeFirstName(session) || message.split(' ')[0];
                 setReply({ EN: `Nice to meet you, ${fn} 😊\nAre you exploring LASIK, specs removal, or just checking options right now?`, HI: `आपसे मिलकर अच्छा लगा, ${fn} 😊\nक्या आप LASIK, specs removal, या सिर्फ options explore कर रहे हैं?` }[lang]);
                 session.state = 'CORE_CONSULT';
             }
@@ -828,10 +1004,20 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         else if (state === 'CORE_CONSULT') {
             if (!session.data.powerStability && getEyePowerNumeric(session.data.eyePower) !== null && getEyePowerNumeric(session.data.eyePower) <= -5) session.data.powerStability = message;
+
+            // ─── SAFETY: Handle "no lens" clarification ───
+            if (session.data._noLensStated && session.data.lastAskedField === 'EYE_POWER') {
+                delete session.data._noLensStated;
+                // User said "no lens" — ask specifically about glasses
+                const clarify = { EN: 'Got it, no contact lenses! Do you wear glasses? If yes, what\'s the power? 😊', HI: 'समझ गया, contact lens नहीं! क्या आप glasses पहनते हैं? अगर हाँ, तो power क्या है? 😊' };
+                setReply(clarify[lang] || clarify.EN);
+                return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
+            }
+
             if (shouldOfferCallback(session)) {
                 if (!session.data.callback_offered) session.data.callback_offered = true;
                 session.data.request_call = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true;
-                const fn = session.data.contactName ? session.data.contactName.split(' ')[0] : '';
+                const fn = safeFirstName(session);
                 const ack = getAcknowledgement(message, lang);
                 const cbMsg = getEscalationMessage('candidate', lang, fn);
                 setReply(ack ? `${ack}\n\n${cbMsg}` : cbMsg);
