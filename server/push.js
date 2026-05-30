@@ -4,8 +4,8 @@
 
 import webpush from 'web-push';
 
-const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || 'BLtbdYQyzlnogD31ribxQCTAvvcyd4-iOqnmns3I6Ri5FWEmt5i-3Vw_49pYWOeOsGT0xl7UYfj2ov8WyUtrGus';
-const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'KkM8JdUFWkJxR5OYti3ZJnC4NuWxVX_2yEyXmuyO8b0';
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:hello@relivecure.com';
 
 let configured = false;
