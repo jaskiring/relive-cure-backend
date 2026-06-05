@@ -272,7 +272,7 @@ const BOT_MSG = {
     ASK_CITY: { EN: 'Which city are you based in? 📍', HI: 'आप किस शहर में रहते हैं? 📍' },
     ASK_EYE_POWER: { EN: 'Do you wear glasses or lenses? If yes, what\'s your approximate power? 😊', HI: 'क्या आप glasses या lenses पहनते हैं? अगर हाँ, तो approximate power क्या है? 😊' },
     ASK_POWER_STABILITY: { EN: 'How long has your power been stable?', HI: 'आपकी power कितने समय से stable है?' },
-    INVALID_NAME: { EN: 'Sorry 😊 What should I call you?', HI: 'माफ़ करें 😊 आपको क्या बुलाऊँ?' },
+    INVALID_NAME: { EN: 'I didn\'t catch that 😊 What should I call you?', HI: 'समझ नहीं आया 😊 आपको क्या बुलाऊँ?' },
     WELCOME_BACK: { EN: 'Welcome back! 👋 Would you like to continue where we left off? (Yes/No)', HI: 'वापस आए! 👋 क्या आप वहीं से जारी रखना चाहते हैं? (हाँ/नहीं)' },
     NOT_INTERESTED: { EN: 'No worries at all 😊 If you ever want guidance on eye care, we\'re always here. Take care!', HI: 'कोई बात नहीं 😊 अगर कभी guidance चाहिए, हम यहाँ हैं। ख्याल रखें!' },
     FALLBACK: { EN: 'I may not have the right information for that 😊 But our specialist will call you shortly and answer everything!', HI: 'इसके बारे में सही जानकारी मेरे पास नहीं है 😊 लेकिन specialist जल्द call करेंगे!' }
@@ -373,6 +373,11 @@ const NAME_BLACKLIST = new Set([
     // Hinglish/English question words — never valid names
     'kya', 'kaise', 'kab', 'kahan', 'kyu', 'kyon', 'kyun', 'kahaan', 'kab tak', 'kaisa',
     'what', 'how', 'where', 'when', 'why', 'who', 'which',
+    // Hindi time words (Latin + Devanagari) — appeared as captured names in real data
+    'now', 'kal', 'aaj', 'parso',
+    'कल', 'आज', 'परसों',
+    // Hinglish fillers found as names in real data
+    'not', 'in', 'koi', 'kuch', 'dost', 'yaar', 'kuchbhi',
 ]);
 
 // ─── SAFETY NET: Medical + common word blacklists ────────────────────────────
@@ -527,8 +532,11 @@ function passiveExtract(message, session) {
             const words = t.split(/\s+/);
             const isShort = t.length >= 2 && t.length <= 30 && words.length <= 2;
             const isLetters = /^[a-zA-Zऀ-ॿ\s.'-]+$/.test(t);
-            // Don't accept short generic replies — those are handled by other paths
-            const notGeneric = !['yes','no','ok','haan','nahi','sure','hi','hello','start','later','baad mein','baad'].includes(t.toLowerCase());
+            // Don't accept short generic replies — those are handled by other paths.
+            // Also check the first word so "No sorry" / "Yes please" are rejected.
+            const _tLow = t.toLowerCase();
+            const _genericFirst = ['yes','no','ok','haan','nahi','sure','hi','hello','start','later','baad mein','baad','sorry','not','nope','yep'];
+            const notGeneric = !_genericFirst.includes(_tLow) && !_genericFirst.includes(_tLow.split(/\s+/)[0]);
             // Don't accept LASIK intent words, medical terms, or other non-city answers as cities
             const notBlacklisted = !CITY_BLACKLIST.has(t.toLowerCase());
             if (isShort && isLetters && notGeneric && notBlacklisted) {
@@ -675,7 +683,7 @@ const KB = {
     SAFETY: { EN: '😊 LASIK is one of the *safest* eye procedures worldwide:\n\n• 98%+ success rate\n• No general anesthesia\n• Takes only 10–15 minutes\n• Full evaluation done before surgery', HI: '😊 LASIK दुनिया के *सबसे safe* procedures में से एक है:\n\n• 98%+ success rate\n• General anesthesia नहीं\n• सिर्फ 10–15 मिनट\n• Surgery से पहले पूरी evaluation' },
     TIMELINE: { EN: '📅 *LASIK at Relive Cure:*\n\n• Surgery: 10–15 mins (both eyes)\n• Same day discharge\n• Back to work next day\n• Driving: after 1–2 days', HI: '📅 *Relive Cure में LASIK:*\n\n• Surgery: 10–15 मिनट\n• Same day discharge\n• अगले दिन काम पर वापस\n• Driving: 1–2 दिन बाद' },
     REFERRAL: { EN: '🎁 Refer a friend → Earn *₹1,000* per surgery. No limit!\n\nOur team will share details when you book 😊', HI: '🎁 एक दोस्त refer करें → *₹1,000* कमाएँ। कोई limit नहीं!\n\nBooking पर team details देगी 😊' },
-    LOCATION: { EN: "I'll share the clinic details once we lock a slot for you 😊\n\nFirst — are you exploring LASIK, specs removal, or just checking options right now?", HI: "स्लॉट तय होने पर पूरी details शेयर कर दूँगी 😊\n\nपहले बताइए — LASIK करवाना है, चश्मा हटवाना है, या अभी सिर्फ options देख रहे हैं?" },
+    LOCATION: { EN: "Our sales specialist will call you shortly with all the details 😊\n\nWhile we get that set up — could you tell me which city you're in? 📍", HI: "हमारा sales specialist जल्द call करके सारी details share करेगा 😊\n\nतब तक — आप किस शहर से हैं? 📍" },
     ALTERNATIVES: { EN: '👓 LASIK vs Glasses:\n\n• LASIK → one-time cost, permanent freedom\n• Glasses → recurring cost, daily hassle\n• Sports / swimming → no glasses with LASIK ✅', HI: '👓 LASIK vs Chashma:\n\n• LASIK → एक बार का खर्च, हमेशा की आज़ादी\n• Chashma → बार-बार खर्च, रोज़ की परेशानी' },
     CONCERN: { EN: '😊 I hear you — blurry vision and being dependent on glasses is exactly what LASIK is designed to fix. Most patients become completely glasses-free after the procedure.\n\nOur specialist can check your eligibility properly — let me grab a couple of quick details first.', HI: '😊 मैं समझता हूँ — धुंधला दिखना और चश्मे पर निर्भर रहना, LASIK इसी के लिए बना है। ज़्यादातर patients procedure के बाद पूरी तरह चश्मा-मुक्त हो जाते हैं।\n\nSpecialist आपकी eligibility ठीक से check कर सकते हैं — पहले कुछ quick details ले लेता हूँ।' }
 };
@@ -855,8 +863,21 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             } catch (e) { console.error('[BOT] pause-check error', e.message); }
 
             if (!message && messageObj.type && messageObj.type !== 'text') {
-                const lang = botSessions[phone]?.lang || 'EN';
-                await sendWhatsAppReply(phone, lang === 'HI' ? 'मैं अभी सिर्फ text process कर सकता हूँ 😊 कृपया type करें।' : 'I can only process text right now 😊 Please type your question.'); return;
+                const _mLang = botSessions[phone]?.lang || 'EN';
+                const _mSess = botSessions[phone];
+                let _mReply;
+                if (messageObj.type === 'image') {
+                    _mReply = _mLang === 'HI'
+                        ? 'यह शायद आपकी prescription है 😊 मैं अभी images नहीं पढ़ सकता — क्या आप अपनी eye power type करेंगे (जैसे -2.5)?'
+                        : "Looks like you shared an image — possibly a prescription 😊 I can't read images yet. Could you type your eye power (e.g. -2.5)?";
+                } else {
+                    _mReply = _mLang === 'HI'
+                        ? 'मैं अभी सिर्फ text process कर सकता हूँ 😊 कृपया type करें।'
+                        : 'I can only process text right now 😊 Please type your message.';
+                }
+                if (!_mSess?.data?.contactName || _mSess?.data?.contactName === 'WhatsApp Lead')
+                    _mReply += (_mLang === 'HI' ? '\n\nआपका नाम क्या है?' : '\n\nWhat should I call you?');
+                await sendWhatsAppReply(phone, _mReply); return;
             }
         } else { phone = reqBody.phone; message = reqBody.message || ''; msgId = null; }
 
@@ -957,6 +978,16 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             const hasData = session.data.contactName && session.data.contactName !== 'WhatsApp Lead';
             if (hasData && !session.resume_offered) { session.state = 'ASK_RESUME'; session.resume_offered = true; setReply(t('WELCOME_BACK', lang)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
+        }
+
+        // Intercept WhatsApp CTA template re-click ("Hello! Can I get more info on this?")
+        // isValidName() rejects it due to '?' → bot would loop on INVALID_NAME without this.
+        if (msgLow.includes('can i get more info')) {
+            const hasName = session.data.contactName && session.data.contactName !== 'WhatsApp Lead';
+            if (!hasName) {
+                setReply(lang === 'EN' ? "Happy to help! 😊 Could I just get your name first?" : "ज़रूर! 😊 बस पहले अपना नाम बताइए?");
+                return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
+            }
         }
 
         if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = safeFirstName(session); setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
