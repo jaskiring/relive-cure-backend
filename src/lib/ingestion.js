@@ -1,14 +1,22 @@
 export const calculateParametersCompleted = (lead) => {
-    // Count ALL fields the bot actively collects + passively captures.
-    // The bot flow asks: Name → City → Eye Power → (Power Stability)
-    // Passive captures: insurance, timeline, preferred_surgery_city
+    // Count qualification parameters the bot captures.
+    // contact_name removed from scoring — it's now always 'WhatsApp Lead' since name collection
+    // was removed (leads get stuck at NAME). The 5 qualifying params are:
+    //   city (asked), eye_power (asked), insurance (passive), timeline (passive), request_call (explicit intent)
     const fields = [
-        'contact_name',            // Bot asks first
-        'city',                    // Bot asks second
-        'eye_power',               // Bot asks third (main qualifying question)
+        'city',                    // Bot asks first
+        'eye_power',               // Bot asks second (main qualifying question)
         'insurance',               // Passive capture from user messages
         'timeline',                // Passive capture from user messages
     ];
+    // request_call counts as the 5th parameter — explicit callback = highest intent signal
+    if (lead.request_call) return Math.min(5, fields.reduce((c, f) => {
+        const val = lead[f]; if (!val) return c;
+        const str = String(val).trim();
+        if (!str || str === 'WhatsApp Lead') return c;
+        if (f === 'eye_power' && typeof val === 'object' && val.raw) return c + 1;
+        return str ? c + 1 : c;
+    }, 0) + 1); // +1 for request_call
     let count = 0;
     for (const field of fields) {
         const val = lead[field];

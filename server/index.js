@@ -630,7 +630,11 @@ async function sendToAPI(phone, session, trigger = 'update') {
         source: 'whatsapp', bot_version: 'v6.2-stable',
         first_message_at: d.first_message_at || session.last_activity_at || new Date().toISOString(),
         last_message_at: session.last_activity_at || new Date().toISOString(),
-        message_count: d.message_count || 1, current_flow_state: session.state || 'UNKNOWN'
+        message_count: d.message_count || 1, current_flow_state: session.state || 'UNKNOWN',
+        // Opt-out and disengagement — previously lost in memory, now persisted
+        opted_out: d.opted_out || false,
+        disengagement_trigger: d.disengagement_trigger ? d.disengagement_trigger.slice(0, 200) : null,
+        is_returning: d.is_returning || false,
     };
 
     try {

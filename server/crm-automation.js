@@ -1135,7 +1135,12 @@ async function processLead(lead) {
     const isTest = !!(lead.is_test || (lead.contact_name || '').toUpperCase().includes('TEST'));
     const intentTag = (lead.intent_level || 'WARM').toUpperCase();
     const subjectPrefix = isTest ? '[TEST] ' : '';
-    const subject = `${subjectPrefix}[${intentTag}] LASIK Lead — ${realName} (${cleanPhone})`;
+    // Build a meaningful subject since contact_name is now always 'WhatsApp Lead'
+    const cityPart = (lead.city || '').trim() ? `${lead.city}` : 'City N/A';
+    const langPart = (lead.language || 'EN').toUpperCase() === 'HI' ? '🇮🇳 HI' : '🇬🇧 EN';
+    const powerPart = lead.eye_power ? ` · ${lead.eye_power}` : '';
+    const callPart  = lead.request_call ? ' · 📞' : '';
+    const subject = `${subjectPrefix}[${intentTag}] LASIK — ${cityPart}${powerPart}${callPart} · ${langPart} (${cleanPhone})`;
 
     const subjectResult = await page.$eval(SEL.subject, (el, val) => {
       el.focus();
@@ -1178,6 +1183,9 @@ async function processLead(lead) {
       `📍 City:        ${lead.city || 'Not shared'}`,
       `🏥 Surgery City: ${lead.preferred_surgery_city || lead.city || 'Not shared'}`,
       `🗣️ Language:     ${(lead.language || 'EN').toUpperCase() === 'HI' ? 'Hindi' : 'English'}`,
+      `🔁 Returning:   ${lead.is_returning ? '✅ YES (had previous conversation)' : 'No — first contact'}`,
+      lead.opted_out ? `⛔ OPTED OUT:   YES — "${lead.disengagement_trigger || 'said stop/bye'}" — DO NOT send unsolicited messages` : '',
+      `📅 First Msg:   ${lead.first_message_at ? new Date(lead.first_message_at).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' }) : 'N/A'}`,
       ``,
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
       `👁️ CLINICAL INFO`,

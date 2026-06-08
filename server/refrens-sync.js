@@ -393,9 +393,38 @@ export async function syncRefrensLeads(supabaseAdmin) {
             else upserted += Math.min(100, deduped.length - i);
         }
 
+        // ── Write CRM outcomes back to leads_surgery ────────────────────────────
+        // After syncing Refrens data, update leads_surgery rows whose phone matches
+        // a Refrens record that now has a terminal status (Deal Done / Lost).
+        // This closes the loop: founder sees full journey in one place, no stale "Pushed" statuses.
+        let writeback = 0;
+        try {
+            const terminalRows = deduped.filter(r => /deal done|won|lost|not serviceable/i.test(r.status || ''));
+            for (const r of terminalRows) {
+                if (!r.phone) continue;
+                const normalizedPhone = String(r.phone).replace(/\D/g, '').slice(-10);
+                if (!normalizedPhone || normalizedPhone.length < 8) continue;
+                const crmStatus = /deal done|won/i.test(r.status) ? 'converted' : 'lost_in_crm';
+                const { error: wbErr } = await supabaseAdmin
+                    .from('leads_surgery')
+                    .update({
+                        crm_outcome: crmStatus,              // new field — outcome from CRM
+                        crm_status_label: r.status || '',    // e.g. "Deal Done", "Lost"
+                        crm_assignee: r.assignee || null,
+                        crm_date_closed: r.date_closed || null,
+                        crm_last_note: r.last_internal_note || null,
+                    })
+                    .like('phone_number', `%${normalizedPhone}`);  // matches with or without country code
+                if (!wbErr) writeback++;
+            }
+            if (writeback > 0) console.log(`[REFRENS SYNC] ↩️ Wrote back CRM outcome to ${writeback} leads_surgery rows`);
+        } catch (wbEx) {
+            console.warn('[REFRENS SYNC] Write-back failed (non-fatal):', wbEx.message);
+        }
+
         const duration = ((Date.now() - startTime)/1000).toFixed(1);
-        console.log(`[REFRENS SYNC] ✅ Done in ${duration}s — ${upserted} upserted`);
-        return { success: true, total_rows: rows.length, valid_rows: deduped.length, upserted, errors, duration_seconds: duration, synced_at: new Date().toISOString() };
+        console.log(`[REFRENS SYNC] ✅ Done in ${duration}s — ${upserted} upserted, ${writeback} written back`);
+        return { success: true, total_rows: rows.length, valid_rows: deduped.length, upserted, errors, writeback, duration_seconds: duration, synced_at: new Date().toISOString() };
 
     } catch (err) {
         console.error('[REFRENS SYNC] ❌ Fatal:', err.message);
