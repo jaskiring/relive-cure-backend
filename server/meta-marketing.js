@@ -978,6 +978,9 @@ export async function getCampaignLeads(campaignId) {
     if (/warm|interested|considering|follow|maybe/i.test(callOutcome)) return 'WARM';
     if (/not interested|wrong|junk|irrelevant|dnp/i.test(callOutcome)) return 'COLD';
 
+    // 3b. Chatbot request_call flag — explicit callback = HOT
+    if (bot?.request_call) return 'HOT';
+
     // 4. CRM status inference
     const status = (refrens?.status || '').toLowerCase();
     if (/deal done|won|surgery done|surgery booked/i.test(status)) return 'HOT';
