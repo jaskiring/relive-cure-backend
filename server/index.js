@@ -266,8 +266,8 @@ function detectLanguageWithConfidence(message) {
 function t(key, lang) { const e = BOT_MSG[key]; if (!e) return ''; return e[lang] || e['EN']; }
 
 const BOT_MSG = {
-    GREETING: { EN: 'Hi! 😊 I\'m your Relive Cure vision assistant.\n\nWhat should I call you?', HI: 'नमस्ते! 😊 मैं आपका Relive Cure vision assistant हूँ।\n\nआपको क्या बुलाऊँ?' },
-    GREETING_HIGH_INTENT: { EN: 'Great! I can definitely help with that 😊\n\nWhat should I call you?', HI: 'बिल्कुल! मैं इसमें आपकी मदद कर सकता हूँ 😊\n\nआपको क्या बुलाऊँ?' },
+    GREETING: { EN: 'Hi! 😊 I\'m Relive Cure\'s vision assistant.\n\nAre you exploring LASIK, specs removal, or just checking options?', HI: 'नमस्ते! 😊 मैं Relive Cure का vision assistant हूँ।\n\nक्या आप LASIK, specs removal, या सिर्फ options देख रहे हैं?' },
+    GREETING_HIGH_INTENT: { EN: 'Great! I can definitely help with that 😊\n\nAre you exploring LASIK, specs removal, or just checking options?', HI: 'बिल्कुल! मैं इसमें मदद कर सकता हूँ 😊\n\nक्या आप LASIK, specs removal, या options देख रहे हैं?' },
     ASK_NAME: { EN: 'What should I call you? 😊', HI: 'आपको क्या बुलाऊँ? 😊' },
     ASK_CITY: { EN: 'Which city are you based in? 📍', HI: 'आप किस शहर में रहते हैं? 📍' },
     ASK_EYE_POWER: { EN: 'Do you wear glasses or lenses? If yes, what\'s your approximate power? 😊', HI: 'क्या आप glasses या lenses पहनते हैं? अगर हाँ, तो approximate power क्या है? 😊' },
@@ -707,8 +707,7 @@ function getNextQuestion(session, context = 'normal') {
     const d = session.data; const lang = session.lang || 'EN';
     const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' ? d.contactName.split(' ')[0] : '';
     let field = null, text = '';
-    if (!d.contactName) { field = 'NAME'; text = t('ASK_NAME', lang); }
-    else if (!d.city) { field = 'CITY'; text = t('ASK_CITY', lang); }
+    if (!d.city) { field = 'CITY'; text = t('ASK_CITY', lang); }
     else if (!d.eyePower) { field = 'EYE_POWER'; text = t('ASK_EYE_POWER', lang); }
     else if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) { field = 'POWER_STABILITY'; text = t('ASK_POWER_STABILITY', lang); }
     if (!field) return { text: '', field: null };
@@ -1000,12 +999,16 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         const state = session.state;
         session.repeat_count[state] = (session.repeat_count[state] || 0) + 1;
 
-        if (state === 'GREETING') { session.state = 'NAME'; setReply(isHighIntentFirst(msgLow) ? t('GREETING_HIGH_INTENT', lang) : t('GREETING', lang)); }
+        if (state === 'GREETING') {
+            session.state = 'CORE_CONSULT';
+            if (!session.data.contactName) session.data.contactName = 'WhatsApp Lead';
+            setReply(isHighIntentFirst(msgLow) ? t('GREETING_HIGH_INTENT', lang) : t('GREETING', lang));
+        }
 
         else if (state === 'ASK_RESUME') {
             const isYes = ['yes', 'haan', 'ha', 'ok', 'okay', 'sure', 'हाँ', 'ठीक', 'bilkul', 'ji'].some(w => msgLow.includes(w));
             if (isYes) { const next = getNextQuestion(session); if (next.field) { const r = { EN: `Great! Let's continue.\n\n${next.text}`, HI: `बढ़िया! जारी रखते हैं।\n\n${next.text}` }; setReply(r[lang] || r.EN); session.state = 'CORE_CONSULT'; } else { session.state = 'COMPLETE'; setReply(getRandomCompleteReply(lang)); session.data.request_call = true; } }
-            else { session.state = 'GREETING'; session.data = {}; session.repeat_count = {}; session.resume_offered = false; setReply(t('GREETING', lang)); session.state = 'NAME'; }
+            else { session.state = 'CORE_CONSULT'; session.data = { contactName: 'WhatsApp Lead' }; session.repeat_count = {}; session.resume_offered = false; setReply(t('GREETING', lang)); }
         }
 
         else if (state === 'RETURNING') {
