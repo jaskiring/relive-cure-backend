@@ -876,10 +876,14 @@ async function getAccountBenchmark() {
   if (refrensIds.length > 0) {
     const { data: rls } = await supabaseAdmin
       .from('refrens_leads')
-      .select('id, intent_band, status')
+      .select('id, intent_band, status, labels, call_outcome, follow_up_date')
       .in('id', refrensIds);
     for (const r of (rls || [])) {
-      if (r.intent_band === 'HOT' || /hot/i.test(r.intent_band || '')) hot++;
+      const _band = (r.intent_band || '').toLowerCase();
+      const _labels = (r.labels || '').toLowerCase();
+      const _co = (r.call_outcome || '').toLowerCase();
+      const _st = (r.status || '').toLowerCase();
+      if (/hot/.test(_band) || /hot|high intent|very interested/.test(_labels) || /hot|very interested/.test(_co) || /deal done|won|surgery/.test(_st)) hot++;
       if (/deal done|won|surgery done|surgery booked/i.test(r.status || '')) surgeries++;
     }
   }
@@ -931,7 +935,7 @@ export async function getCampaignLeads(campaignId) {
   if (refrensIds.length > 0) {
     const { data } = await supabaseAdmin
       .from('refrens_leads')
-      .select('id, status, intent_band, intent_score, assignee, last_internal_note, date_closed, lead_source, customer_city')
+      .select('id, status, intent_band, intent_score, assignee, last_internal_note, date_closed, lead_source, customer_city, labels, follow_up_date, call_outcome')
       .in('id', refrensIds);
     for (const r of (data || [])) refrensMap[r.id] = r;
   }
@@ -954,15 +958,41 @@ export async function getCampaignLeads(campaignId) {
   } catch { /* non-fatal */ }
 
   // Derive intent + stage per lead, then collect aggregations in one pass.
+  // Priority: explicit intent_band → Refrens labels → call_outcome → CRM status inference → chatbot → WARM default for matched leads
   function intentOf(lead, refrens, bot) {
-    const band = refrens?.intent_band;
-    if (band === 'HOT' || /hot/i.test(band || '')) return 'HOT';
-    if (band === 'WARM' || /warm/i.test(band || '')) return 'WARM';
-    if (band === 'COLD' || /cold/i.test(band || '')) return 'COLD';
-    // Fallback to chatbot's derived intent
+    // 1. Explicit intent_band (rarely set)
+    const band = (refrens?.intent_band || '').trim();
+    if (/hot/i.test(band)) return 'HOT';
+    if (/warm/i.test(band)) return 'WARM';
+    if (/cold/i.test(band)) return 'COLD';
+
+    // 2. Refrens labels — reps tag leads as "High Intent", "Warm", etc.
+    const labels = (refrens?.labels || '').toLowerCase();
+    if (/hot|high intent|very interested|urgent/i.test(labels)) return 'HOT';
+    if (/warm|interested|follow.?up/i.test(labels)) return 'WARM';
+    if (/cold|dnp|junk|spam|not interested|wrong/i.test(labels)) return 'COLD';
+
+    // 3. Call outcome
+    const callOutcome = (refrens?.call_outcome || '').toLowerCase();
+    if (/hot|very interested|callback|convert/i.test(callOutcome)) return 'HOT';
+    if (/warm|interested|considering|follow|maybe/i.test(callOutcome)) return 'WARM';
+    if (/not interested|wrong|junk|irrelevant|dnp/i.test(callOutcome)) return 'COLD';
+
+    // 4. CRM status inference
+    const status = (refrens?.status || '').toLowerCase();
+    if (/deal done|won|surgery done|surgery booked/i.test(status)) return 'HOT';
+    if (/consult|booked|in[- ]progress/i.test(status)) return 'WARM';
+    if (/lost|dnp|not interested|not serviceable|junk/i.test(status)) return 'COLD';
+    if (refrens?.follow_up_date) return 'WARM'; // rep set a follow-up date → they're engaged
+
+    // 5. Chatbot's derived intent (for chatbot-matched leads)
     const lvl = (bot?.intent_level || '').toUpperCase();
     if (lvl === 'HOT' || lvl === 'WARM' || lvl === 'COLD') return lvl;
-    return 'Unknown';
+
+    // 6. Matched to CRM but no signal = at least WARM (they filled a Meta Lead Ad form — an active inquiry)
+    if (lead.matched_lead_id) return 'WARM';
+
+    return 'Unknown'; // unmatched: no data at all
   }
   function stageOf(lead, refrens, bot) {
     const status = refrens?.status || bot?.status || '';
