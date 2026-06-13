@@ -21,6 +21,7 @@ import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
+import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
 
 // In-memory upload (we re-stream to Meta immediately; files are bounded to ~25MB).
@@ -109,6 +110,46 @@ app.get('/api/diag/crm-form', async (req, res) => {
         res.json({ success: true, ...dump });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message, stack: e.stack?.split('\n').slice(0, 5) });
+    }
+});
+
+// ─── Sanity check ─────────────────────────────────────────────────────────────
+async function runSanityCheck() {
+    const [labelsRes, statusRes] = await Promise.all([
+        supabaseAdmin.from('refrens_leads').select('labels'),
+        supabaseAdmin.from('refrens_leads').select('status'),
+    ]);
+    const knownLabels = new Set(REFRENS_LABELS);
+    const unknownLabels = new Set();
+    labelsRes.data?.forEach(row => {
+        if (!row.labels) return;
+        row.labels.split(',').forEach(l => { const t = l.trim(); if (t && !knownLabels.has(t)) unknownLabels.add(t); });
+    });
+    const knownStatuses = new Set(REFRENS_STATUS);
+    const unknownStatuses = new Set();
+    statusRes.data?.forEach(row => { if (row.status && !knownStatuses.has(row.status)) unknownStatuses.add(row.status); });
+    const alarms = [];
+    if (unknownLabels.size > 0) alarms.push(`Unknown labels: ${[...unknownLabels].join(', ')}`);
+    if (unknownStatuses.size > 0) alarms.push(`Unknown statuses: ${[...unknownStatuses].join(', ')}`);
+    if (alarms.length > 0) {
+        console.warn('[SANITY] ⚠️', alarms.join(' | '));
+        if (isPushConfigured()) {
+            fanout(supabaseAdmin, { title: '⚠️ Vocabulary drift', body: alarms.join(' | ').slice(0, 100), url: '/m', kind: 'escalation' }).catch(() => {});
+        }
+    } else {
+        console.log('[SANITY] ✅ All labels/statuses known');
+    }
+    return { alarms, checkedAt: new Date().toISOString() };
+}
+
+app.get('/api/sanity-check', async (req, res) => {
+    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        const result = await runSanityCheck();
+        res.json({ ok: true, ...result });
+    } catch (e) {
+        console.error('[SANITY] ❌ route error:', e.message);
+        res.status(500).json({ ok: false, error: e.message });
     }
 });
 
@@ -1666,6 +1707,11 @@ app.listen(PORT, '0.0.0.0', () => {
     setTimeout(runMetaSync, 5 * 60 * 1000);
     setInterval(runMetaSync, 60 * 60 * 1000);
     console.log('[SCHEDULER] Meta sync: first run in 5 min, then every 1h');
+
+    // ─── Sanity-check scheduler (daily) ──────────────────────────────────────
+    setTimeout(() => runSanityCheck().catch(e => console.error('[SANITY] daily run failed:', e.message)), 10 * 60 * 1000);
+    setInterval(() => runSanityCheck().catch(e => console.error('[SANITY] daily run failed:', e.message)), 24 * 60 * 60 * 1000);
+    console.log('[SCHEDULER] Sanity check: first run in 10 min, then every 24h');
 
     // ─── Push fanout (Phase M3 + extended): new leads + inbound messages ────
     // Two watchers, same fanout helper. The notification payload always
