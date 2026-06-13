@@ -1,8 +1,10 @@
 -- unified_leads: single row per phone across refrens_leads, leads_surgery, whatsapp_conversations.
 -- refrens_leads uses contact_name (not name) and customer_city (not city).
 -- phone formats differ between systems; matched_both will be 0 until phone normalisation lands.
+-- Applied via DROP + CREATE (not CREATE OR REPLACE) because column order changed.
 
-CREATE OR REPLACE VIEW public.unified_leads AS
+DROP VIEW IF EXISTS public.unified_leads;
+CREATE VIEW public.unified_leads AS
 SELECT
   -- identity
   COALESCE(r.phone, ls.phone_number, wc.phone)               AS phone,
@@ -15,6 +17,7 @@ SELECT
   r.lead_source                                               AS lead_source,
   r.customer_city                                             AS refrens_city,
   ls.refrens_lead_url                                         AS refrens_lead_url,
+  ls.refrens_lead_id                                          AS ls_refrens_lead_id,
 
   -- bot / leads_surgery fields
   ls.id                                                       AS ls_id,
@@ -30,7 +33,12 @@ SELECT
 
   -- whatsapp
   wc.contact_name                                             AS wa_contact_name,
-  wc.last_message_at                                         AS last_message_at,
+  wc.last_message_at                                          AS last_message_at,
+
+  -- composite helpers for the dashboard
+  COALESCE(r.assignee, ls.assignee)                           AS assignee,
+  COALESCE(ls.last_user_message, r.last_internal_note)        AS last_user_message,
+  COALESCE(ls.last_activity_at, r.refrens_created_at, wc.last_message_at) AS best_created_at,
 
   -- presence flags
   (ls.id IS NOT NULL)                                         AS has_bot_lead,
