@@ -84,14 +84,14 @@ async function backfillCrmPushes() {
   console.log('[2/2] Fetching leads_surgery (pushed_to_crm=true) …');
   const leads = await fetchAll(
     'leads_surgery',
-    'phone_number, updated_at, intent_level, intent_score, parameters_completed',
+    'phone_number, created_at, intent_level, intent_score, parameters_completed',
     q => q.eq('pushed_to_crm', true)
   );
   console.log(`      ${leads.length} pushed leads found`);
 
   const events = leads.map(l => ({
     phone:      l.phone_number,
-    ts:         l.updated_at,
+    ts:         l.created_at,
     event_type: 'crm_pushed',
     source:     'system',
     payload: {
