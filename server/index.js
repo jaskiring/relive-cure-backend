@@ -1767,5 +1767,33 @@ app.listen(PORT, '0.0.0.0', () => {
       })
       .subscribe();
 
-    console.log('[PUSH] fanout active — INSERT on leads_surgery + whatsapp_messages');
+    supabaseAdmin
+      .channel('m-signal-push')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'lead_signals' }, async (payload) => {
+        const sig = payload.new;
+        if (!sig) return;
+        try {
+          const SIGNAL_TITLES = {
+            request_call_raised: '📞 Lead requested a callback!',
+            intent_hot:          '🔥 Lead just went HOT!',
+            intent_level_up:     '📈 Lead intent upgraded',
+            score_jump:          '⬆️ Lead score jumped',
+            concern_new:         '⚠️ New concern flagged',
+          };
+          const title = SIGNAL_TITLES[sig.signal_type] || '📊 Lead signal';
+          const detail = sig.old_value && sig.new_value ? ` · ${sig.old_value} → ${sig.new_value}` : '';
+          await fanout(supabaseAdmin, {
+            title,
+            body: `${sig.phone}${detail}`,
+            phone: sig.phone,
+            url: `/m?phone=${encodeURIComponent(sig.phone)}`,
+            kind: 'signal',
+          });
+        } catch (e) {
+          console.warn('[PUSH] signal fanout failed:', e.message);
+        }
+      })
+      .subscribe();
+
+    console.log('[PUSH] fanout active — INSERT on leads_surgery + whatsapp_messages + lead_signals');
 });
