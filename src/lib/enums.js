@@ -12,3 +12,6 @@ export const LS_STATUS = ['new', 'contacted', 'follow_up', 'ipd_done', 'lost', '
 export const HOT_KEYWORDS = /^(hot|high intent|urgent|very interested)$/i;
 
 export const CALLBACK_SRC = ['knowledge_trigger', 'fallback', 'sales_intent', 'escalation', 'completion'];
+
+// Signal types emitted by detectSignals() in ingestion.js when a material delta is detected.
+export const SIGNAL_TYPES = ['request_call_raised', 'intent_hot', 'score_jump', 'concern_new', 'intent_level_up'];
