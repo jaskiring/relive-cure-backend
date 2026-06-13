@@ -164,5 +164,23 @@ export const ingestLead = async (supabaseClient, leadData) => {
 
     const action = data ? 'UPSERTED' : 'SKIPPED';
     console.log(`[DB] Success | action=${action} | id=${data?.id || 'N/A'}`);
+
+    // Fire-and-forget lore event — never awaited, never throws into main path.
+    if (process.env.LEAD_EVENTS_ENABLED !== 'false') {
+      supabaseClient.from('lead_events').insert({
+        phone:      phone_number,
+        ts:         new Date().toISOString(),
+        event_type: 'bot_signal',
+        source:     'bot',
+        payload: {
+          parameters_completed: payload.parameters_completed,
+          intent_score:         payload.intent_score,
+          intent_level:         payload.intent_level,
+          request_call:         payload.request_call,
+          ingestion_trigger:    payload.ingestion_trigger,
+        },
+      }).then(() => {}).catch(e => console.error('[LORE] ingest lead_events failed:', e.message));
+    }
+
     return { data, action: action.toLowerCase() };
 };
