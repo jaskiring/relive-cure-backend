@@ -30,6 +30,38 @@ export const calculateParametersCompleted = (lead) => {
     return count;
 };
 
+const INTENT_RANK = { cold: 0, warm: 1, hot: 2 };
+
+export function detectSignals(oldRow, newPayload) {
+    if (!oldRow) return [];
+    const signals = [];
+
+    const oldIntent = (oldRow.intent_level || 'cold').toLowerCase();
+    const newIntent = (newPayload.intent_level || 'cold').toLowerCase();
+    const oldRank = INTENT_RANK[oldIntent] ?? 0;
+    const newRank = INTENT_RANK[newIntent] ?? 0;
+
+    if (!oldRow.request_call && newPayload.request_call === true)
+        signals.push({ signal_type: 'request_call_raised', old_value: 'false', new_value: 'true', payload: {} });
+
+    if (newRank === 2 && oldRank < 2)
+        signals.push({ signal_type: 'intent_hot', old_value: oldIntent, new_value: newIntent, payload: {} });
+    else if (newRank > oldRank)
+        signals.push({ signal_type: 'intent_level_up', old_value: oldIntent, new_value: newIntent, payload: {} });
+
+    const oldScore = oldRow.intent_score || 0;
+    const newScore = newPayload.intent_score || 0;
+    if (newScore - oldScore >= 20)
+        signals.push({ signal_type: 'score_jump', old_value: String(oldScore), new_value: String(newScore), payload: { delta: newScore - oldScore } });
+
+    for (const field of ['concern_pain', 'concern_safety', 'concern_power']) {
+        if (!oldRow[field] && newPayload[field] === true)
+            signals.push({ signal_type: 'concern_new', old_value: 'false', new_value: 'true', payload: { field } });
+    }
+
+    return signals;
+}
+
 export const checkDuplicate = async (supabaseClient, phoneNumber) => {
     if (!phoneNumber) return null;
 
@@ -146,13 +178,26 @@ export const ingestLead = async (supabaseClient, leadData) => {
     if (urgency_level)                   payload.urgency_level = urgency_level;
     if (is_returning !== undefined)      payload.is_returning = is_returning;
 
+    // Fetch old row before upsert so detectSignals can diff (best-effort — failure = no signals).
+    let oldRow = null;
+    if (process.env.LEAD_EVENTS_ENABLED !== 'false') {
+        try {
+            const { data: _old } = await supabaseClient
+                .from('leads_surgery')
+                .select('intent_level, intent_score, request_call, concern_pain, concern_safety, concern_power')
+                .eq('phone_number', phone_number)
+                .maybeSingle();
+            oldRow = _old;
+        } catch (_e) { /* non-fatal — skip signal detection */ }
+    }
+
     console.log(`[DB] Upserting lead | phone=${phone_number}`);
 
     const { data, error } = await supabaseClient
         .from('leads_surgery')
-        .upsert(payload, { 
+        .upsert(payload, {
             onConflict: 'phone_number',
-            ignoreDuplicates: false 
+            ignoreDuplicates: false
         })
         .select()
         .single();
@@ -165,8 +210,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
     const action = data ? 'UPSERTED' : 'SKIPPED';
     console.log(`[DB] Success | action=${action} | id=${data?.id || 'N/A'}`);
 
-    // Fire-and-forget lore event — never awaited, never throws into main path.
     if (process.env.LEAD_EVENTS_ENABLED !== 'false') {
+      // Fire-and-forget lore event.
       supabaseClient.from('lead_events').insert({
         phone:      phone_number,
         ts:         new Date().toISOString(),
@@ -180,6 +225,15 @@ export const ingestLead = async (supabaseClient, leadData) => {
           ingestion_trigger:    payload.ingestion_trigger,
         },
       }).then(() => {}).catch(e => console.error('[LORE] ingest lead_events failed:', e.message));
+
+      // Fire-and-forget signal detection — never throws into upsert path.
+      const signals = detectSignals(oldRow, payload);
+      if (signals.length > 0) {
+        console.log(`[SIGNALS] Detected ${signals.length} signal(s) for ${phone_number}:`, signals.map(s => s.signal_type).join(', '));
+        supabaseClient.from('lead_signals').insert(
+          signals.map(s => ({ phone: phone_number, ...s, detected_at: new Date().toISOString() }))
+        ).then(() => {}).catch(e => console.error('[SIGNALS] lead_signals insert failed:', e.message));
+      }
     }
 
     return { data, action: action.toLowerCase() };
