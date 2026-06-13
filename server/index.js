@@ -604,6 +604,16 @@ function scoreSession(session) {
 // ─── DIRECT DB INGEST — no HTTP ───────────────────────────────────────────────
 async function sendToAPI(phone, session, trigger = 'update') {
     const d = session.data; const scored = scoreSession(session);
+
+    // Use the real WhatsApp display name if the session never captured one.
+    // whatsapp_conversations.contact_name is already written by saveWhatsAppMessage
+    // before sendToAPI runs (it's called via setImmediate), so this read is safe.
+    if ((!d.contactName || d.contactName === 'WhatsApp Lead') && process.env.LEAD_EVENTS_ENABLED !== 'false') {
+      try {
+        const { data: _wc } = await supabaseAdmin.from('whatsapp_conversations').select('contact_name').eq('phone', phone).maybeSingle();
+        if (_wc?.contact_name) d.contactName = _wc.contact_name;
+      } catch (_e) { /* non-fatal — fallback stays 'WhatsApp Lead' */ }
+    }
     const eyePowerStr = getEyePowerString(d.eyePower);
     const eyePowerNum = getEyePowerNumeric(d.eyePower);
     const userQuestions = [
