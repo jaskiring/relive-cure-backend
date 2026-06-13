@@ -31,6 +31,17 @@ export async function saveWhatsAppMessage({ phone, direction, body = null, msgTy
         { onConflict: 'wa_message_id', ignoreDuplicates: true }
       );
 
+    // 1b. Fire-and-forget lore event — never awaited, never throws into main path.
+    if (process.env.LEAD_EVENTS_ENABLED !== 'false') {
+      supabaseAdmin.from('lead_events').insert({
+        phone,
+        ts,
+        event_type: direction === 'inbound' ? 'whatsapp_in' : 'whatsapp_out',
+        source:     direction === 'inbound' ? 'customer' : 'bot',
+        payload:    { body: body ? body.slice(0, 500) : null, msg_type: msgType, wa_message_id: waMessageId },
+      }).then(() => {}).catch(e => console.error('[LORE] whatsapp lead_events failed:', e.message));
+    }
+
     // 2. Upsert the conversation summary row (one per phone).
     const { data: existing } = await supabaseAdmin
       .from('whatsapp_conversations')
