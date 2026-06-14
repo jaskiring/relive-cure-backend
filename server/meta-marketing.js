@@ -82,6 +82,8 @@ export async function fetchCampaigns(accountId, token) {
   for (let i = 0; i < 20; i++) {
     const params = {
       fields: 'id,name,objective,status,daily_budget,lifetime_budget,start_time,stop_time',
+      // Only fetch campaigns Meta considers live — excludes DELETED/ARCHIVED
+      effective_status: JSON.stringify(['ACTIVE', 'PAUSED', 'IN_PROCESS', 'WITH_ISSUES']),
       limit: 100
     };
     if (after) params.after = after;
@@ -191,6 +193,7 @@ export async function runSync({ since, until } = {}) {
 
   const campaigns = await fetchCampaigns(accountId, token);
   if (campaigns.length > 0) {
+    const syncedAt = new Date().toISOString();
     const rows = campaigns.map(c => ({
       id: c.id,
       account_id: accountId,
@@ -201,12 +204,17 @@ export async function runSync({ since, until } = {}) {
       lifetime_budget: c.lifetime_budget ? Number(c.lifetime_budget) / 100 : null,
       start_time: c.start_time || null,
       stop_time: c.stop_time || null,
-      last_synced_at: new Date().toISOString()
+      last_synced_at: syncedAt
     }));
     const { error } = await supabaseAdmin
       .from('meta_campaigns')
       .upsert(rows, { onConflict: 'id' });
     if (error) throw new Error(`Campaigns upsert failed: ${error.message}`);
+    // Remove any campaigns that Meta no longer returns (deleted/archived in Meta)
+    await supabaseAdmin
+      .from('meta_campaigns')
+      .delete()
+      .lt('last_synced_at', syncedAt);
   }
 
   const insights = await fetchInsights(accountId, token, { since, until });
