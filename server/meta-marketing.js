@@ -267,20 +267,33 @@ export async function listCampaignsWithTotals() {
     .gte('date', new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10));
   if (iErr) throw new Error(iErr.message);
 
+  // A campaign with status=ACTIVE can still be NOT delivering (its ad sets / ads
+  // are paused, or it's out of budget) — Meta's Ads Manager "Delivery" column
+  // reflects this, our raw `status` toggle does not. We approximate live delivery
+  // by recent spend: any spend in the last 4 days ⇒ actively delivering.
+  const recentCutoff = new Date(Date.now() - 4 * 86400 * 1000).toISOString().slice(0, 10);
+
   const totals = {};
   for (const r of (insights || [])) {
-    const t = totals[r.campaign_id] = totals[r.campaign_id] || { spend: 0, impressions: 0, clicks: 0, leads: 0 };
+    const t = totals[r.campaign_id] = totals[r.campaign_id] || { spend: 0, impressions: 0, clicks: 0, leads: 0, recentSpend: 0 };
     t.spend += Number(r.spend || 0);
     t.impressions += Number(r.impressions || 0);
     t.clicks += Number(r.clicks || 0);
     t.leads += Number(r.leads || 0);
+    if (r.date >= recentCutoff) t.recentSpend += Number(r.spend || 0);
   }
 
   return (campaigns || []).map(c => {
-    const t = totals[c.id] || { spend: 0, impressions: 0, clicks: 0, leads: 0 };
+    const t = totals[c.id] || { spend: 0, impressions: 0, clicks: 0, leads: 0, recentSpend: 0 };
+    const delivering = (c.status === 'ACTIVE') && t.recentSpend > 0;
     return {
       ...c,
-      ...t,
+      spend: t.spend,
+      impressions: t.impressions,
+      clicks: t.clicks,
+      leads: t.leads,
+      recentSpend: t.recentSpend,
+      delivering,
       cpl: t.leads > 0 ? Math.round((t.spend / t.leads) * 100) / 100 : null
     };
   });
