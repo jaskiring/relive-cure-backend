@@ -67,10 +67,14 @@ export async function fanout(supabaseAdmin, payload) {
       await webpush.sendNotification(sub, body, { TTL: 60 * 60 });
       sent++;
     } catch (e) {
-      // 404 / 410 = subscription dead; remove from DB
-      if (e.statusCode === 404 || e.statusCode === 410) {
+      // 404 / 410 = expired; 400+VapidPkHashMismatch = VAPID key changed after sub was created
+      const bodyStr = typeof e.body === 'string' ? e.body : JSON.stringify(e.body || '');
+      const isStale = e.statusCode === 404 || e.statusCode === 410 ||
+        (e.statusCode === 400 && bodyStr.includes('VapidPkHashMismatch'));
+      if (isStale) {
         await supabaseAdmin.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
         removed++;
+        console.log('[PUSH] pruned stale subscription (status', e.statusCode, ')');
       } else {
         console.warn('[PUSH] send failed:', e.statusCode, e.body);
       }
