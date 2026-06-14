@@ -1703,10 +1703,17 @@ app.listen(PORT, '0.0.0.0', () => {
             metaRecordSyncError(err.message);
         }
     }
-    // First run: 5 minutes after boot. Then every hour.
-    setTimeout(runMetaSync, 5 * 60 * 1000);
-    setInterval(runMetaSync, 60 * 60 * 1000);
-    console.log('[SCHEDULER] Meta sync: first run in 5 min, then every 1h');
+    // Time-aware scheduler: hourly 6am-11pm IST, 4-hourly 11pm-6am IST
+    function scheduleNextMetaSync() {
+        const nowIST = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+        const hourIST = nowIST.getUTCHours(); // hours in IST (since we added offset)
+        const isDaytime = hourIST >= 6 && hourIST < 23;
+        const delay = isDaytime ? 60 * 60 * 1000 : 4 * 60 * 60 * 1000;
+        setTimeout(async () => { await runMetaSync(); scheduleNextMetaSync(); }, delay);
+    }
+    // First run: 5 minutes after boot.
+    setTimeout(() => { runMetaSync(); scheduleNextMetaSync(); }, 5 * 60 * 1000);
+    console.log('[SCHEDULER] Meta sync: first run in 5 min, then 1h daytime / 4h night (IST)');
 
     // ─── Sanity-check scheduler (daily) ──────────────────────────────────────
     setTimeout(() => runSanityCheck().catch(e => console.error('[SANITY] daily run failed:', e.message)), 10 * 60 * 1000);
