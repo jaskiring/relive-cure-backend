@@ -187,6 +187,56 @@ app.post('/api/push-to-crm-form', async (req, res) => {
     } catch (error) { res.status(500).json({ status: 'error', message: error.message }); }
 });
 
+// ─── Auto-push config (founder-controlled hands-free CRM push) ──────────────
+// When enabled, the worker (further below) pushes new, quiet, qualified
+// chatbot leads to Refrens automatically and assigns each to a rep. The config
+// lives in the single-row auto_push_config table (see migrations) so it
+// survives restarts and runs even with no dashboard open.
+const AUTO_PUSH_DEFAULT = { id: 1, enabled: false, enabled_at: null, rep_a: null, rep_b: null, split_a_pct: 100 };
+async function readAutoPushConfig() {
+  try {
+    const { data, error } = await supabaseAdmin.from('auto_push_config').select('*').eq('id', 1).maybeSingle();
+    if (error) return { ...AUTO_PUSH_DEFAULT, _available: !/(does not exist|schema cache)/i.test(error.message || '') };
+    return { ...AUTO_PUSH_DEFAULT, ...(data || {}), _available: true };
+  } catch { return { ...AUTO_PUSH_DEFAULT, _available: false }; }
+}
+
+app.get('/api/auto-push/config', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const cfg = await readAutoPushConfig();
+  return res.json({ success: true, available: cfg._available !== false, config: cfg });
+});
+
+app.post('/api/auto-push/config', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const { enabled, rep_a, rep_b, split_a_pct, updated_by } = req.body || {};
+  if (enabled && (!rep_a || !String(rep_a).trim())) {
+    return res.status(400).json({ success: false, error: 'At least one rep is required to enable auto-push.' });
+  }
+  const prev = await readAutoPushConfig();
+  const cleanB = rep_b && String(rep_b).trim() ? String(rep_b).trim() : null;
+  const row = {
+    id: 1,
+    enabled: !!enabled,
+    rep_a: rep_a ? String(rep_a).trim() : null,
+    rep_b: cleanB,
+    split_a_pct: cleanB ? Math.max(1, Math.min(99, Math.round(Number(split_a_pct) || 50))) : 100,
+    updated_by: updated_by ? String(updated_by).slice(0, 80) : null,
+    updated_at: new Date().toISOString(),
+    // Re-stamp enabled_at only on an OFF→ON transition so "from that point onwards" is honoured.
+    enabled_at: enabled ? ((prev && prev.enabled && prev.enabled_at) ? prev.enabled_at : new Date().toISOString()) : (prev?.enabled_at || null),
+  };
+  const { error } = await supabaseAdmin.from('auto_push_config').upsert(row, { onConflict: 'id' });
+  if (error) {
+    const hint = /(does not exist|schema cache)/i.test(error.message || '')
+      ? 'auto_push_config table missing — run server/migrations/create_auto_push_config.sql in Supabase first.'
+      : error.message;
+    return res.status(500).json({ success: false, error: hint });
+  }
+  console.log(`[AUTO-PUSH] config updated → enabled=${row.enabled}${row.enabled ? ` reps=${row.rep_a}${row.rep_b ? `/${row.rep_b} (${row.split_a_pct}/${100 - row.split_a_pct})` : ''}` : ''}`);
+  return res.json({ success: true, config: row });
+});
+
 // ─── Web Push subscribe / unsubscribe (mobile companion app) ────────────────
 // Diagnostic — verify push is fully wired (no auth so it can be hit easily).
 // Returns whether VAPID env is set + current subscriber count. Used by the
@@ -1719,6 +1769,55 @@ app.listen(PORT, '0.0.0.0', () => {
     setTimeout(() => runSanityCheck().catch(e => console.error('[SANITY] daily run failed:', e.message)), 10 * 60 * 1000);
     setInterval(() => runSanityCheck().catch(e => console.error('[SANITY] daily run failed:', e.message)), 24 * 60 * 60 * 1000);
     console.log('[SCHEDULER] Sanity check: first run in 10 min, then every 24h');
+
+    // ─── Auto-push worker — hands-free CRM push for quiet, qualified leads ────
+    // Gate (founder's spec): a new lead is auto-pushed once it has given ≥2
+    // details AND has gone quiet for ≥2.5 min (abandoned the chat mid-way).
+    // Reuses the existing push pipeline (processQueue) and the per-lead
+    // `assignee` field the CRM automation already honours. No-ops unless the
+    // founder has enabled it from the dashboard.
+    let autoPushRunning = false;
+    function pickAutoPushRep(cfg) {
+      if (!cfg.rep_b) return cfg.rep_a;
+      return (Math.random() * 100 < (cfg.split_a_pct || 50)) ? cfg.rep_a : cfg.rep_b;
+    }
+    async function runAutoPush() {
+      if (autoPushRunning) return;
+      const cfg = await readAutoPushConfig();
+      if (!cfg || !cfg.enabled || !cfg.rep_a) return;
+      autoPushRunning = true;
+      try {
+        const quietCutoff = new Date(Date.now() - 150 * 1000).toISOString().replace('T', ' ').replace('Z', '');
+        let q = supabaseAdmin.from('leads_surgery')
+          .select('*')
+          .eq('pushed_to_crm', false)
+          .gte('parameters_completed', 2)
+          .lt('last_activity_at', quietCutoff)
+          .order('last_activity_at', { ascending: true })
+          .limit(10);
+        if (cfg.enabled_at) q = q.gte('created_at', cfg.enabled_at);
+        const { data: leads, error } = await q;
+        if (error) { console.warn('[AUTO-PUSH] fetch failed:', error.message); return; }
+        if (!leads || leads.length === 0) return;
+        const batch = leads.map(l => ({ ...l, assignee: pickAutoPushRep(cfg) }));
+        console.log(`[AUTO-PUSH] pushing ${batch.length} quiet+qualified lead(s)…`);
+        const results = await processQueue(batch);
+        for (const r of results.filter(x => x.success)) {
+          const patch = { pushed_to_crm: true, status: 'PUSHED_TO_CRM' };
+          if (r.refrens_url) patch.refrens_lead_url = r.refrens_url;
+          if (r.refrens_id) patch.refrens_lead_id = r.refrens_id;
+          try { await supabaseAdmin.from('leads_surgery').update(patch).eq('id', r.id); } catch { /* best-effort */ }
+        }
+        console.log(`[AUTO-PUSH] done — ${results.filter(x => x.success).length}/${results.length} pushed`);
+      } catch (e) {
+        console.error('[AUTO-PUSH] worker error:', e.message);
+      } finally {
+        autoPushRunning = false;
+      }
+    }
+    setTimeout(runAutoPush, 90 * 1000);
+    setInterval(runAutoPush, 60 * 1000);
+    console.log('[SCHEDULER] Auto-push worker: first run in 90s, then every 60s (gated by config)');
 
     // ─── Push fanout (Phase M3 + extended): new leads + inbound messages ────
     // Two watchers, same fanout helper. The notification payload always
