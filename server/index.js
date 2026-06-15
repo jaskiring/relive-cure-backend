@@ -237,6 +237,118 @@ app.post('/api/auto-push/config', async (req, res) => {
   return res.json({ success: true, config: row });
 });
 
+// ─── Lead Lore Engine: call recordings (Phase 4A rep app) ───────────────────
+// The rep Android app pairs the OEM call recording with the call-log entry,
+// uploads the audio to the rep's Drive, then POSTs the metadata here. We store
+// it in call_recordings, link it to the CRM/chatbot lead by phone, and emit a
+// lead_events 'call' row so the call shows up in the lead's Lore timeline.
+function normCallPhone(raw) {
+  const d = String(raw || '').replace(/[^\d]/g, '');
+  if (d.length < 7) return null;
+  if (d.startsWith('91') && d.length === 12) return d.slice(2);
+  if (d.length > 10) return d.slice(-10);
+  return d;
+}
+async function linkCallToLead(phone) {
+  try {
+    const { data: ref } = await supabaseAdmin.from('refrens_leads').select('id').eq('phone', phone).maybeSingle();
+    if (ref) return { matched_lead_id: ref.id, matched_source: 'refrens' };
+    const { data: bot } = await supabaseAdmin.from('leads_surgery').select('id').eq('phone_number', phone).maybeSingle();
+    if (bot) return { matched_lead_id: bot.id, matched_source: 'chatbot' };
+  } catch { /* best-effort */ }
+  return { matched_lead_id: null, matched_source: null };
+}
+
+// POST /api/calls/upload-complete — the app reports a finished (and optionally
+// uploaded) call. Idempotent on drive_file_id when present.
+app.post('/api/calls/upload-complete', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const b = req.body || {};
+  const phone = normCallPhone(b.phone);
+  if (!phone) return res.status(400).json({ success: false, error: 'A valid phone number is required.' });
+  const duration = Math.max(0, Math.round(Number(b.duration_sec) || 0));
+  const connected = (typeof b.connected === 'boolean') ? b.connected : duration >= 5;
+  const link = await linkCallToLead(phone);
+  const startedAt = b.call_started_at ? new Date(b.call_started_at).toISOString() : new Date().toISOString();
+  const row = {
+    rep_id: b.rep_id ? String(b.rep_id).slice(0, 80) : null,
+    rep_name: b.rep_name ? String(b.rep_name).slice(0, 120) : null,
+    phone,
+    direction: b.direction === 'inbound' ? 'inbound' : (b.direction === 'outbound' ? 'outbound' : null),
+    call_started_at: startedAt,
+    duration_sec: duration,
+    connected,
+    outcome: b.outcome ? String(b.outcome).slice(0, 80) : null,
+    followup_needed: !!b.followup_needed,
+    drive_file_id: b.drive_file_id ? String(b.drive_file_id).slice(0, 200) : null,
+    drive_file_url: b.drive_file_url ? String(b.drive_file_url).slice(0, 500) : null,
+    matched_lead_id: link.matched_lead_id,
+    matched_source: link.matched_source,
+    transcript_status: b.drive_file_id ? 'pending' : 'no_recording',
+    device_meta: b.device_meta && typeof b.device_meta === 'object' ? b.device_meta : null,
+    updated_at: new Date().toISOString(),
+  };
+  try {
+    let saved;
+    if (row.drive_file_id) {
+      // Idempotent upsert on drive_file_id so a retried upload doesn't double-insert.
+      const { data, error } = await supabaseAdmin.from('call_recordings').upsert(row, { onConflict: 'drive_file_id' }).select('id').maybeSingle();
+      if (error) throw error;
+      saved = data;
+    } else {
+      const { data, error } = await supabaseAdmin.from('call_recordings').insert(row).select('id').maybeSingle();
+      if (error) throw error;
+      saved = data;
+    }
+    // Fire-and-forget Lore event so the call shows in the lead timeline.
+    supabaseAdmin.from('lead_events').insert({
+      phone, ts: startedAt, event_type: 'call', source: 'call',
+      payload: { direction: row.direction, duration_sec: duration, connected, outcome: row.outcome, followup_needed: row.followup_needed, rep_name: row.rep_name, drive_file_url: row.drive_file_url, call_id: saved?.id || null },
+    }).then(() => {}, (e) => console.warn('[CALLS] lead_events emit failed:', e?.message));
+    console.log(`[CALLS] ${row.direction || 'call'} ${connected ? 'connected' : 'no-answer'} ${duration}s · ${phone} · rep=${row.rep_name || row.rep_id || '?'}${row.outcome ? ` · ${row.outcome}` : ''}`);
+    return res.json({ success: true, id: saved?.id || null, linked: link.matched_source });
+  } catch (err) {
+    const hint = /(does not exist|schema cache)/i.test(err.message || '')
+      ? 'call_recordings table missing — run server/migrations/create_call_recordings.sql in Supabase first.'
+      : err.message;
+    console.error('[CALLS] upload-complete failed:', hint);
+    return res.status(500).json({ success: false, error: hint });
+  }
+});
+
+// GET /api/calls — call validation feed for the dashboard. Optional filters:
+// ?rep=, ?phone=, ?since=ISO, ?limit=. Returns rows + headline aggregates.
+app.get('/api/calls', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  try {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+    let q = supabaseAdmin.from('call_recordings').select('*').order('call_started_at', { ascending: false }).limit(limit);
+    if (req.query.rep) q = q.eq('rep_id', String(req.query.rep));
+    if (req.query.phone) { const p = normCallPhone(req.query.phone); if (p) q = q.eq('phone', p); }
+    if (req.query.since) q = q.gte('call_started_at', new Date(req.query.since).toISOString());
+    const { data, error } = await q;
+    if (error) {
+      const hint = /(does not exist|schema cache)/i.test(error.message || '')
+        ? 'call_recordings table missing — run the migration in Supabase first.' : error.message;
+      return res.status(500).json({ success: false, error: hint, available: false });
+    }
+    const calls = data || [];
+    const connected = calls.filter(c => c.connected).length;
+    const stats = {
+      total: calls.length,
+      connected,
+      not_connected: calls.length - connected,
+      connect_rate: calls.length ? Math.round((connected / calls.length) * 100) : 0,
+      followups: calls.filter(c => c.followup_needed).length,
+      with_recording: calls.filter(c => c.drive_file_id).length,
+      transcribed: calls.filter(c => c.transcript_status === 'done').length,
+    };
+    return res.json({ success: true, available: true, stats, calls });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── Web Push subscribe / unsubscribe (mobile companion app) ────────────────
 // Diagnostic — verify push is fully wired (no auth so it can be hit easily).
 // Returns whether VAPID env is set + current subscriber count. Used by the
