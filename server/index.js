@@ -174,6 +174,11 @@ app.post('/api/push-to-crm-form', async (req, res) => {
           };
           if (r.refrens_url) patch.refrens_lead_url = r.refrens_url;
           if (r.refrens_id)  patch.refrens_lead_id  = r.refrens_id;
+          // Persist the assignee we just set in Refrens back to leads_surgery so the
+          // Chatbot view reflects it immediately (instead of showing "Unassigned"
+          // until the next 4h sync writeback).
+          const orig = pendingLeads.find(l => l.id === r.id);
+          if (orig?.assignee && String(orig.assignee).trim().length >= 2) patch.assignee = String(orig.assignee).trim();
           try {
             const { error } = await supabaseAdmin.from('leads_surgery').update(patch).eq('id', r.id);
             if (error) console.warn(`[CRM] Failed to persist refrens URL for lead ${r.id}:`, error.message);
@@ -1918,6 +1923,8 @@ app.listen(PORT, '0.0.0.0', () => {
           const patch = { pushed_to_crm: true, status: 'PUSHED_TO_CRM' };
           if (r.refrens_url) patch.refrens_lead_url = r.refrens_url;
           if (r.refrens_id) patch.refrens_lead_id = r.refrens_id;
+          const orig = batch.find(l => l.id === r.id);
+          if (orig?.assignee && String(orig.assignee).trim().length >= 2) patch.assignee = String(orig.assignee).trim();
           try { await supabaseAdmin.from('leads_surgery').update(patch).eq('id', r.id); } catch { /* best-effort */ }
         }
         console.log(`[AUTO-PUSH] done — ${results.filter(x => x.success).length}/${results.length} pushed`);
