@@ -22,8 +22,9 @@ import { isUnderQuota, tickRequest, tickFallback, quotaStatus } from './agent-qu
 const DEFAULT_MODEL = 'gemini-2.5-flash';
 const REQUEST_TIMEOUT_MS = 8000;
 
-// Circuit breaker: after a 429, refuse all calls until the next UTC midnight.
-let _quotaExhaustedUntil = 0;  // epoch ms
+// Circuit breaker: after a 429, back off for 60s (per-minute rate limit).
+// After daily cap exhaustion, block until next UTC midnight.
+let _backoffUntil = 0;  // epoch ms — short backoff for 429
 
 export function isAgentEnabled() {
     const mode = process.env.BOT_AGENT_MODE;
@@ -112,9 +113,9 @@ const RESPONSE_SCHEMA = {
 export async function runGeminiAgent({ message, history = [] }) {
     if (!isAgentEnabled()) return null;
 
-    // Circuit breaker: skip entirely if we recently hit a 429.
-    if (Date.now() < _quotaExhaustedUntil) {
-        console.warn('[AGENT] circuit breaker open (post-429) → fallback');
+    // Circuit breaker: skip if backing off from a recent 429.
+    if (Date.now() < _backoffUntil) {
+        console.warn('[AGENT] circuit breaker open (post-429 backoff) → fallback');
         return null;
     }
     if (!isUnderQuota()) {
@@ -169,10 +170,8 @@ export async function runGeminiAgent({ message, history = [] }) {
         const txt = await res.text().catch(() => '');
         tickFallback();
         if (res.status === 429) {
-            const now = new Date();
-            const midnightUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
-            _quotaExhaustedUntil = midnightUTC;
-            console.warn(`[AGENT] 429 rate limited → circuit breaker open until ${new Date(midnightUTC).toISOString()}`);
+            _backoffUntil = Date.now() + 60_000; // retry after 60s
+            console.warn('[AGENT] 429 rate limited → backing off 60s');
         } else {
             console.error(`[AGENT] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
         }
