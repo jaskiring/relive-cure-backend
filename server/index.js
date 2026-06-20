@@ -622,6 +622,10 @@ const COMMON_WORD_BLACKLIST = new Set([
     'number', 'glass', 'glasses', 'lens', 'lenses', 'specs',
     'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
     'specs removal', 'option', 'options', 'checking',
+    'looking', 'interested', 'consultation', 'help', 'info', 'surgery',
+    'process', 'procedure', 'treatment', 'correct', 'good', 'fine',
+    'actually', 'basically', 'currently', 'recently', 'definitely',
+    'hindi', 'english', 'hinglish',
     // Hindi filler/pronouns that aren't names
     'इस', 'यह', 'वह', 'मैं', 'तुम', 'आप', 'हम', 'ये', 'वो',
     'कोई', 'कुछ', 'अभी', 'बस', 'हां', 'ना', 'जी'
