@@ -522,14 +522,22 @@ function parseEyePower(message) {
     if (!message || typeof message !== 'string') return { raw: message, parsed: null, numeric: null, confidence: 'low' };
     const m = message.trim();
 
-    // Handle structured format from agent: "R:-4 L:-5" or "R:-4, L:-5"
-    const structMatch = m.match(/R\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
+    // Handle structured format from agent: "R:-4 L:-5" or "L:-5 R:-6"
+    const structMatch = m.match(/[Rr]\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
     if (structMatch) {
         const r = parseFloat(structMatch[1]);
         const l = parseFloat(structMatch[2]);
         const avg = (Math.abs(r) + Math.abs(l)) / 2;
-        const numeric = -(avg); // glasses power is negative
+        const numeric = -(avg);
         return { raw: m, parsed: m, numeric, confidence: 'high', right: r, left: l };
+    }
+    const structMatch2 = m.match(/[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Rr]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
+    if (structMatch2) {
+        const l = parseFloat(structMatch2[1]);
+        const r = parseFloat(structMatch2[2]);
+        const avg = (Math.abs(r) + Math.abs(l)) / 2;
+        const numeric = -(avg);
+        return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
     }
 
     // Handle "right 4 left 5" or "right eye 4 left eye 5"
@@ -537,7 +545,18 @@ function parseEyePower(message) {
     if (rlMatch) {
         let r = parseFloat(rlMatch[1]);
         let l = parseFloat(rlMatch[2]);
-        // Assume negative unless explicitly positive (glasses power)
+        if (r > 0) r = -r;
+        if (l > 0) l = -l;
+        const avg = (Math.abs(r) + Math.abs(l)) / 2;
+        const numeric = -avg;
+        return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
+    }
+
+    // Handle "left -5 right -6" or "left eye 5 right eye 6"
+    const lrMatch = m.match(/left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*[,\s]+right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
+    if (lrMatch) {
+        let l = parseFloat(lrMatch[1]);
+        let r = parseFloat(lrMatch[2]);
         if (r > 0) r = -r;
         if (l > 0) l = -l;
         const avg = (Math.abs(r) + Math.abs(l)) / 2;
@@ -548,14 +567,12 @@ function parseEyePower(message) {
     // Handle "both eyes same" or just a single number
     const match = m.match(/[-+]?\d+(\.\d+)?/);
     if (!match) {
-        // Check for "high power" type phrases
         if (/high|bahut|zyada|jyada/i.test(m)) {
             return { raw: m, parsed: null, numeric: null, confidence: 'low' };
         }
         return { raw: m, parsed: null, numeric: null, confidence: 'low' };
     }
     let numeric = parseFloat(match[0]);
-    // For glasses, assume negative unless explicitly positive
     if (numeric > 0 && !m.includes('+')) numeric = -numeric;
     return { raw: m, parsed: match[0], numeric, confidence: (Math.abs(numeric) >= 0.25 && Math.abs(numeric) <= 22) ? 'high' : 'medium' };
 }
@@ -1067,7 +1084,18 @@ async function sendWhatsAppReply(phone, reply) {
     const url = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
     let rawText = '';
     try {
-        const res = await globalThis.fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: reply } }) });
+        // Strip markdown formatting for WhatsApp (no bold, bullets, headers, horizontal rules)
+        let cleanReply = (reply || '')
+            .replace(/\*([^*]+)\*/g, '$1')     // *bold* → bold
+            .replace(/_([^_]+)_/g, '$1')         // _italic_ → italic
+            .replace(/^#{1,3}\s+/gm, '')          // ### header → header
+            .replace(/^[-•]\s+/gm, '')            // • bullet or - bullet → plain
+            .replace(/^\d+\.\s+/gm, '')           // 1. numbered → plain
+            .replace(/^_{3,}$/gm, '')              // ___ horizontal rule → empty
+            .replace(/^[-]{3,}$/gm, '')            // --- horizontal rule → empty
+            .replace(/\n{3,}/g, '\n\n')           // collapse 3+ newlines to 2
+            .trim();
+        const res = await globalThis.fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: cleanReply } }) });
         rawText = await res.text();
         if (res.status === 429) { console.warn('[WA SEND] ⚠️ Rate limited (429)'); return; }
         if (rawText.trim().startsWith('{')) {
