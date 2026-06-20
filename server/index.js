@@ -20,6 +20,8 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
+import { isAgentEnabled, agentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
+import { hydrateQuota } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
@@ -41,6 +43,7 @@ console.log('[BOOT] ✅ Server starting...');
 console.log('[BOOT] BOT_SECRET SET:', !!process.env.BOT_SECRET);
 console.log('[BOOT] PHONE_NUMBER_ID SET:', !!process.env.PHONE_NUMBER_ID);
 console.log('[BOOT] NODE_VERSION:', process.version);
+console.log('[BOOT] LLM AGENT:', isAgentEnabled() ? `${agentMode().toUpperCase()} (${process.env.GEMINI_MODEL || 'gemini-2.5-flash'})` : 'OFF (rule-based bot)');
 console.log('═══════════════════════════════════════');
 
 const app = express();
@@ -54,7 +57,7 @@ app.use(express.json());
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', node: process.version, ts: new Date().toISOString(), uptime: process.uptime(), bot: 'v6.2-stable' });
+    res.json({ status: 'ok', node: process.version, ts: new Date().toISOString(), uptime: process.uptime(), bot: 'v6.2-stable', agent: agentStatus() });
 });
 
 // ─── DB test ──────────────────────────────────────────────────────────────────
@@ -556,7 +559,7 @@ setInterval(() => { const now = Date.now(); for (const [id, ts] of botProcessedM
 try {
     if (fs.existsSync(SESSION_FILE)) {
         const raw = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-        for (const [phone, s] of Object.entries(raw)) botSessions[phone] = { ...s, inactivityTimer: null };
+        for (const [phone, s] of Object.entries(raw)) botSessions[phone] = { ...s, _agentHistory: s._agentHistory || [], inactivityTimer: null };
         console.log(`[SESSION] Hydrated ${Object.keys(botSessions).length} sessions`);
     }
 } catch (e) { console.error('[SESSION] Hydration error:', e.message); }
@@ -568,7 +571,7 @@ function schedulePersist() {
         try {
             const toWrite = {};
             for (const [p, s] of Object.entries(botSessions)) {
-                toWrite[p] = { state: s.state, data: s.data, ingested: s.ingested, first_ingest_done: s.first_ingest_done || false, last_activity_at: s.last_activity_at, lang: s.lang || 'EN', repeat_count: s.repeat_count || {}, resume_offered: s.resume_offered || false, last_intent_handled: s.last_intent_handled || null };
+                toWrite[p] = { state: s.state, data: s.data, ingested: s.ingested, first_ingest_done: s.first_ingest_done || false, last_activity_at: s.last_activity_at, lang: s.lang || 'EN', repeat_count: s.repeat_count || {}, resume_offered: s.resume_offered || false, last_intent_handled: s.last_intent_handled || null, _agentHistory: s._agentHistory || [] };
             }
             fs.writeFileSync(SESSION_FILE, JSON.stringify(toWrite, null, 2));
         } catch (e) { console.error('[SESSION] Persist error:', e.message); }
@@ -1033,6 +1036,37 @@ async function sendWhatsAppReply(phone, reply) {
 }
 
 // ─── CORE MESSAGE HANDLER ─────────────────────────────────────────────────────
+// Map the Gemini agent's structured extraction onto session.data, so the existing
+// scoring (scoreSession), leads_surgery ingest (sendToAPI), and hands-free
+// auto-push all keep working unchanged whether the reply came from the agent or
+// the rule-based machine.
+function applyAgentExtract(session, ag) {
+    const d = session.data;
+    if (ag.name && typeof ag.name === 'string' && isValidName(ag.name) && (!d.contactName || d.contactName === 'WhatsApp Lead')) {
+        d.contactName = ag.name.trim();
+    }
+    if (ag.city && typeof ag.city === 'string' && !d.city) d.city = ag.city.trim();
+    if (ag.eye_power && typeof ag.eye_power === 'string' && !d.eyePower) {
+        const p = parseEyePower(ag.eye_power);
+        // Only treat as a captured power parameter when there's a real number;
+        // a vague "high power" is just an interest signal, not a filled field.
+        if (p && p.numeric !== null) { d.eyePower = p; d.concern_power = true; }
+        else d.concern_power = true;
+    }
+    if (ag.asks_cost) d.interest_cost = true;
+    if (ag.asks_recovery) d.interest_recovery = true;
+    if (ag.asks_pain) d.concern_pain = true;
+    if (ag.asks_safety) d.concern_safety = true;
+    if (ag.power_concern) d.concern_power = true;
+    if (ag.is_cataract) d.is_cataract = true;
+    if (ag.wants_callback) {
+        d.request_call = true;
+        if (!d.callback_offered) d.callback_offered = true;
+        d.human_handoff_started = true;
+        if (!d.callback_source) d.callback_source = 'agent';
+    }
+}
+
 async function handleIncomingMessage(reqBody, isTestChat = false) {
     let phone, message, msgId;
     let reply = null, replied = false, finalized = false;
@@ -1215,6 +1249,45 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = safeFirstName(session); setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
+        // ─── LLM AGENT (Gemini, free tier) — natural conversation, with the
+        //     rule-based state machine below as automatic fallback.
+        //     Safety guards above (opt-out, abuse, off-topic, human-takeover,
+        //     explicit "call me") always run first and are never delegated to the LLM.
+        //     In shadow mode the agent runs but its reply is only logged — the
+        //     rule-based reply is what the customer sees. ───
+        if (isAgentEnabled() && session.state !== 'ASK_RESUME' && session.state !== 'RETURNING') {
+            let agentResult = null;
+            try {
+                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [] });
+            } catch (e) {
+                console.error('[AGENT] error → rule-based fallback:', e.message);
+            }
+
+            if (agentResult && agentResult.reply) {
+                // Always reconcile session.data so the rule-based fallback (if it
+                // ever fires) and the CRM pipeline see what the agent learned.
+                applyAgentExtract(session, agentResult);
+
+                // Track conversation memory (capped, persisted via schedulePersist).
+                session._agentHistory = (session._agentHistory || [])
+                    .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
+                    .slice(-20);
+                if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+
+                if (agentMode() === 'live') {
+                    setReply(agentResult.reply);
+                    console.log(`[AGENT:live] ✅ ${phone}`);
+                    return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
+                } else {
+                    // SHADOW: log what the agent would have said, fall through to
+                    // rule-based so the customer still gets a safe reply.
+                    console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
+                }
+            } else {
+                console.log(`[AGENT:fallback] ${phone} → rule-based`);
+            }
+        }
+
         const knowledge = buildKnowledgeResponse(message, session);
         if (knowledge) { setReply(knowledge); return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat); }
 
@@ -1309,7 +1382,21 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 }
 
 function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = false) {
-    setImmediate(async () => { try { await sendToAPI(phone, session, trigger); } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); } });
+    setImmediate(async () => {
+        try {
+            await sendToAPI(phone, session, trigger);
+            // If the agent is enabled but this reply came from rule-based, emit a
+            // lead_events row so we can measure fallback rate in the dashboard.
+            if (isAgentEnabled() && trigger !== 'agent') {
+                supabaseAdmin.from('lead_events').insert({
+                    phone, ts: new Date().toISOString(),
+                    event_type: 'agent_fallback',
+                    source: 'agent',
+                    payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
+                }).then(() => {}, () => {});
+            }
+        } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
+    });
     return finalizeFn(isTestChat);
 }
 
@@ -1836,6 +1923,9 @@ if (SELF_URL) {
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[API] ✅ Server running on port ${PORT}`);
     console.log('[BOT] ✅ v6.2-stable embedded — no HTTP overhead');
+
+    // ─── Agent quota hydrate (read today's count from Supabase) ────────────────
+    hydrateQuota().catch(e => console.warn('[BOOT] quota hydrate failed:', e.message));
 
     // ─── Refrens auto-sync scheduler ─────────────────────────────────────────
     async function runRefrensSync() {
