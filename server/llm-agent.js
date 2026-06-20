@@ -212,7 +212,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             responseMimeType: 'application/json',
             responseSchema: RESPONSE_SCHEMA,
             temperature: 0.5,
-            maxOutputTokens: 200,
+            maxOutputTokens: 400,
             thinkingConfig: { thinkingBudget: 100 },
         },
     };
