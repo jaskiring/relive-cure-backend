@@ -615,7 +615,7 @@ function shouldOfferCallback(session) {
     if (d.interest_cost) score++;
     if (d.interest_recovery) score++;
     if (d.request_call) score += 2;
-    return score >= 2;
+    return score >= 3;
 }
 
 let botSessions = {};
@@ -979,7 +979,7 @@ const KB = {
     SAFETY: { EN: '😊 LASIK is one of the *safest* eye procedures worldwide:\n\n• 98%+ success rate\n• No general anesthesia\n• Takes only 10–15 minutes\n• Full evaluation done before surgery', HI: '😊 LASIK दुनिया के *सबसे safe* procedures में से एक है:\n\n• 98%+ success rate\n• General anesthesia नहीं\n• सिर्फ 10–15 मिनट\n• Surgery से पहले पूरी evaluation' },
     TIMELINE: { EN: '📅 *LASIK at Relive Cure:*\n\n• Surgery: 10–15 mins (both eyes)\n• Same day discharge\n• Back to work next day\n• Driving: after 1–2 days', HI: '📅 *Relive Cure में LASIK:*\n\n• Surgery: 10–15 मिनट\n• Same day discharge\n• अगले दिन काम पर वापस\n• Driving: 1–2 दिन बाद' },
     REFERRAL: { EN: '🎁 Refer a friend → Earn *₹1,000* per surgery. No limit!\n\nOur team will share details when you book 😊', HI: '🎁 एक दोस्त refer करें → *₹1,000* कमाएँ। कोई limit नहीं!\n\nBooking पर team details देगी 😊' },
-    LOCATION: { EN: "Our sales specialist will call you shortly with all the details 😊\n\nWhile we get that set up — could you tell me which city you're in? 📍", HI: "हमारा sales specialist जल्द call करके सारी details share करेगा 😊\n\nतब तक — आप किस शहर से हैं? 📍" },
+    LOCATION: { EN: "Our sales specialist will call you shortly with all the details 😊", HI: "हमारा sales specialist जल्द call करके सारी details share करेगा 😊" },
     ALTERNATIVES: { EN: '👓 LASIK vs Glasses:\n\n• LASIK → one-time cost, permanent freedom\n• Glasses → recurring cost, daily hassle\n• Sports / swimming → no glasses with LASIK ✅', HI: '👓 LASIK vs Chashma:\n\n• LASIK → एक बार का खर्च, हमेशा की आज़ादी\n• Chashma → बार-बार खर्च, रोज़ की परेशानी' },
     CONCERN: { EN: '😊 I hear you — blurry vision and being dependent on glasses is exactly what LASIK is designed to fix. Most patients become completely glasses-free after the procedure.\n\nOur specialist can check your eligibility properly — let me grab a couple of quick details first.', HI: '😊 मैं समझता हूँ — धुंधला दिखना और चश्मे पर निर्भर रहना, LASIK इसी के लिए बना है। ज़्यादातर patients procedure के बाद पूरी तरह चश्मा-मुक्त हो जाते हैं।\n\nSpecialist आपकी eligibility ठीक से check कर सकते हैं — पहले कुछ quick details ले लेता हूँ।' }
 };
