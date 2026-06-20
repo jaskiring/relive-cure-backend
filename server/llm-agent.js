@@ -32,13 +32,13 @@ let _runtimeMode = null;  // 'shadow' | 'live' | 'off' | null (null = use env va
 
 export function isAgentEnabled() {
     if (_runtimeMode === 'off') return false;
-    const mode = _runtimeMode || process.env.BOT_AGENT_MODE;
+    const mode = _runtimeMode || process.env.BOT_AGENT_MODE || 'live';
     return !!process.env.GEMINI_API_KEY && (mode === 'shadow' || mode === 'live');
 }
 
 export function agentMode() {
     if (!isAgentEnabled()) return null;
-    return _runtimeMode || process.env.BOT_AGENT_MODE;
+    return _runtimeMode || process.env.BOT_AGENT_MODE || 'live';
 }
 
 export function setAgentMode(mode) {
@@ -108,11 +108,23 @@ NAME EXTRACTION RULES (critical — wrong name in reply looks terrible):
 EXTRACTION: alongside your reply, report any details the user has revealed:
 - name: their actual name ONLY if clearly stated, else null.
 - city: their city if stated, else null.
-- eye_power: their glasses/lens power if stated (e.g. "-2.5", "+1.0", "high power"), else null.
+- eye_power: their glasses/lens power if stated. If user gives both eyes, use format "R:-X L:-Y". If one number, use it directly (e.g. "-2.5"). If they say "high power" without a number, return "high".
+- timeline: when they want surgery if stated (e.g. "this month", "after diwali", "next week", "asap"), else null.
+- insurance: true if they mention having health insurance, else false.
+- previous_surgery: any prior eye surgery mentioned (e.g. "had cataract surgery"), else null.
+- age_group: their age if stated as a number, else null.
+- willing_to_travel: true if they ask about visiting a different city for surgery, else null.
 - asks_cost / asks_recovery / asks_pain / asks_safety: true if THIS message asks about that topic.
 - power_concern: true if they describe weak vision / blur / high power / dependence on glasses.
 - wants_callback: true if they want a human / a call.
 - is_cataract: true if cataract is indicated.
+
+EYE POWER EXTRACTION RULES:
+- "right 4 left 5" → eye_power: "R:-4 L:-5" (glasses power is negative unless stated plus)
+- "-2.5 both eyes" → eye_power: "-2.5"
+- "my power is 3" → eye_power: "-3" (assume minus for glasses unless they say plus)
+- "+1.5" → eye_power: "+1.5" (explicit plus means hyperopia)
+- "high power" / "bahut zyada hai" → eye_power: "high" (no numeric)
 
 Always return the JSON object. "reply" is the WhatsApp message to send back.`;
 
@@ -123,6 +135,11 @@ const RESPONSE_SCHEMA = {
         name: { type: 'STRING', nullable: true },
         city: { type: 'STRING', nullable: true },
         eye_power: { type: 'STRING', nullable: true },
+        timeline: { type: 'STRING', nullable: true },
+        insurance: { type: 'BOOLEAN' },
+        previous_surgery: { type: 'STRING', nullable: true },
+        age_group: { type: 'NUMBER', nullable: true },
+        willing_to_travel: { type: 'BOOLEAN' },
         asks_cost: { type: 'BOOLEAN' },
         asks_recovery: { type: 'BOOLEAN' },
         asks_pain: { type: 'BOOLEAN' },

@@ -519,10 +519,45 @@ const COMPLETE_VARIANTS = {
 function getRandomCompleteReply(lang) { const v = COMPLETE_VARIANTS[lang] || COMPLETE_VARIANTS.EN; return v[Math.floor(Math.random() * v.length)]; }
 
 function parseEyePower(message) {
-    const match = message.match(/[-+]?\d+(\.\d+)?/);
-    if (!match) return { raw: message, parsed: null, numeric: null, confidence: 'low' };
-    const numeric = parseFloat(match[0]);
-    return { raw: message, parsed: match[0], numeric, confidence: (Math.abs(numeric) >= 0.25 && Math.abs(numeric) <= 22) ? 'high' : 'medium' };
+    if (!message || typeof message !== 'string') return { raw: message, parsed: null, numeric: null, confidence: 'low' };
+    const m = message.trim();
+
+    // Handle structured format from agent: "R:-4 L:-5" or "R:-4, L:-5"
+    const structMatch = m.match(/R\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
+    if (structMatch) {
+        const r = parseFloat(structMatch[1]);
+        const l = parseFloat(structMatch[2]);
+        const avg = (Math.abs(r) + Math.abs(l)) / 2;
+        const numeric = -(avg); // glasses power is negative
+        return { raw: m, parsed: m, numeric, confidence: 'high', right: r, left: l };
+    }
+
+    // Handle "right 4 left 5" or "right eye 4 left eye 5"
+    const rlMatch = m.match(/right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*[,\s]+left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
+    if (rlMatch) {
+        let r = parseFloat(rlMatch[1]);
+        let l = parseFloat(rlMatch[2]);
+        // Assume negative unless explicitly positive (glasses power)
+        if (r > 0) r = -r;
+        if (l > 0) l = -l;
+        const avg = (Math.abs(r) + Math.abs(l)) / 2;
+        const numeric = -avg;
+        return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
+    }
+
+    // Handle "both eyes same" or just a single number
+    const match = m.match(/[-+]?\d+(\.\d+)?/);
+    if (!match) {
+        // Check for "high power" type phrases
+        if (/high|bahut|zyada|jyada/i.test(m)) {
+            return { raw: m, parsed: null, numeric: null, confidence: 'low' };
+        }
+        return { raw: m, parsed: null, numeric: null, confidence: 'low' };
+    }
+    let numeric = parseFloat(match[0]);
+    // For glasses, assume negative unless explicitly positive
+    if (numeric > 0 && !m.includes('+')) numeric = -numeric;
+    return { raw: m, parsed: match[0], numeric, confidence: (Math.abs(numeric) >= 0.25 && Math.abs(numeric) <= 22) ? 'high' : 'medium' };
 }
 function getEyePowerNumeric(ep) { if (!ep) return null; if (typeof ep === 'string') return parseFloat(ep) || null; return ep.numeric || null; }
 function getEyePowerString(ep) { if (!ep) return null; if (typeof ep === 'string') return ep; return ep.parsed || ep.raw || null; }
@@ -1061,7 +1096,6 @@ async function sendWhatsAppReply(phone, reply) {
 function applyAgentExtract(session, ag) {
     const d = session.data;
     if (ag.name && typeof ag.name === 'string' && isValidName(ag.name)) {
-        // Allow name update: first capture OR correction (user explicitly stating a different name)
         if (!d.contactName || d.contactName === 'WhatsApp Lead' || d.contactName.toLowerCase() !== ag.name.trim().toLowerCase()) {
             d.contactName = ag.name.trim();
         }
@@ -1069,11 +1103,15 @@ function applyAgentExtract(session, ag) {
     if (ag.city && typeof ag.city === 'string' && !d.city) d.city = ag.city.trim();
     if (ag.eye_power && typeof ag.eye_power === 'string' && !d.eyePower) {
         const p = parseEyePower(ag.eye_power);
-        // Only treat as a captured power parameter when there's a real number;
-        // a vague "high power" is just an interest signal, not a filled field.
         if (p && p.numeric !== null) { d.eyePower = p; d.concern_power = true; }
+        else if (p && p.raw) { d.eyePower = p; d.concern_power = true; } // "high" case
         else d.concern_power = true;
     }
+    if (ag.timeline && typeof ag.timeline === 'string' && !d.timeline) d.timeline = ag.timeline.trim();
+    if (ag.insurance === true && !d.insurance) d.insurance = 'Yes';
+    if (ag.previous_surgery && typeof ag.previous_surgery === 'string' && !d.previous_surgery) d.previous_surgery = ag.previous_surgery.trim();
+    if (ag.age_group && typeof ag.age_group === 'number' && !d.ageGroup) d.ageGroup = ag.age_group;
+    if (ag.willing_to_travel === true) d.willing_to_travel = true;
     if (ag.asks_cost) d.interest_cost = true;
     if (ag.asks_recovery) d.interest_recovery = true;
     if (ag.asks_pain) d.concern_pain = true;
@@ -1293,7 +1331,16 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 session._agentHistory = (session._agentHistory || [])
                     .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
                     .slice(-20);
-                if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+
+                // State sync: if agent extracted useful data, ensure we're past GREETING
+                const hasData = session.data.city || session.data.eyePower || session.data.contactName;
+                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
+                // If callback was triggered by agent, move to COMPLETE
+                if (session.data.request_call && session.state !== 'COMPLETE') {
+                    session.state = 'COMPLETE';
+                    if (!session.data.callback_offered) session.data.callback_offered = true;
+                    session.data.human_handoff_started = true;
+                }
 
                 if (agentMode() === 'live') {
                     setReply(agentResult.reply);
@@ -1305,6 +1352,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
                 }
             } else {
+                // Agent failed but may have extracted data on a previous turn.
+                // Ensure state is past GREETING so rule-based doesn't re-greet.
+                const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
+                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
                 console.log(`[AGENT:fallback] ${phone} → rule-based`);
             }
         }

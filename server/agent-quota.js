@@ -13,6 +13,7 @@ let _writeTimer = null;
 let _bootHydrated = false;
 let _testCap = null;  // test override; null in production
 let _supabase = null; // lazy-loaded
+let _dailyExhausted = false; // set true when quota exhausted; resets next day
 
 function _today() { return new Date().toISOString().slice(0, 10); }
 function _cap() {
@@ -35,6 +36,7 @@ function resetForTest() {
     _mem = { date: _today(), count: 0, fallbacks: 0 };
     _writeTimer = null;
     _bootHydrated = true; // skip Supabase hydrate in tests
+    _dailyExhausted = false;
 }
 
 // Called once on boot to read today's row from Supabase.
@@ -66,8 +68,11 @@ export async function hydrateQuota() {
 
 export function isUnderQuota() {
     const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0 };
-    return _mem.count < _cap();
+    if (_mem.date !== d) { _mem = { date: d, count: 0, fallbacks: 0 }; _dailyExhausted = false; }
+    if (_dailyExhausted) return false;
+    const under = _mem.count < _cap();
+    if (!under) _dailyExhausted = true; // persist for rest of day
+    return under;
 }
 
 export function tickRequest() {

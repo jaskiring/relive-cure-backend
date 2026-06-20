@@ -38,9 +38,10 @@ test('isAgentEnabled: false with no env', withEnv({ GEMINI_API_KEY: undefined, B
     assert.equal(isAgentEnabled(), false);
 }));
 
-test('isAgentEnabled: false with key but no mode', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: undefined }, async () => {
-    const { isAgentEnabled } = await loadModule();
-    assert.equal(isAgentEnabled(), false);
+test('isAgentEnabled: true with key but no mode (defaults to live)', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: undefined }, async () => {
+    const { isAgentEnabled, agentMode } = await loadModule();
+    assert.equal(isAgentEnabled(), true);
+    assert.equal(agentMode(), 'live');
 }));
 
 test('isAgentEnabled: true with key + shadow; agentMode reports shadow', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'shadow' }, async () => {
