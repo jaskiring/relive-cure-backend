@@ -656,6 +656,7 @@ const COMMON_WORD_BLACKLIST = new Set([
     'please', 'location', 'rate', 'price', 'cost', 'address',
     'number', 'glass', 'glasses', 'lens', 'lenses', 'specs',
     'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
+    'from', 'to', 'with', 'for', 'about', 'into', 'on', 'at', 'by',
     'specs removal', 'option', 'options', 'checking',
     'looking', 'interested', 'consultation', 'help', 'info', 'surgery',
     'process', 'procedure', 'treatment', 'correct', 'good', 'fine',
