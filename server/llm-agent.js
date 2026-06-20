@@ -26,14 +26,28 @@ const REQUEST_TIMEOUT_MS = 8000;
 // After daily cap exhaustion, block until next UTC midnight.
 let _backoffUntil = 0;  // epoch ms — short backoff for 429
 
+// Runtime mode override — set via POST /api/agent/mode from the dashboard.
+// When set, it takes priority over the BOT_AGENT_MODE env var.
+let _runtimeMode = null;  // 'shadow' | 'live' | 'off' | null (null = use env var)
+
 export function isAgentEnabled() {
-    const mode = process.env.BOT_AGENT_MODE;
+    if (_runtimeMode === 'off') return false;
+    const mode = _runtimeMode || process.env.BOT_AGENT_MODE;
     return !!process.env.GEMINI_API_KEY && (mode === 'shadow' || mode === 'live');
 }
 
 export function agentMode() {
     if (!isAgentEnabled()) return null;
-    return process.env.BOT_AGENT_MODE;
+    return _runtimeMode || process.env.BOT_AGENT_MODE;
+}
+
+export function setAgentMode(mode) {
+    if (mode === 'shadow' || mode === 'live' || mode === 'off') {
+        _runtimeMode = mode;
+        console.log(`[AGENT] mode set to "${mode}" via API`);
+        return true;
+    }
+    return false;
 }
 
 export function agentStatus() {

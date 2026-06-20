@@ -20,7 +20,7 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
-import { isAgentEnabled, agentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
+import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
 import { hydrateQuota } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
@@ -58,6 +58,20 @@ app.use(express.json());
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', node: process.version, ts: new Date().toISOString(), uptime: process.uptime(), bot: 'v6.2-stable', agent: agentStatus() });
+});
+
+// ─── Agent mode toggle (dashboard UI) ──────────────────────────────────────
+app.get('/api/agent/mode', (req, res) => {
+    res.json({ success: true, ...agentStatus() });
+});
+
+app.post('/api/agent/mode', (req, res) => {
+    const { mode } = req.body;
+    if (!mode || !['shadow', 'live', 'off'].includes(mode)) {
+        return res.status(400).json({ success: false, error: 'mode must be "shadow", "live", or "off"' });
+    }
+    setAgentMode(mode);
+    res.json({ success: true, ...agentStatus() });
 });
 
 // ─── DB test ──────────────────────────────────────────────────────────────────
