@@ -93,7 +93,24 @@ export function quotaStatus() {
 function _scheduleWrite() {
     if (_testCap !== null) return;  // don't touch Supabase in tests
     clearTimeout(_writeTimer);
-    _writeTimer = setTimeout(_flush, 1000);
+    _writeTimer = setTimeout(_flush, 500);
+}
+
+// Flush immediately on process exit so Railway deploys don't lose counts.
+async function flushQuota() {
+    clearTimeout(_writeTimer);
+    if (_testCap !== null) return;
+    if (_mem.count === 0 && _mem.fallbacks === 0) return; // nothing to write
+    await _flush();
+}
+
+// Register shutdown handler once
+if (typeof process !== 'undefined' && !process._quotaShutdownRegistered) {
+    process._quotaShutdownRegistered = true;
+    const shutdown = async () => { await flushQuota(); process.exit(0); };
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    process.on('beforeExit', () => { _flush(); }); // best-effort
 }
 
 async function _flush() {

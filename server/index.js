@@ -1060,8 +1060,11 @@ async function sendWhatsAppReply(phone, reply) {
 // the rule-based machine.
 function applyAgentExtract(session, ag) {
     const d = session.data;
-    if (ag.name && typeof ag.name === 'string' && isValidName(ag.name) && (!d.contactName || d.contactName === 'WhatsApp Lead')) {
-        d.contactName = ag.name.trim();
+    if (ag.name && typeof ag.name === 'string' && isValidName(ag.name)) {
+        // Allow name update: first capture OR correction (user explicitly stating a different name)
+        if (!d.contactName || d.contactName === 'WhatsApp Lead' || d.contactName.toLowerCase() !== ag.name.trim().toLowerCase()) {
+            d.contactName = ag.name.trim();
+        }
     }
     if (ag.city && typeof ag.city === 'string' && !d.city) d.city = ag.city.trim();
     if (ag.eye_power && typeof ag.eye_power === 'string' && !d.eyePower) {
