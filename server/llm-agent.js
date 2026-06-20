@@ -22,7 +22,7 @@ import { isUnderQuota, tickRequest, tickFallback, quotaStatus } from './agent-qu
 const DEFAULT_MODEL = 'gemini-2.5-flash';
 const REQUEST_TIMEOUT_MS = 8000;
 
-// Circuit breaker: after a 429, back off for 60s (per-minute rate limit).
+// Circuit breaker: after a 429, back off briefly (Gemini free tier ~5 RPM).
 // After daily cap exhaustion, block until next UTC midnight.
 let _backoffUntil = 0;  // epoch ms — short backoff for 429
 
@@ -170,8 +170,8 @@ export async function runGeminiAgent({ message, history = [] }) {
         const txt = await res.text().catch(() => '');
         tickFallback();
         if (res.status === 429) {
-            _backoffUntil = Date.now() + 60_000; // retry after 60s
-            console.warn('[AGENT] 429 rate limited → backing off 60s');
+            _backoffUntil = Date.now() + 10_000; // retry after 10s
+            console.warn('[AGENT] 429 rate limited → backing off 10s');
         } else {
             console.error(`[AGENT] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
         }
