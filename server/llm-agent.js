@@ -88,6 +88,7 @@ Asking again makes you sound robotic and forgetful. Always check history first.
 
 ═══ STYLE ═══
 - MAX 2 sentences per reply. ONE short message. Never stacked paragraphs.
+- PLAIN TEXT ONLY. No markdown. No bullet points, no bold (**), no headers (##), no horizontal rules (---), no numbered lists. Just plain sentences.
 - Match their language: English → English, Hindi → Hindi, Hinglish → Hinglish.
 - Warm but efficient. Not overly chatty. Not robotic.
 - Occasional emoji, not every line.
@@ -151,11 +152,11 @@ const RESPONSE_SCHEMA = {
 
 /**
  * Run the Gemini agent for one inbound message.
- * @param {{ message: string, history?: Array<{role:'user'|'model', text:string}> }} args
+ * @param {{ message: string, history?: Array<{role:'user'|'model', text:string}>, sessionData?: object }} args
  * @returns {Promise<object|null>} structured result or null to fall back.
  *   Caller MUST treat null as "use the rule-based reply".
  */
-export async function runGeminiAgent({ message, history = [] }) {
+export async function runGeminiAgent({ message, history = [], sessionData = null }) {
     if (!isAgentEnabled()) return null;
 
     // Circuit breaker: skip if backing off from a recent 429.
@@ -171,12 +172,36 @@ export async function runGeminiAgent({ message, history = [] }) {
     const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
+    // Build context line from session data so the agent NEVER re-asks collected info
+    let contextLine = '';
+    if (sessionData) {
+        const parts = [];
+        if (sessionData.contactName && sessionData.contactName !== 'WhatsApp Lead') parts.push(`Name: ${sessionData.contactName}`);
+        if (sessionData.city) parts.push(`City: ${sessionData.city}`);
+        if (sessionData.eyePower) {
+            const ep = sessionData.eyePower;
+            const eyeStr = ep.parsed || ep.raw || (ep.numeric !== null ? String(ep.numeric) : '');
+            if (eyeStr) parts.push(`Eye Power: ${eyeStr}`);
+        }
+        if (sessionData.timeline) parts.push(`Timeline: ${sessionData.timeline}`);
+        if (sessionData.insurance) parts.push(`Insurance: ${sessionData.insurance}`);
+        if (sessionData.previous_surgery) parts.push(`Previous Surgery: ${sessionData.previous_surgery}`);
+        if (sessionData.ageGroup) parts.push(`Age: ${sessionData.ageGroup}`);
+        if (sessionData.is_cataract) parts.push(`Cataract: yes`);
+        if (sessionData.request_call) parts.push(`Callback requested: yes`);
+        if (parts.length > 0) {
+            contextLine = `[ALREADY COLLECTED — DO NOT ASK AGAIN: ${parts.join(', ')}]\n`;
+        }
+    }
+
+    const fullMessage = contextLine + message;
+
     const contents = [
         ...history
             .filter(h => h && h.text)
             .slice(-16)
             .map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.text }] })),
-        { role: 'user', parts: [{ text: message }] },
+        { role: 'user', parts: [{ text: fullMessage }] },
     ];
 
     const body = {
@@ -185,9 +210,8 @@ export async function runGeminiAgent({ message, history = [] }) {
         generationConfig: {
             responseMimeType: 'application/json',
             responseSchema: RESPONSE_SCHEMA,
-            temperature: 0.6,
-            maxOutputTokens: 500,
-            thinkingConfig: { thinkingBudget: 0 },
+            temperature: 0.5,
+            maxOutputTokens: 200,
         },
     };
 

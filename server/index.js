@@ -1318,7 +1318,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         if (isAgentEnabled() && session.state !== 'ASK_RESUME' && session.state !== 'RETURNING') {
             let agentResult = null;
             try {
-                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [] });
+                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [], sessionData: session.data });
             } catch (e) {
                 console.error('[AGENT] error → rule-based fallback:', e.message);
             }
