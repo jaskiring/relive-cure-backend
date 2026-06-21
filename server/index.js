@@ -90,16 +90,27 @@ function getSessionToken() {
     return crypto.createHmac('sha256', CRM_API_KEY || 'fallback').update(`${u}:${p}`).digest('hex');
 }
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     const validUsername = process.env.VITE_ADMIN_USERNAME || 'admin';
     const validPassword = process.env.VITE_ADMIN_PASSWORD;
     if (!validPassword) return res.status(503).json({ success: false, message: 'Auth not configured' });
+    // Built-in admin check
     if (username === validUsername && password === validPassword) {
-        res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken() });
-    } else {
-        res.status(401).json({ success: false, message: 'Invalid credentials' });
+        return res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken(), role: 'admin' });
     }
+    // Extra users from dashboard_users table
+    try {
+        const { data } = await supabaseAdmin
+            .from('dashboard_users')
+            .select('username, password_hash, role')
+            .eq('username', username)
+            .maybeSingle();
+        if (data && data.password_hash === crypto.createHash('sha256').update(`rc_user:${password}:relive_cure`).digest('hex')) {
+            return res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken(), role: data.role || 'limited' });
+        }
+    } catch { /* table may not exist yet — fall through */ }
+    return res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
 
 app.get('/api/auth/verify', (req, res) => {
@@ -1775,7 +1786,8 @@ import {
     importAllCampaignLeads as metaImportAllCampaignLeads,
     computeRecommendations as metaComputeRecommendations,
     recordSyncError as metaRecordSyncError,
-    bustVerificationCache as metaBustCache
+    bustVerificationCache as metaBustCache,
+    getAllCampaignLeadsExport as metaGetAllLeadsExport,
 } from './meta-marketing.js';
 
 function requireCrmKey(req, res) {
@@ -1946,6 +1958,96 @@ app.get('/api/meta/campaign/:id/audience', async (req, res) => {
     }
 });
 
+
+// GET /api/meta/leads/export — all meta leads across all campaigns (enriched), for Excel download
+// Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD (both optional)
+app.get('/api/meta/leads/export', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { from, to } = req.query;
+        const result = await metaGetAllLeadsExport({ from, to });
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// ─── Dashboard User Management ────────────────────────────────────────────────
+// Users are stored in dashboard_users Supabase table. The built-in admin (from
+// VITE_ADMIN_USERNAME/VITE_ADMIN_PASSWORD env vars) always has role 'admin' and
+// cannot be managed through this API.
+
+function hashPassword(password) {
+    return crypto.createHash('sha256')
+        .update(`rc_user:${password}:relive_cure`)
+        .digest('hex');
+}
+
+async function ensureUsersTable() {
+    // Create table if it doesn't exist (runs once on boot)
+    await supabaseAdmin.rpc('exec_sql', {
+        sql: `CREATE TABLE IF NOT EXISTS dashboard_users (
+            id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'limited',
+            created_at TIMESTAMPTZ DEFAULT now()
+        )`
+    }).catch(() => {}); // RPC might not exist — that's OK, table likely already exists
+}
+ensureUsersTable();
+
+app.get('/api/admin/users', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_users')
+            .select('id, username, role, created_at')
+            .order('created_at', { ascending: true });
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        return res.json({ success: true, users: data || [] });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/admin/users', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const { username, password, role } = req.body || {};
+    if (!username || !password) return res.status(400).json({ success: false, error: 'username and password required' });
+    const validRoles = ['admin', 'limited', 'hr', 'rep'];
+    const safeRole = validRoles.includes(role) ? role : 'limited';
+    const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
+    if (username.toLowerCase() === reserved) return res.status(400).json({ success: false, error: 'Cannot create user with reserved admin username' });
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_users')
+            .insert({ username, password_hash: hashPassword(password), role: safeRole })
+            .select('id, username, role, created_at')
+            .single();
+        if (error) return res.status(400).json({ success: false, error: error.message });
+        return res.json({ success: true, user: data });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.delete('/api/admin/users/:username', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const { username } = req.params;
+    const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
+    if (username.toLowerCase() === reserved) return res.status(400).json({ success: false, error: 'Cannot delete the built-in admin' });
+    try {
+        const { error } = await supabaseAdmin
+            .from('dashboard_users')
+            .delete()
+            .eq('username', username);
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        return res.json({ success: true });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
 
 // ─── CSV Upload Sync ─────────────────────────────────────────────────────────
 app.post('/api/upload-refrens-csv', express.text({ type: 'text/csv', limit: '10mb' }), async (req, res) => {

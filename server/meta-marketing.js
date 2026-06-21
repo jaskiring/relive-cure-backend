@@ -1526,3 +1526,95 @@ export function computeRecommendations({ kpis30, kpis7, wow, breakdowns, funnel,
   const sevRank = { critical: 0, warn: 1, info: 2, good: 3 };
   return rec.sort((a, b) => sevRank[a.severity] - sevRank[b.severity]);
 }
+
+// ─── Bulk campaign leads export ───────────────────────────────────────────────
+// Returns all meta leads across all campaigns, enriched with CRM data.
+// Used by GET /api/meta/leads/export
+export async function getAllCampaignLeadsExport({ from, to } = {}) {
+  let query = supabaseAdmin
+    .from('meta_leads')
+    .select('meta_lead_id, name, phone, email, city, created_time, ad_id, campaign_id, matched_lead_id, matched_source, raw_payload')
+    .order('created_time', { ascending: false });
+  if (from) query = query.gte('created_time', from + 'T00:00:00.000Z');
+  if (to)   query = query.lte('created_time', to   + 'T23:59:59.999Z');
+
+  const { data: metaLeads, error } = await query;
+  if (error) throw new Error(error.message);
+  if (!metaLeads || metaLeads.length === 0) return { leads: [], total: 0 };
+
+  // Campaign id → name
+  const campaignIds = [...new Set(metaLeads.map(l => l.campaign_id).filter(Boolean))];
+  const { data: camps } = await supabaseAdmin
+    .from('meta_campaigns')
+    .select('id, name')
+    .in('id', campaignIds);
+  const campName = {};
+  for (const c of (camps || [])) campName[c.id] = c.name;
+
+  // ad_id → name (best-effort via meta_ad_insights table — it stores ad_id but not name,
+  // so we skip ad resolution here; campaign name is sufficient for export)
+
+  // Bulk-fetch matched CRM rows
+  const refrensIds = metaLeads.filter(l => l.matched_source === 'refrens' && l.matched_lead_id).map(l => l.matched_lead_id);
+  const botIds     = metaLeads.filter(l => l.matched_source === 'chatbot' && l.matched_lead_id).map(l => l.matched_lead_id);
+
+  let refrensMap = {};
+  if (refrensIds.length) {
+    const { data } = await supabaseAdmin
+      .from('refrens_leads')
+      .select('id, status, intent_band, labels, call_outcome, follow_up_date, customer_city')
+      .in('id', refrensIds);
+    for (const r of (data || [])) refrensMap[r.id] = r;
+  }
+  let botMap = {};
+  if (botIds.length) {
+    const { data } = await supabaseAdmin
+      .from('leads_surgery')
+      .select('id, status, intent_level, contact_name, request_call')
+      .in('id', botIds);
+    for (const r of (data || [])) botMap[r.id] = r;
+  }
+
+  function exportIntentOf(lead, refrens, bot) {
+    const band = (refrens?.intent_band || '').trim();
+    if (/hot/i.test(band))  return 'HOT';
+    if (/warm/i.test(band)) return 'WARM';
+    if (/cold/i.test(band)) return 'COLD';
+    const labels = (refrens?.labels || '').toLowerCase();
+    if (/hot|high intent|very interested|urgent/i.test(labels)) return 'HOT';
+    if (/warm|interested|follow.?up/i.test(labels))             return 'WARM';
+    if (/cold|dnp|junk|spam|not interested|wrong/i.test(labels)) return 'COLD';
+    const callOutcome = (refrens?.call_outcome || '').toLowerCase();
+    if (/hot|very interested|callback|convert/i.test(callOutcome)) return 'HOT';
+    if (/warm|interested|considering|follow|maybe/i.test(callOutcome)) return 'WARM';
+    if (/not interested|wrong|junk|irrelevant|dnp/i.test(callOutcome)) return 'COLD';
+    if (bot?.request_call) return 'HOT';
+    const status = (refrens?.status || '').toLowerCase();
+    if (/deal done|won|surgery done|surgery booked/i.test(status)) return 'HOT';
+    if (/consult|booked|in[- ]progress/i.test(status))            return 'WARM';
+    if (/lost|dnp|not interested|not serviceable|junk/i.test(status)) return 'COLD';
+    if (refrens?.follow_up_date) return 'WARM';
+    const lvl = (bot?.intent_level || '').toUpperCase();
+    if (lvl === 'HOT' || lvl === 'WARM' || lvl === 'COLD') return lvl;
+    if (lead.matched_lead_id) return 'WARM';
+    return 'Unknown';
+  }
+
+  const leads = metaLeads.map(l => {
+    const refrens = l.matched_source === 'refrens' ? refrensMap[l.matched_lead_id] : null;
+    const bot     = l.matched_source === 'chatbot' ? botMap[l.matched_lead_id]     : null;
+    return {
+      Campaign:      campName[l.campaign_id] || l.campaign_id || '—',
+      Name:          l.name || bot?.contact_name || '(unnamed)',
+      Phone:         l.phone || '—',
+      Email:         l.email || '—',
+      City:          l.city || refrens?.customer_city || '—',
+      Intent:        exportIntentOf(l, refrens, bot),
+      'CRM Status':  refrens?.status || (bot ? 'Chatbot lead' : '—'),
+      'Matched CRM': l.matched_lead_id ? 'Yes' : 'No',
+      'Captured Date': l.created_time ? new Date(l.created_time).toLocaleDateString('en-IN') : '—',
+    };
+  });
+
+  return { leads, total: leads.length };
+}
