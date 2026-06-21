@@ -1,16 +1,12 @@
--- unified_leads: single row per phone across refrens_leads, leads_surgery, whatsapp_conversations.
--- refrens_leads uses contact_name (not name) and customer_city (not city).
--- phone formats differ between systems; matched_both will be 0 until phone normalisation lands.
--- Applied via DROP + CREATE (not CREATE OR REPLACE) because column order changed.
+-- Extend unified_leads with HR payroll fields (date_closed, refrens_created_at, customer_city alias).
+-- Safe to run: DROP + CREATE VIEW only.
 
 DROP VIEW IF EXISTS public.unified_leads;
 CREATE VIEW public.unified_leads AS
 SELECT
-  -- identity
   COALESCE(r.phone, ls.phone_number, wc.phone)               AS phone,
   COALESCE(r.contact_name, ls.contact_name, wc.contact_name) AS contact_name,
 
-  -- refrens fields
   r.id                                                        AS refrens_id,
   r.status                                                    AS refrens_status,
   r.labels                                                    AS refrens_labels,
@@ -22,7 +18,6 @@ SELECT
   ls.refrens_lead_url                                         AS refrens_lead_url,
   ls.refrens_lead_id                                          AS ls_refrens_lead_id,
 
-  -- bot / leads_surgery fields
   ls.id                                                       AS ls_id,
   ls.intent_level                                             AS intent_level,
   ls.intent_score                                             AS intent_score,
@@ -34,16 +29,13 @@ SELECT
   ls.last_activity_at                                         AS last_activity_at,
   ls.bot_version                                              AS bot_version,
 
-  -- whatsapp
   wc.contact_name                                             AS wa_contact_name,
   wc.last_message_at                                          AS last_message_at,
 
-  -- composite helpers for the dashboard
   COALESCE(r.assignee, ls.assignee)                           AS assignee,
   COALESCE(ls.last_user_message, r.last_internal_note)        AS last_user_message,
   COALESCE(ls.last_activity_at, r.refrens_created_at, wc.last_message_at) AS best_created_at,
 
-  -- presence flags
   (ls.id IS NOT NULL)                                         AS has_bot_lead,
   (r.id  IS NOT NULL)                                         AS has_refrens_lead,
   (wc.phone IS NOT NULL)                                      AS has_whatsapp

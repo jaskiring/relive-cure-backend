@@ -11,3 +11,7 @@ CREATE TABLE IF NOT EXISTS dashboard_users (
 
 -- Disable RLS — accessed only via service role key from backend
 ALTER TABLE dashboard_users DISABLE ROW LEVEL SECURITY;
+
+GRANT ALL ON TABLE public.dashboard_users TO service_role;
+REVOKE ALL ON TABLE public.dashboard_users FROM anon;
+REVOKE ALL ON TABLE public.dashboard_users FROM authenticated;

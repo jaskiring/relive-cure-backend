@@ -74,6 +74,28 @@ app.post('/api/agent/mode', (req, res) => {
     res.json({ success: true, ...agentStatus() });
 });
 
+// Persisted Gemini credit counter (Supabase agent_quota) — source of truth for the dashboard.
+app.get('/api/agent/quota', async (req, res) => {
+    try {
+        await hydrateQuota();
+        const status = agentStatus();
+        const q = status.quota || { count: 0, cap: 1200, fallbacks: 0, remaining: 1200, tokens: { prompt: 0, output: 0, thinking: 0, total: 0 }, date: new Date().toISOString().slice(0, 10) };
+        const remaining = q.remaining ?? Math.max(0, (q.cap || 1200) - (q.count || 0));
+        const resetsAt = new Date();
+        resetsAt.setUTCDate(resetsAt.getUTCDate() + 1);
+        resetsAt.setUTCHours(0, 0, 0, 0);
+        res.json({
+            success: true,
+            ...status,
+            quota: { ...q, remaining },
+            resets_at: resetsAt.toISOString(),
+            note: 'Calls = our API attempt counter. Tokens = summed from Gemini usageMetadata on each successful response.',
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // ─── DB test ──────────────────────────────────────────────────────────────────
 app.get('/test-db', async (req, res) => {
     try {
@@ -375,6 +397,58 @@ app.post('/api/calls/upload-complete', async (req, res) => {
       : err.message;
     console.error('[CALLS] upload-complete failed:', hint);
     return res.status(500).json({ success: false, error: hint });
+  }
+});
+
+// PATCH /api/calls/:id — post-call tag from rep app (outcome + follow-up flag).
+app.patch('/api/calls/:id', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ success: false, error: 'Call id required.' });
+  const b = req.body || {};
+  const patch = { updated_at: new Date().toISOString() };
+  if (b.outcome != null) patch.outcome = String(b.outcome).slice(0, 80);
+  if (typeof b.followup_needed === 'boolean') patch.followup_needed = b.followup_needed;
+  try {
+    const { data, error } = await supabaseAdmin.from('call_recordings').update(patch).eq('id', id).select('id, phone, outcome, followup_needed').maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: 'Call not found.' });
+    return res.json({ success: true, call: data });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/calls/upload-recording — rep app uploads OEM .m4a to Supabase Storage (increment 2–3 shortcut vs Drive).
+app.post('/api/calls/upload-recording', upload.single('file'), async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const file = req.file;
+  const callId = req.body?.call_id ? String(req.body.call_id).trim() : null;
+  if (!file?.buffer?.length) return res.status(400).json({ success: false, error: 'Audio file required.' });
+  if (!callId) return res.status(400).json({ success: false, error: 'call_id required.' });
+  const repId = req.body?.rep_id ? String(req.body.rep_id).slice(0, 80) : 'unknown';
+  const ext = (file.originalname || 'recording.m4a').split('.').pop() || 'm4a';
+  const storagePath = `rep/${repId}/${callId}.${ext.replace(/[^a-z0-9]/gi, '')}`;
+  try {
+    const { error: upErr } = await supabaseAdmin.storage.from('call-recordings').upload(storagePath, file.buffer, {
+      contentType: file.mimetype || 'audio/mp4',
+      upsert: true,
+    });
+    if (upErr) throw upErr;
+    const { data: pub } = supabaseAdmin.storage.from('call-recordings').getPublicUrl(storagePath);
+    const { data, error } = await supabaseAdmin.from('call_recordings').update({
+      drive_file_id: storagePath,
+      drive_file_url: pub?.publicUrl || null,
+      transcript_status: 'pending',
+      updated_at: new Date().toISOString(),
+    }).eq('id', callId).select('id, drive_file_url, transcript_status').maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: 'Call row not found — report call metadata first.' });
+    console.log(`[CALLS] recording uploaded ${storagePath} → call ${callId}`);
+    return res.json({ success: true, id: data.id, url: data.drive_file_url, transcript_status: data.transcript_status });
+  } catch (err) {
+    console.error('[CALLS] upload-recording failed:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -838,10 +912,51 @@ function isEscalationTrigger(msg) { return ESCALATION_TRIGGERS.some(w => msg.toL
 function isSalesIntent(msg) { return SALES_INTENT.some(w => msg.toLowerCase().includes(w)); }
 function isHighIntentFirst(msg) { return HIGH_INTENT_FIRST.some(w => msg.toLowerCase().includes(w)); }
 
+/** After a live Gemini reply: pause bot for opt-out / abuse without changing the reply. */
+function applyConversationHardStop(phone, session, message, msgLow) {
+    if (isNotInterested(msgLow)) {
+        session.data.opted_out = true;
+        if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
+        supabaseAdmin.from('whatsapp_conversations')
+            .upsert({ phone, bot_paused: true, updated_at: new Date().toISOString() }, { onConflict: 'phone' }).catch(() => {});
+        return 'not_interested';
+    }
+    if (isDisengaged(msgLow) || isAbusive(msgLow)) {
+        const abuse = isAbusive(msgLow);
+        session.data.opted_out = true;
+        if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
+        supabaseAdmin.from('whatsapp_conversations')
+            .upsert({ phone, bot_paused: true, updated_at: new Date().toISOString() }, { onConflict: 'phone' }).catch(() => {});
+        if (isPushConfigured()) {
+            fanout(supabaseAdmin, {
+                title: abuse ? '🚨 Angry lead — bot paused' : '⏸️ Lead disengaged',
+                body: `${safeFirstName(session) || phone}: "${message.slice(0, 60)}"`,
+                phone, url: `/m?phone=${encodeURIComponent(phone)}`, kind: 'escalation'
+            }).catch(() => {});
+        }
+        return abuse ? 'abuse' : 'disengaged';
+    }
+    return null;
+}
+
 const INDIAN_CITIES = ['delhi', 'mumbai', 'bangalore', 'bengaluru', 'hyderabad', 'pune', 'gurgaon', 'gurugram', 'noida', 'chennai', 'kolkata', 'jaipur', 'ahmedabad', 'chandigarh', 'lucknow', 'surat', 'bhopal', 'indore', 'nagpur', 'faridabad', 'meerut', 'rajkot', 'varanasi', 'amritsar', 'allahabad', 'prayagraj', 'coimbatore', 'jodhpur', 'madurai', 'raipur', 'kota', 'mohali', 'panchkula', 'dehradun', 'ghaziabad'];
 
 function passiveExtract(message, session) {
     const m = message.toLowerCase(); const d = session.data;
+    // Capture name from natural phrases so rule-based doesn't re-ask after a Gemini fallback.
+    if (!d.contactName || d.contactName === 'WhatsApp Lead') {
+        const namePatterns = [
+            /\b(?:i'?m|i am|im|mera naam|naam hai)\s+([a-zA-Z\u0900-\u097F]{2,20})\b/i,
+            /^([a-zA-Z\u0900-\u097F]{2,20})(?:\s+(?:here|hoon|hun|from|se))?\b/i,
+        ];
+        for (const re of namePatterns) {
+            const nm = message.match(re);
+            if (nm?.[1] && isValidName(nm[1])) {
+                d.contactName = nm[1].charAt(0).toUpperCase() + nm[1].slice(1).toLowerCase();
+                break;
+            }
+        }
+    }
     if (!d.city) {
         for (const city of INDIAN_CITIES) { if (m.includes(city)) { d.city = city.charAt(0).toUpperCase() + city.slice(1); break; } }
         const fromMatch = m.match(/(?:from|i'm from|i am from|main.*se hoon|main.*se hun)\s+([a-z]+)/i);
@@ -1301,7 +1416,48 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         session.repeat_count = session.repeat_count || {};
 
-        // ─── SAFETY NET: Not interested → pause bot in DB so restarts don't re-engage ───
+        // ─── LLM AGENT FIRST — every message tries Gemini while enabled + under quota.
+        //     Rule-based (including safety handlers) runs only when agent is off,
+        //     daily cap is exhausted, or the API fails. ───
+        if (isAgentEnabled()) {
+            let agentResult = null;
+            try {
+                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [], sessionData: session.data });
+            } catch (e) {
+                console.error('[AGENT] error → rule-based fallback:', e.message);
+            }
+
+            if (agentResult && agentResult.reply) {
+                applyAgentExtract(session, agentResult);
+
+                session._agentHistory = (session._agentHistory || [])
+                    .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
+                    .slice(-20);
+
+                const hasData = session.data.city || session.data.eyePower || session.data.contactName;
+                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
+                if (session.data.request_call && session.state !== 'COMPLETE') {
+                    session.state = 'COMPLETE';
+                    if (!session.data.callback_offered) session.data.callback_offered = true;
+                    session.data.human_handoff_started = true;
+                }
+
+                if (agentMode() === 'live') {
+                    setReply(agentResult.reply);
+                    console.log(`[AGENT:live] ✅ ${phone}`);
+                    applyConversationHardStop(phone, session, message, msgLow);
+                    return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
+                }
+                console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
+            } else {
+                const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
+                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
+                console.log(`[AGENT:fallback] ${phone} → rule-based`);
+            }
+        }
+
+        // ─── RULE-BASED FALLBACK (quota exhausted, agent off, or API failed) ───
+
         if (isNotInterested(msgLow)) {
             session.data.opted_out = true;
             if (session.inactivityTimer) { clearTimeout(session.inactivityTimer); session.inactivityTimer = null; }
@@ -1311,7 +1467,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
         }
 
-        // ─── SAFETY NET: Disengagement + abuse detection ───
         if (isDisengaged(msgLow) || isAbusive(msgLow)) {
             const abuse = isAbusive(msgLow);
             session.data.opted_out = true;
@@ -1331,7 +1486,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             return finalizeWithIngest(phone, session, 'disengaged', finalize, isTestChat);
         }
 
-        // ─── SAFETY NET: Name correction ("my name isn't lipoma") ───
         const nameCorr = checkNameCorrection(message, session);
         if (nameCorr === 'cleared') {
             setReply(lang === 'HI'
@@ -1348,7 +1502,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             return finalizeWithIngest(phone, session, 'name_correction', finalize, isTestChat);
         }
 
-        // ─── SAFETY NET: Off-topic body condition ("lipoma ho gyi hai") ───
         if (isOffTopic(message)) {
             setReply(lang === 'HI'
                 ? 'मैं Relive Cure का vision assistant हूँ — इस concern के लिए सही specialist से मिलें 🙏\n\nक्या आपकी आँखों से जुड़ा कोई सवाल है?'
@@ -1363,8 +1516,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
         }
 
-        // Intercept WhatsApp CTA template re-click ("Hello! Can I get more info on this?")
-        // isValidName() rejects it due to '?' → bot would loop on INVALID_NAME without this.
         if (msgLow.includes('can i get more info')) {
             const hasName = session.data.contactName && session.data.contactName !== 'WhatsApp Lead';
             if (!hasName) {
@@ -1376,58 +1527,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = safeFirstName(session); setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
         if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = safeFirstName(session); setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
-
-        // ─── LLM AGENT (Gemini, free tier) — natural conversation, with the
-        //     rule-based state machine below as automatic fallback.
-        //     Safety guards above (opt-out, abuse, off-topic, human-takeover,
-        //     explicit "call me") always run first and are never delegated to the LLM.
-        //     In shadow mode the agent runs but its reply is only logged — the
-        //     rule-based reply is what the customer sees. ───
-        if (isAgentEnabled() && session.state !== 'ASK_RESUME' && session.state !== 'RETURNING') {
-            let agentResult = null;
-            try {
-                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [], sessionData: session.data });
-            } catch (e) {
-                console.error('[AGENT] error → rule-based fallback:', e.message);
-            }
-
-            if (agentResult && agentResult.reply) {
-                // Always reconcile session.data so the rule-based fallback (if it
-                // ever fires) and the CRM pipeline see what the agent learned.
-                applyAgentExtract(session, agentResult);
-
-                // Track conversation memory (capped, persisted via schedulePersist).
-                session._agentHistory = (session._agentHistory || [])
-                    .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
-                    .slice(-20);
-
-                // State sync: if agent extracted useful data, ensure we're past GREETING
-                const hasData = session.data.city || session.data.eyePower || session.data.contactName;
-                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
-                // If callback was triggered by agent, move to COMPLETE
-                if (session.data.request_call && session.state !== 'COMPLETE') {
-                    session.state = 'COMPLETE';
-                    if (!session.data.callback_offered) session.data.callback_offered = true;
-                    session.data.human_handoff_started = true;
-                }
-
-                if (agentMode() === 'live') {
-                    setReply(agentResult.reply);
-                    console.log(`[AGENT:live] ✅ ${phone}`);
-                    return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
-                } else {
-                    // SHADOW: log what the agent would have said, fall through to
-                    // rule-based so the customer still gets a safe reply.
-                    console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
-                }
-            } else {
-                // Agent failed but may have extracted data on a previous turn.
-                // Ensure state is past GREETING so rule-based doesn't re-greet.
-                const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
-                if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
-                console.log(`[AGENT:fallback] ${phone} → rule-based`);
-            }
-        }
 
         const knowledge = buildKnowledgeResponse(message, session);
         if (knowledge) { setReply(knowledge); return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat); }

@@ -33,3 +33,7 @@ create table if not exists call_recordings (
 create index if not exists idx_call_recordings_phone on call_recordings (phone, call_started_at desc);
 create index if not exists idx_call_recordings_rep   on call_recordings (rep_id, call_started_at desc);
 create index if not exists idx_call_recordings_tstat on call_recordings (transcript_status);
+create unique index if not exists idx_call_recordings_drive_file_id on call_recordings (drive_file_id) where drive_file_id is not null;
+
+GRANT ALL ON TABLE public.call_recordings TO service_role;
+GRANT SELECT ON TABLE public.call_recordings TO anon, authenticated;

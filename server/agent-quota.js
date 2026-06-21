@@ -8,7 +8,7 @@
 
 const DEFAULT_DAILY_CAP = 1200;
 
-let _mem = { date: null, count: 0, fallbacks: 0 };
+let _mem = { date: null, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
 let _writeTimer = null;
 let _bootHydrated = false;
 let _testCap = null;  // test override; null in production
@@ -33,7 +33,7 @@ async function _db() {
 // Test-only helpers.
 function _setCapForTest(n) { _testCap = n; }
 function resetForTest() {
-    _mem = { date: _today(), count: 0, fallbacks: 0 };
+    _mem = { date: _today(), count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
     _writeTimer = null;
     _bootHydrated = true; // skip Supabase hydrate in tests
     _dailyExhausted = false;
@@ -48,7 +48,7 @@ export async function hydrateQuota() {
         const db = await _db();
         const { data, error } = await db
             .from('agent_quota')
-            .select('date, request_count, fallback_count')
+            .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total')
             .eq('date', today)
             .maybeSingle();
         if (error) {
@@ -56,10 +56,18 @@ export async function hydrateQuota() {
             return;
         }
         if (data) {
-            _mem = { date: data.date, count: data.request_count || 0, fallbacks: data.fallback_count || 0 };
-            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → ${_mem.count}/${_cap()}`);
+            _mem = {
+                date: data.date,
+                count: data.request_count || 0,
+                fallbacks: data.fallback_count || 0,
+                tokens_prompt: data.tokens_prompt || 0,
+                tokens_output: data.tokens_output || 0,
+                tokens_thinking: data.tokens_thinking || 0,
+                tokens_total: data.tokens_total || 0,
+            };
+            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → ${_mem.count}/${_cap()} calls, ${_mem.tokens_total} tokens`);
         } else {
-            _mem = { date: today, count: 0, fallbacks: 0 };
+            _mem = { date: today, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
         }
     } catch (e) {
         console.warn('[AGENT-QUOTA] hydrate error:', e.message);
@@ -68,7 +76,10 @@ export async function hydrateQuota() {
 
 export function isUnderQuota() {
     const d = _today();
-    if (_mem.date !== d) { _mem = { date: d, count: 0, fallbacks: 0 }; _dailyExhausted = false; }
+    if (_mem.date !== d) {
+        _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+        _dailyExhausted = false;
+    }
     if (_dailyExhausted) return false;
     const under = _mem.count < _cap();
     if (!under) _dailyExhausted = true; // persist for rest of day
@@ -77,14 +88,29 @@ export function isUnderQuota() {
 
 export function tickRequest() {
     const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0 };
+    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
     _mem.count += 1;
+    _scheduleWrite();
+}
+
+/** Accumulate token counts from Gemini usageMetadata (Google-reported). */
+export function tickTokens(usage = {}) {
+    const d = _today();
+    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+    const prompt = Number(usage.promptTokenCount) || 0;
+    const output = Number(usage.candidatesTokenCount) || 0;
+    const thinking = Number(usage.thoughtsTokenCount) || 0;
+    const total = Number(usage.totalTokenCount) || (prompt + output + thinking);
+    _mem.tokens_prompt += prompt;
+    _mem.tokens_output += output;
+    _mem.tokens_thinking += thinking;
+    _mem.tokens_total += total;
     _scheduleWrite();
 }
 
 export function tickFallback() {
     const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0 };
+    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
     _mem.fallbacks += 1;
     _scheduleWrite();
 }
@@ -92,7 +118,20 @@ export function tickFallback() {
 export function quotaStatus() {
     const d = _today();
     const count = _mem.date === d ? _mem.count : 0;
-    return { date: d, count, cap: _cap(), fallbacks: _mem.date === d ? _mem.fallbacks : 0 };
+    const tokens = _mem.date === d ? {
+        prompt: _mem.tokens_prompt,
+        output: _mem.tokens_output,
+        thinking: _mem.tokens_thinking,
+        total: _mem.tokens_total,
+    } : { prompt: 0, output: 0, thinking: 0, total: 0 };
+    return {
+        date: d,
+        count,
+        cap: _cap(),
+        fallbacks: _mem.date === d ? _mem.fallbacks : 0,
+        remaining: Math.max(0, _cap() - count),
+        tokens,
+    };
 }
 
 function _scheduleWrite() {
@@ -127,6 +166,10 @@ async function _flush() {
                 date: _mem.date,
                 request_count: _mem.count,
                 fallback_count: _mem.fallbacks,
+                tokens_prompt: _mem.tokens_prompt,
+                tokens_output: _mem.tokens_output,
+                tokens_thinking: _mem.tokens_thinking,
+                tokens_total: _mem.tokens_total,
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'date' });
         if (error) console.warn('[AGENT-QUOTA] write failed:', error.message);

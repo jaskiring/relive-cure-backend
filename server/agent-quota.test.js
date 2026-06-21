@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resetForTest, isUnderQuota, tickRequest, tickFallback, quotaStatus, _setCapForTest } from './agent-quota.js';
+import { resetForTest, isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus, _setCapForTest } from './agent-quota.js';
 
 function setup() {
     resetForTest();
@@ -45,6 +45,24 @@ test('quota resets when resetForTest is called', () => {
     assert.equal(isUnderQuota(), false);
     resetForTest();
     assert.equal(isUnderQuota(), true);
+});
+
+test('tickTokens accumulates usageMetadata totals', () => {
+    setup();
+    tickTokens({ promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 10, totalTokenCount: 160 });
+    tickTokens({ promptTokenCount: 200, candidatesTokenCount: 80, totalTokenCount: 280 });
+    const s = quotaStatus();
+    assert.equal(s.tokens.prompt, 300);
+    assert.equal(s.tokens.output, 130);
+    assert.equal(s.tokens.thinking, 10);
+    assert.equal(s.tokens.total, 440);
+});
+
+test('quotaStatus includes remaining calls', () => {
+    setup();
+    tickRequest();
+    const s = quotaStatus();
+    assert.equal(s.remaining, 4);
 });
 
 test('tickRequest does not trigger Supabase write in test mode', () => {

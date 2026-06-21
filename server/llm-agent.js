@@ -3,8 +3,11 @@
 //
 // Ships dark: requires GEMINI_API_KEY + BOT_AGENT_MODE in {shadow, live}.
 // On any failure (timeout, 429, malformed JSON, network, quota), returns null
-// and the caller falls back to the rule-based state machine — production is
-// never at the mercy of a free API.
+// and the caller falls back to the rule-based state machine.
+//
+// The caller tries Gemini FIRST on every message while enabled and under quota.
+// Rule-based (including call-me, cataract, KB templates) only runs when the
+// agent is off, daily cap is hit, or the API fails.
 //
 // Shadow mode (default when enabled): the agent runs and its reply is
 // returned to the caller for logging, but the CALLER sends the rule-based
@@ -17,7 +20,7 @@
 //
 // No SDK dependency — calls the Gemini REST endpoint via globalThis.fetch.
 
-import { isUnderQuota, tickRequest, tickFallback, quotaStatus } from './agent-quota.js';
+import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus } from './agent-quota.js';
 
 const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -282,6 +285,10 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
         tickFallback();
         console.warn('[AGENT] no usable reply → fallback');
         return null;
+    }
+    if (data?.usageMetadata) {
+        tickTokens(data.usageMetadata);
+        console.log(`[AGENT] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
     }
     return parsed;
 }
