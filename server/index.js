@@ -84,6 +84,19 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
+const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
+const ROLE_DEFAULT_TABS = {
+    admin: VALID_TABS,
+    limited: ['chatbot', 'hr'],
+    rep: ['chatbot', 'inbox'],
+    hr: ['hr'],
+};
+
+function normalizeTabs(tabs, roleFallback = 'limited') {
+    const arr = Array.isArray(tabs) ? tabs.filter(t => VALID_TABS.includes(t)) : [];
+    return arr.length ? arr : (ROLE_DEFAULT_TABS[roleFallback] || ['chatbot']);
+}
+
 function getSessionToken() {
     const u = process.env.VITE_ADMIN_USERNAME || '';
     const p = process.env.VITE_ADMIN_PASSWORD || '';
@@ -97,17 +110,33 @@ app.post('/api/auth/login', async (req, res) => {
     if (!validPassword) return res.status(503).json({ success: false, message: 'Auth not configured' });
     // Built-in admin check
     if (username === validUsername && password === validPassword) {
-        return res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken(), role: 'admin' });
+        return res.json({
+            success: true,
+            token: CRM_API_KEY,
+            sessionToken: getSessionToken(),
+            role: 'admin',
+            designation: null,
+            allowed_tabs: VALID_TABS,
+        });
     }
     // Extra users from dashboard_users table
     try {
         const { data } = await supabaseAdmin
             .from('dashboard_users')
-            .select('username, password_hash, role')
+            .select('username, password_hash, role, designation, allowed_tabs')
             .eq('username', username)
             .maybeSingle();
         if (data && data.password_hash === crypto.createHash('sha256').update(`rc_user:${password}:relive_cure`).digest('hex')) {
-            return res.json({ success: true, token: CRM_API_KEY, sessionToken: getSessionToken(), role: data.role || 'limited' });
+            const role = data.role || 'limited';
+            const allowedTabs = normalizeTabs(data.allowed_tabs, role);
+            return res.json({
+                success: true,
+                token: CRM_API_KEY,
+                sessionToken: getSessionToken(),
+                role,
+                designation: data.designation || null,
+                allowed_tabs: allowedTabs,
+            });
         }
     } catch { /* table may not exist yet — fall through */ }
     return res.status(401).json({ success: false, message: 'Invalid credentials' });
@@ -1990,10 +2019,14 @@ app.get('/api/admin/users', async (req, res) => {
     try {
         const { data, error } = await supabaseAdmin
             .from('dashboard_users')
-            .select('id, username, role, created_at')
+            .select('id, username, role, designation, allowed_tabs, created_at')
             .order('created_at', { ascending: true });
         if (error) return res.status(500).json({ success: false, error: error.message });
-        return res.json({ success: true, users: data || [] });
+        const users = (data || []).map(u => ({
+            ...u,
+            allowed_tabs: normalizeTabs(u.allowed_tabs, u.role),
+        }));
+        return res.json({ success: true, users });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
@@ -2001,20 +2034,62 @@ app.get('/api/admin/users', async (req, res) => {
 
 app.post('/api/admin/users', async (req, res) => {
     if (!requireCrmKey(req, res)) return;
-    const { username, password, role } = req.body || {};
+    const { username, password, role, designation, allowed_tabs } = req.body || {};
     if (!username || !password) return res.status(400).json({ success: false, error: 'username and password required' });
     const validRoles = ['admin', 'limited', 'hr', 'rep'];
     const safeRole = validRoles.includes(role) ? role : 'limited';
+    const safeTabs = normalizeTabs(allowed_tabs, safeRole);
+    const safeDesignation = typeof designation === 'string' && designation.trim() ? designation.trim() : null;
     const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
     if (username.toLowerCase() === reserved) return res.status(400).json({ success: false, error: 'Cannot create user with reserved admin username' });
     try {
         const { data, error } = await supabaseAdmin
             .from('dashboard_users')
-            .insert({ username, password_hash: hashPassword(password), role: safeRole })
-            .select('id, username, role, created_at')
+            .insert({
+                username,
+                password_hash: hashPassword(password),
+                role: safeRole,
+                designation: safeDesignation,
+                allowed_tabs: safeTabs,
+            })
+            .select('id, username, role, designation, allowed_tabs, created_at')
             .single();
         if (error) return res.status(400).json({ success: false, error: error.message });
-        return res.json({ success: true, user: data });
+        return res.json({ success: true, user: { ...data, allowed_tabs: normalizeTabs(data.allowed_tabs, data.role) } });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.patch('/api/admin/users/:username', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const { username } = req.params;
+    const { designation, role, allowed_tabs, password } = req.body || {};
+    const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
+    if (username.toLowerCase() === reserved) return res.status(400).json({ success: false, error: 'Cannot edit the built-in admin' });
+    const validRoles = ['admin', 'limited', 'hr', 'rep'];
+    const patch = {};
+    if (role !== undefined) patch.role = validRoles.includes(role) ? role : 'limited';
+    if (designation !== undefined) {
+        patch.designation = typeof designation === 'string' && designation.trim() ? designation.trim() : null;
+    }
+    if (allowed_tabs !== undefined) {
+        patch.allowed_tabs = normalizeTabs(allowed_tabs, patch.role || role || 'limited');
+    }
+    if (password) patch.password_hash = hashPassword(password);
+    if (Object.keys(patch).length === 0) {
+        return res.status(400).json({ success: false, error: 'No fields to update' });
+    }
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_users')
+            .update(patch)
+            .eq('username', username)
+            .select('id, username, role, designation, allowed_tabs, created_at')
+            .maybeSingle();
+        if (error) return res.status(400).json({ success: false, error: error.message });
+        if (!data) return res.status(404).json({ success: false, error: 'User not found' });
+        return res.json({ success: true, user: { ...data, allowed_tabs: normalizeTabs(data.allowed_tabs, data.role) } });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
