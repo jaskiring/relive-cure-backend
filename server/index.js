@@ -1983,19 +1983,7 @@ function hashPassword(password) {
         .digest('hex');
 }
 
-async function ensureUsersTable() {
-    // Create table if it doesn't exist (runs once on boot)
-    await supabaseAdmin.rpc('exec_sql', {
-        sql: `CREATE TABLE IF NOT EXISTS dashboard_users (
-            id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'limited',
-            created_at TIMESTAMPTZ DEFAULT now()
-        )`
-    }).catch(() => {}); // RPC might not exist — that's OK, table likely already exists
-}
-ensureUsersTable();
+// dashboard_users table created via migrations/create_dashboard_users.sql
 
 app.get('/api/admin/users', async (req, res) => {
     if (!requireCrmKey(req, res)) return;
