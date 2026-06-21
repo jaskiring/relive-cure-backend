@@ -965,7 +965,7 @@ export async function getCampaignLeads(campaignId) {
   if (botIds.length > 0) {
     const { data } = await supabaseAdmin
       .from('leads_surgery')
-      .select('id, status, parameters_completed, intent_level, intent_score, contact_name, last_user_message')
+      .select('id, status, parameters_completed, intent_level, intent_score, contact_name, last_user_message, insurance, eye_power, eye_power_numeric, timeline, urgency_level, interest_cost, interest_recovery, concern_pain, concern_safety, concern_power, request_call, city')
       .in('id', botIds);
     for (const r of (data || [])) botMap[r.id] = r;
   }
@@ -1035,6 +1035,19 @@ export async function getCampaignLeads(campaignId) {
   function cityOf(lead, refrens) {
     return refrens?.customer_city || lead.city || 'Unknown';
   }
+  // Fuzzy-pick a value from a Meta-form custom-field map by key regex.
+  function pickCustom(custom, re) {
+    for (const [k, v] of Object.entries(custom || {})) { if (re.test(k) && v) return String(v); }
+    return '';
+  }
+  // Normalize an insurance value to Yes / No / '' for clean filtering.
+  function normInsurance(v) {
+    if (!v) return '';
+    const s = String(v).toLowerCase();
+    if (/^(yes|haan|hai|y|true|covered|insured)/.test(s) || /insurance hai|bima hai/.test(s)) return 'Yes';
+    if (/^(no|nahi|n|false|not)/.test(s) || /no insurance|bima nahi/.test(s)) return 'No';
+    return String(v);
+  }
 
   const STAGES = ['captured','matched','contacted','consulted','booked','done','lost'];
   const INTENTS = ['HOT','WARM','COLD','Unknown'];
@@ -1101,6 +1114,16 @@ export async function getCampaignLeads(campaignId) {
       }
     }
 
+    // Harvest the lead's own Meta-form custom answers (fallback for form-only
+    // leads that never messaged WhatsApp), then coalesce bot → form for the
+    // qualification data points used in the export + filters.
+    const formCustom = Array.isArray(l.field_data) ? extractFieldData(l.field_data).custom : {};
+    const insurance = normInsurance(bot?.insurance || pickCustom(formCustom, /insur|bima|medical_?cover/));
+    const eyePower  = (bot?.eye_power || pickCustom(formCustom, /eye|power|spectacle|glass|sight|vision|number/) || '').toString().trim();
+    const timeline  = (bot?.timeline || pickCustom(formCustom, /timeline|how_?soon|when|plan|surgery_?date|month/) || '').toString().trim();
+    const ageGroup  = pickCustom(formCustom, /\bage\b|umar|age_?group|how_?old/);
+    const assignee  = refrens?.assignee || '';
+
     return {
       ...l,
       refrens,
@@ -1108,7 +1131,13 @@ export async function getCampaignLeads(campaignId) {
       status,
       intent,
       stage,
-      isWon, isLost, isHot
+      isWon, isLost, isHot,
+      // flattened qualification fields for export + filtering
+      insurance,
+      eye_power: eyePower,
+      timeline,
+      age_group: ageGroup,
+      assignee,
     };
   });
 
@@ -1156,8 +1185,17 @@ export async function getCampaignLeads(campaignId) {
     else refrensSlaMap.onTime++;
     // Assignee
     if (l.refrens.assignee) {
-      refrensAssigneeMap[l.refrens.assignee] = (refrensAssigneeMap[l.refrens.assignee] || 0) + 1;
+      const a = refrensAssigneeMap[l.refrens.assignee] = refrensAssigneeMap[l.refrens.assignee] || { assignee: l.refrens.assignee, count: 0, surgeries: 0 };
+      a.count++; if (l.isWon) a.surgeries++;
     }
+  }
+
+  // Insurance breakdown — coalesced bot+form value per lead (Yes / No / Unknown).
+  const insuranceMap = {};
+  for (const l of leads) {
+    const key = l.insurance || 'Unknown';
+    const e = insuranceMap[key] = insuranceMap[key] || { value: key, count: 0, surgeries: 0 };
+    e.count++; if (l.isWon) e.surgeries++;
   }
 
   // Custom form-field breakdowns: convert each question into a sorted array
@@ -1191,7 +1229,8 @@ export async function getCampaignLeads(campaignId) {
     refrensHealth:   Object.entries(refrensHealthMap).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count),
     refrensStatus:   Object.entries(refrensStatusMap).map(([status, count]) => ({ status, count })).sort((a,b) => b.count - a.count),
     refrensSla:      refrensSlaMap,
-    refrensAssignee: Object.entries(refrensAssigneeMap).map(([assignee, count]) => ({ assignee, count })).sort((a,b) => b.count - a.count)
+    refrensAssignee: Object.values(refrensAssigneeMap).sort((a,b) => b.count - a.count),
+    byInsurance:     Object.values(insuranceMap).sort((a,b) => b.count - a.count)
   };
 
   const accountBenchmark = await getAccountBenchmark();
