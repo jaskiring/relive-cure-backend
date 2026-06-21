@@ -19,7 +19,7 @@
 
 import { isUnderQuota, tickRequest, tickFallback, quotaStatus } from './agent-quota.js';
 
-const DEFAULT_MODEL = 'gemini-1.5-flash';
+const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
 const REQUEST_TIMEOUT_MS = 8000;
 
 // Circuit breaker: after a 429, back off briefly (Gemini free tier ~5 RPM).
@@ -212,8 +212,8 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             responseMimeType: 'application/json',
             responseSchema: RESPONSE_SCHEMA,
             temperature: 0.5,
-            maxOutputTokens: 400,
-            thinkingConfig: { thinkingBudget: 100 },
+            maxOutputTokens: 1024,
+            thinkingConfig: { thinkingBudget: 512 },
         },
     };
 
