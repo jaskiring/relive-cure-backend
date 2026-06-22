@@ -658,6 +658,14 @@ function parseEyePower(message) {
         return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
     }
 
+    // Handle "5 in both eyes" / "-3 both eyes"
+    const bothEyesMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+(?:in\s+)?both\s+eyes?/i);
+    if (bothEyesMatch) {
+        let n = parseFloat(bothEyesMatch[1]);
+        if (n > 0 && !bothEyesMatch[1].includes('+')) n = -n;
+        return { raw: m, parsed: `R:${n} L:${n}`, numeric: n, confidence: 'high', right: n, left: n };
+    }
+
     // Handle "right 4 left 5" or "right eye 4 left eye 5"
     const rlMatch = m.match(/right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*[,\s]+left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
     if (rlMatch) {
@@ -1042,7 +1050,7 @@ function passiveExtract(message, session) {
             // Don't capture yet — the bot will clarify via getNextQuestion
             // Just mark as a partial response so we don't loop
             d._noLensStated = true;
-        } else if (powerMatch && (hasContext || session.state === 'EYE_POWER' || justAskedPower)) {
+        } else if (powerMatch && (hasContext || /both\s+eyes?/i.test(m) || session.state === 'EYE_POWER' || justAskedPower)) {
             d.eyePower = parseEyePower(message);
             d.concern_power = true;
             d.lastAskedField = null; // clear so it doesn't keep matching
@@ -1078,6 +1086,7 @@ function passiveExtract(message, session) {
     } else if (d.lastAskedField === 'INSURANCE') {
         d.lastAskedField = null;
     }
+    if (/motia|motiyabind|मोतियाबिंद|cataract/i.test(m)) d.is_cataract = true;
 }
 
 function scoreSession(session) {
@@ -1117,14 +1126,15 @@ async function sendToAPI(phone, session, trigger = 'update') {
         eyePowerStr ? `Eye power: ${eyePowerStr}` : null,
         d.powerStability ? `Power stable: ${d.powerStability}` : null,
         eyePowerNum !== null ? `Eye power numeric: ${eyePowerNum}` : null,
+        d.is_cataract ? 'Cataract mentioned' : null,
         d.opted_out ? 'User opted out' : null
     ].filter(Boolean).join(' | ');
 
     const payload = {
         phone_number: phone, contact_name: d.contactName || 'WhatsApp Lead',
-        city: d.city || '', preferred_surgery_city: d.city || '',
-        eye_power: eyePowerStr || '', eye_power_numeric: eyePowerNum,
-        timeline: d.timeline || '', insurance: d.insurance || '',
+        city: d.city || undefined, preferred_surgery_city: d.city || undefined,
+        eye_power: eyePowerStr || undefined, eye_power_numeric: eyePowerNum,
+        timeline: d.timeline || undefined, insurance: d.insurance || undefined,
         interest_cost: scored.interest_cost, interest_recovery: scored.interest_recovery,
         concern_pain: scored.concern_pain, concern_safety: scored.concern_safety,
         concern_power: !!d.concern_power, intent_level: scored.intent_band || 'COLD',
@@ -1145,7 +1155,7 @@ async function sendToAPI(phone, session, trigger = 'update') {
     try {
         const { data, action } = await ingestLead(supabaseAdmin, payload);
         console.log(`[BOT→DB] ✅ ${action.toUpperCase()} | id=${data.id} | phone=${phone}`);
-        session.ingested = true; session.first_ingest_done = true; schedulePersist();
+        session.ingested = true; session.first_ingest_done = true; session._lastIngestError = null; schedulePersist();
         // Inline lead-INSERT push fanout — only on first ingest (not updates).
         // More reliable than Supabase realtime in the Node client.
         if (action === 'upserted' && data?.id && isPushConfigured()) {
@@ -1167,9 +1177,29 @@ async function sendToAPI(phone, session, trigger = 'update') {
 }
 
 // ─── DIRECT DB CHECK — no HTTP ────────────────────────────────────────────────
+function hydrateSessionDataFromLead(row) {
+    if (!row) return {};
+    const data = {
+        contactName: row.contact_name || 'WhatsApp Lead',
+        is_returning: true,
+    };
+    if (row.city) data.city = row.city;
+    if (row.insurance) data.insurance = row.insurance;
+    if (row.timeline) data.timeline = row.timeline;
+    if (row.message_count) data.message_count = row.message_count;
+    if (row.eye_power) {
+        const parsed = parseEyePower(String(row.eye_power));
+        data.eyePower = parsed?.numeric != null ? parsed : { raw: row.eye_power, parsed: row.eye_power, numeric: row.eye_power_numeric ?? null, confidence: 'db' };
+    }
+    if (row.request_call) data.request_call = true;
+    if (row.concern_power) data.concern_power = true;
+    if (row.interest_cost) data.interest_cost = true;
+    return data;
+}
+
 async function checkExistingLead(phone) {
     try {
-        const { data, error } = await supabaseAdmin.from('leads_surgery').select('id, contact_name, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, urgency_level, pushed_to_crm').eq('phone_number', phone).maybeSingle();
+        const { data, error } = await supabaseAdmin.from('leads_surgery').select('id, phone_number, contact_name, city, insurance, timeline, eye_power, eye_power_numeric, message_count, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, concern_power, urgency_level, pushed_to_crm, request_call').eq('phone_number', phone).maybeSingle();
         if (error) throw error;
         return data || null;
     } catch (e) { console.error('[BOT] checkExistingLead error:', e.message); return null; }
@@ -1514,13 +1544,13 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         if (!botSessions[phone]) {
             const existing = await checkExistingLead(phone);
-            const seedData = existing ? { contactName: existing.contact_name, is_returning: true } : {};
+            const seedData = existing ? hydrateSessionDataFromLead(existing) : {};
             if (!existing && waProfileName) {
                 const waFirst = waProfileName.trim().split(/\s+/).slice(0, 2).join(' ');
                 if (isValidName(waFirst)) seedData.contactName = waFirst;
             }
             botSessions[phone] = { state: existing ? 'RETURNING' : 'GREETING', data: seedData, inactivityTimer: null, ingested: !!existing, first_ingest_done: !!existing, lang: 'EN', repeat_count: {}, resume_offered: false, last_intent_handled: null };
-            if (!existing && !isLabPhone(phone)) { setImmediate(async () => { try { await sendToAPI(phone, botSessions[phone], 'initial'); } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); } }); }
+            if (!existing) { setImmediate(async () => { try { await sendToAPI(phone, botSessions[phone], 'initial'); } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); } }); }
         }
 
         let session = botSessions[phone];
@@ -1537,7 +1567,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         if (session.state === 'COMPLETE' || session.state === 'CORE_CONSULT') {
             const stillExists = await checkExistingLead(phone);
-            if (!stillExists && session.ingested) {
+            if (!stillExists && session.ingested && !isLabPhone(phone)) {
                 delete botSessions[phone];
                 botSessions[phone] = { state: 'GREETING', data: {}, inactivityTimer: null, ingested: false, first_ingest_done: false, lang, repeat_count: {}, resume_offered: false, last_intent_handled: null };
                 session = botSessions[phone];
@@ -1791,7 +1821,10 @@ function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = fa
                     payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
                 }).then(() => {}, () => {});
             }
-        } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
+        } catch (e) {
+            console.error('[ASYNC_INGEST_ERROR]', e);
+            session._lastIngestError = e.message;
+        }
     };
     if (isLabPhone(phone)) {
         return runIngest().then(() => finalizeFn(isTestChat));

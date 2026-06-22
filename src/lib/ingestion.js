@@ -118,7 +118,42 @@ export const ingestLead = async (supabaseClient, leadData) => {
         throw new Error('phone_number is required for ingestion');
     }
 
-    const parameters_completed = calculateParametersCompleted(leadData);
+    const keepField = (next, prev) => {
+        if (next !== undefined && next !== null && next !== '') return next;
+        return prev;
+    };
+
+    let existing = null;
+    try {
+        const { data: _ex } = await supabaseClient
+            .from('leads_surgery')
+            .select('city, insurance, timeline, eye_power, eye_power_numeric, contact_name, message_count, request_call, concern_power, interest_cost, interest_recovery, concern_pain, concern_safety, parameters_completed, intent_level, intent_score, first_message_at')
+            .eq('phone_number', phone_number)
+            .maybeSingle();
+        existing = _ex;
+    } catch (_e) { /* non-fatal */ }
+
+    const merged = {
+        ...leadData,
+        city: keepField(city, existing?.city),
+        insurance: keepField(insurance, existing?.insurance),
+        timeline: keepField(timeline, existing?.timeline),
+        contact_name: keepField(contact_name, existing?.contact_name) || 'WhatsApp Lead',
+        eye_power: keepField(eye_power, existing?.eye_power),
+        eye_power_numeric: eye_power_numeric != null && eye_power_numeric !== ''
+            ? eye_power_numeric
+            : (existing?.eye_power_numeric ?? null),
+        message_count: Math.max(message_count || 0, existing?.message_count || 0) || message_count,
+        request_call: leadData.request_call || existing?.request_call || false,
+        concern_power: !!leadData.concern_power || !!existing?.concern_power,
+        interest_cost: leadData.interest_cost || existing?.interest_cost || false,
+        interest_recovery: leadData.interest_recovery || existing?.interest_recovery || false,
+        concern_pain: leadData.concern_pain || existing?.concern_pain || false,
+        concern_safety: leadData.concern_safety || existing?.concern_safety || false,
+        first_message_at: first_message_at || existing?.first_message_at || null,
+    };
+
+    const parameters_completed = calculateParametersCompleted(merged);
 
     let score = parameters_completed * 10;
     if ((leadData.intent_level || '').toUpperCase() === 'HOT') score += 50;
@@ -132,7 +167,7 @@ export const ingestLead = async (supabaseClient, leadData) => {
         return 'cold';
     };
 
-    const finalIntentLevel = (leadData.intent_level || intent_band || calculateIntent(parameters_completed, timeline)).toLowerCase();
+    const finalIntentLevel = (leadData.intent_level || intent_band || calculateIntent(parameters_completed, merged.timeline)).toLowerCase();
 
     let remarks = leadData.remarks || '';
     if (bot_fallback) {
@@ -142,11 +177,11 @@ export const ingestLead = async (supabaseClient, leadData) => {
 
     const payload = {
         phone_number,
-        contact_name: contact_name || 'WhatsApp Lead',
-        city,
-        insurance,
-        preferred_surgery_city,
-        timeline,
+        contact_name: merged.contact_name || 'WhatsApp Lead',
+        city: merged.city,
+        insurance: merged.insurance,
+        preferred_surgery_city: keepField(preferred_surgery_city, merged.city),
+        timeline: merged.timeline,
         source: leadData.source || 'chatbot',
         lead_type,
         parameters_completed,
@@ -156,36 +191,36 @@ export const ingestLead = async (supabaseClient, leadData) => {
         bot_fallback,
         remarks,
         intent_level: finalIntentLevel,
-        request_call: leadData.request_call || false,
+        request_call: merged.request_call || false,
         ingestion_trigger: leadData.ingestion_trigger || 'unknown',
-        concern_power: !!leadData.concern_power,
+        concern_power: !!merged.concern_power,
         last_activity_at: new Date().toISOString().replace('T', ' ').replace('Z', ''),
         
         // Trilingual Tracking Fields
         bot_version: bot_version || leadData.bot_version || null,
         language: language || leadData.language || 'EN',
-        message_count: message_count || leadData.message_count || null,
-        first_message_at: first_message_at || leadData.first_message_at || null,
+        message_count: merged.message_count || null,
+        first_message_at: merged.first_message_at || null,
         last_message_at: last_message_at || leadData.last_message_at || null,
         current_flow_state: current_flow_state || leadData.current_flow_state || null,
         callback_source: callback_source || leadData.callback_source || null,
     };
 
-    if (eye_power) payload.eye_power = typeof eye_power === 'object' ? (eye_power.raw || JSON.stringify(eye_power)) : String(eye_power);
-    if (eye_power_numeric != null && eye_power_numeric !== '') payload.eye_power_numeric = eye_power_numeric;
+    if (merged.eye_power) payload.eye_power = typeof merged.eye_power === 'object' ? (merged.eye_power.raw || JSON.stringify(merged.eye_power)) : String(merged.eye_power);
+    if (merged.eye_power_numeric != null && merged.eye_power_numeric !== '') payload.eye_power_numeric = merged.eye_power_numeric;
 
     console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
 
-    if (interest_cost !== undefined)     payload.interest_cost = interest_cost;
-    if (interest_recovery !== undefined) payload.interest_recovery = interest_recovery;
-    if (concern_pain !== undefined)      payload.concern_pain = concern_pain;
-    if (concern_safety !== undefined)    payload.concern_safety = concern_safety;
+    if (interest_cost !== undefined)     payload.interest_cost = merged.interest_cost;
+    if (interest_recovery !== undefined) payload.interest_recovery = merged.interest_recovery;
+    if (concern_pain !== undefined)      payload.concern_pain = merged.concern_pain;
+    if (concern_safety !== undefined)    payload.concern_safety = merged.concern_safety;
     if (urgency_level)                   payload.urgency_level = urgency_level;
     if (is_returning !== undefined)      payload.is_returning = is_returning;
 
     // Fetch old row before upsert so detectSignals can diff (best-effort — failure = no signals).
-    let oldRow = null;
-    if (process.env.LEAD_EVENTS_ENABLED !== 'false') {
+    let oldRow = existing;
+    if (!oldRow && process.env.LEAD_EVENTS_ENABLED !== 'false') {
         try {
             const { data: _old } = await supabaseClient
                 .from('leads_surgery')
@@ -198,14 +233,19 @@ export const ingestLead = async (supabaseClient, leadData) => {
 
     console.log(`[DB] Upserting lead | phone=${phone_number}`);
 
-    const { data, error } = await supabaseClient
+    const doUpsert = async (body) => supabaseClient
         .from('leads_surgery')
-        .upsert(payload, {
-            onConflict: 'phone_number',
-            ignoreDuplicates: false
-        })
+        .upsert(body, { onConflict: 'phone_number', ignoreDuplicates: false })
         .select()
         .single();
+
+    let { data, error } = await doUpsert(payload);
+
+    if (error && /eye_power_numeric/.test(error.message || '')) {
+        console.warn('[DB] Retrying upsert without eye_power_numeric');
+        const { eye_power_numeric: _drop, ...retryPayload } = payload;
+        ({ data, error } = await doUpsert(retryPayload));
+    }
 
     if (error) {
         console.error('[DB] ❌ Upsert failed:', error.message);

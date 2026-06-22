@@ -52,7 +52,37 @@ function snapshotLeadRow(row) {
         insurance: row.insurance,
         source: row.source,
         last_user_message: row.last_user_message,
+        message_count: row.message_count,
+        current_flow_state: row.current_flow_state,
     };
+}
+
+/** Prefer live session data when DB row is stale or missing fields. */
+function mergeLeadFromSession(dbLead, session) {
+    if (!session?.data) return dbLead;
+    const d = session.data;
+    const ep = d.eyePower;
+    const eye_power = typeof ep === 'string' ? ep : (ep?.parsed || ep?.raw || null);
+    const eye_power_numeric = ep && typeof ep === 'object' ? (ep.numeric ?? null) : null;
+    const merged = { ...(dbLead || {}) };
+    if (d.contactName) merged.contact_name = d.contactName;
+    if (d.city) merged.city = d.city;
+    if (d.insurance) merged.insurance = d.insurance;
+    if (d.timeline) merged.timeline = d.timeline;
+    if (eye_power) merged.eye_power = eye_power;
+    if (eye_power_numeric != null) merged.eye_power_numeric = eye_power_numeric;
+    if (d.lastMessage) merged.last_user_message = d.lastMessage;
+    merged.message_count = Math.max(merged.message_count || 0, d.message_count || 0);
+    merged.request_call = merged.request_call || !!d.request_call;
+    if (session.state) merged.current_flow_state = session.state;
+    let pc = 0;
+    if (merged.city) pc++;
+    if (merged.eye_power) pc++;
+    if (merged.insurance) pc++;
+    if (merged.timeline) pc++;
+    if (merged.request_call) pc = Math.min(5, pc + 1);
+    merged.parameters_completed = Math.max(merged.parameters_completed || 0, pc);
+    return merged;
 }
 
 function snapshotSession(session) {
@@ -172,19 +202,22 @@ export function registerBotLabRoutes(app, deps) {
         const session = getLabSession(phone);
         if (!session) return res.status(404).json({ error: 'Session not found' });
         const botSessions = getBotSessions();
+        const sess = botSessions[phone];
         let lead = null;
         if (supabaseAdmin) {
             const { data } = await supabaseAdmin
                 .from('leads_surgery')
-                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
+                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
                 .eq('phone_number', phone)
                 .maybeSingle();
-            lead = snapshotLeadRow(data);
+            lead = snapshotLeadRow(mergeLeadFromSession(data, sess));
+        } else if (sess) {
+            lead = snapshotLeadRow(mergeLeadFromSession(null, sess));
         }
         res.json({
             success: true,
             session,
-            bot: snapshotSession(botSessions[phone]),
+            bot: snapshotSession(sess),
             lead,
             agent: agentStatus(),
         });
@@ -204,28 +237,24 @@ export function registerBotLabRoutes(app, deps) {
             const botSessions = getBotSessions();
             const sess = botSessions[phone];
             let lead = null;
-            let ingestError = null;
+            let ingestError = sess?._lastIngestError || null;
+            if (supabaseAdmin && sendToAPI && sess) {
+                try {
+                    await sendToAPI(phone, sess, 'lab_sync');
+                } catch (e) {
+                    ingestError = e.message;
+                    console.warn('[BOT-LAB] lead sync failed:', e.message);
+                }
+            }
             if (supabaseAdmin) {
                 const { data } = await supabaseAdmin
                     .from('leads_surgery')
-                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
+                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
                     .eq('phone_number', phone)
                     .maybeSingle();
-                lead = snapshotLeadRow(data);
-            }
-            if (supabaseAdmin && sendToAPI && sess && !lead) {
-                try {
-                    await sendToAPI(phone, sess, 'lab_sync');
-                    const { data: retry } = await supabaseAdmin
-                        .from('leads_surgery')
-                        .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
-                        .eq('phone_number', phone)
-                        .maybeSingle();
-                    lead = snapshotLeadRow(retry);
-                } catch (e) {
-                    ingestError = e.message;
-                    console.warn('[BOT-LAB] lead sync retry failed:', e.message);
-                }
+                lead = snapshotLeadRow(mergeLeadFromSession(data, sess));
+            } else if (sess) {
+                lead = snapshotLeadRow(mergeLeadFromSession(null, sess));
             }
             const trigger = sess?._lastTrigger || null;
             const agentFail = sess?._lastAgentFail || null;
