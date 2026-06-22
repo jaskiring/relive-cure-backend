@@ -22,6 +22,7 @@ import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
 import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
+import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { hydrateQuota } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
@@ -607,6 +608,7 @@ function t(key, lang) { const e = BOT_MSG[key]; if (!e) return ''; return e[lang
 
 const BOT_MSG = {
     GREETING: { EN: 'Hi! 😊 I\'m Relive Cure\'s vision assistant.\n\nAre you exploring LASIK, specs removal, or just checking options?', HI: 'नमस्ते! 😊 मैं Relive Cure का vision assistant हूँ।\n\nक्या आप LASIK, specs removal, या सिर्फ options देख रहे हैं?' },
+    GREETING_MORE_INFO: { EN: 'Hi! 😊 Happy to help with LASIK and specs removal.\n\nWhat would you like to know — cost, recovery, or eligibility?', HI: 'नमस्ते! 😊 LASIK और specs removal में मदद करूँगा।\n\nक्या जानना चाहेंगे — cost, recovery, या eligibility?' },
     GREETING_HIGH_INTENT: { EN: 'Great! I can definitely help with that 😊\n\nAre you exploring LASIK, specs removal, or just checking options?', HI: 'बिल्कुल! मैं इसमें मदद कर सकता हूँ 😊\n\nक्या आप LASIK, specs removal, या options देख रहे हैं?' },
     ASK_NAME: { EN: 'What should I call you? 😊', HI: 'आपको क्या बुलाऊँ? 😊' },
     ASK_CITY: { EN: 'Which city are you based in? 📍', HI: 'आप किस शहर में रहते हैं? 📍' },
@@ -914,6 +916,21 @@ function isEscalationTrigger(msg) { return ESCALATION_TRIGGERS.some(w => msg.toL
 function isSalesIntent(msg) { return SALES_INTENT.some(w => msg.toLowerCase().includes(w)); }
 function isHighIntentFirst(msg) { return HIGH_INTENT_FIRST.some(w => msg.toLowerCase().includes(w)); }
 
+function isAdCtaMessage(msgLow) {
+    return msgLow.includes('can i get more info') || msgLow.includes('get more info') || msgLow.includes('more info on this');
+}
+
+function replyAsksForName(reply) {
+    const low = (reply || '').toLowerCase();
+    return /what should i call|could i just get your name|catch your name|get your name first|name first|आपको क्या बुलाऊँ|अपना नाम|naam bata|नाम बताइ/i.test(low);
+}
+
+function getGreetingReply(msgLow, lang) {
+    if (isAdCtaMessage(msgLow)) return t('GREETING_MORE_INFO', lang);
+    if (isHighIntentFirst(msgLow)) return t('GREETING_HIGH_INTENT', lang);
+    return t('GREETING', lang);
+}
+
 /** After a live Gemini reply: pause bot for opt-out / abuse without changing the reply. */
 function applyConversationHardStop(phone, session, message, msgLow) {
     if (isNotInterested(msgLow)) {
@@ -943,13 +960,22 @@ function applyConversationHardStop(phone, session, message, msgLow) {
 
 function sanitizeAgentReply(message, session, reply) {
     const lang = session.lang || 'EN';
-    const intents = detectAllIntents(message);
+    const msgLow = message.toLowerCase();
+    const intents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
     if (intents.includes('LOCATION')) {
         let text = KB.LOCATION[lang] || KB.LOCATION.EN;
         if (!session.data.city) text += `\n\n${t('ASK_CITY', lang)}`;
         return text;
     }
     if (isInventedAgentClaim(reply)) return null;
+    const noRealName = !session.data.contactName || session.data.contactName === 'WhatsApp Lead';
+    if (noRealName && replyAsksForName(reply) && (intents.length > 0 || isHighIntentFirst(msgLow) || isAdCtaMessage(msgLow))) {
+        if (intents.length > 0) {
+            const kb = buildKnowledgeResponse(message, session);
+            if (kb) return kb;
+        }
+        return getGreetingReply(msgLow, lang);
+    }
     return reply;
 }
 
@@ -1339,6 +1365,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         return reply;
     };
 
+    let waProfileName = null;
     try {
         if (reqBody?.entry) {
             const messageObj = reqBody.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
@@ -1349,6 +1376,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             try {
                 const _waValue = reqBody.entry?.[0]?.changes?.[0]?.value;
                 const _waContactName = _waValue?.contacts?.[0]?.profile?.name || null;
+                waProfileName = _waContactName;
                 const _waType = messageObj.type || 'text';
                 const _waMediaId = (_waType !== 'text' && messageObj[_waType]) ? (messageObj[_waType].id || null) : null;
                 saveWhatsAppMessage({
@@ -1390,8 +1418,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                         ? 'मैं अभी सिर्फ text process कर सकता हूँ 😊 कृपया type करें।'
                         : 'I can only process text right now 😊 Please type your message.';
                 }
-                if (!_mSess?.data?.contactName || _mSess?.data?.contactName === 'WhatsApp Lead')
-                    _mReply += (_mLang === 'HI' ? '\n\nआपका नाम क्या है?' : '\n\nWhat should I call you?');
                 await sendWhatsAppReply(phone, _mReply); return;
             }
         } else { phone = reqBody.phone; message = reqBody.message || ''; msgId = null; }
@@ -1406,8 +1432,13 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         if (!botSessions[phone]) {
             const existing = await checkExistingLead(phone);
-            botSessions[phone] = { state: existing ? 'RETURNING' : 'GREETING', data: existing ? { contactName: existing.contact_name, is_returning: true } : {}, inactivityTimer: null, ingested: !!existing, first_ingest_done: !!existing, lang: 'EN', repeat_count: {}, resume_offered: false, last_intent_handled: null };
-            if (!existing) { setImmediate(async () => { try { await sendToAPI(phone, botSessions[phone], 'initial'); } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); } }); }
+            const seedData = existing ? { contactName: existing.contact_name, is_returning: true } : {};
+            if (!existing && waProfileName) {
+                const waFirst = waProfileName.trim().split(/\s+/).slice(0, 2).join(' ');
+                if (isValidName(waFirst)) seedData.contactName = waFirst;
+            }
+            botSessions[phone] = { state: existing ? 'RETURNING' : 'GREETING', data: seedData, inactivityTimer: null, ingested: !!existing, first_ingest_done: !!existing, lang: 'EN', repeat_count: {}, resume_offered: false, last_intent_handled: null };
+            if (!existing && !isLabPhone(phone)) { setImmediate(async () => { try { await sendToAPI(phone, botSessions[phone], 'initial'); } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); } }); }
         }
 
         let session = botSessions[phone];
@@ -1432,6 +1463,22 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         }
 
         session.repeat_count = session.repeat_count || {};
+
+        // ─── INTENT-FIRST — answer the question before collecting name ───
+        const substantiveIntents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+        if (substantiveIntents.length > 0) {
+            const kbDirect = buildKnowledgeResponse(message, session);
+            if (kbDirect) {
+                if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+                setReply(kbDirect);
+                return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat);
+            }
+        }
+        if (session.state === 'GREETING') {
+            session.state = 'CORE_CONSULT';
+            setReply(getGreetingReply(msgLow, lang));
+            return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
+        }
 
         // ─── LLM AGENT FIRST — every message tries Gemini while enabled + under quota.
         //     Rule-based (including safety handlers) runs only when agent is off,
@@ -1540,14 +1587,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
         }
 
-        if (msgLow.includes('can i get more info')) {
-            const hasName = session.data.contactName && session.data.contactName !== 'WhatsApp Lead';
-            if (!hasName) {
-                setReply(lang === 'EN' ? "Happy to help! 😊 Could I just get your name first?" : "ज़रूर! 😊 बस पहले अपना नाम बताइए?");
-                return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
-            }
-        }
-
         if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = safeFirstName(session); setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
         if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = safeFirstName(session); setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
@@ -1590,12 +1629,9 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 // Capture the stated intent so CORE_CONSULT doesn't re-ask.
                 if (isHighIntentFirst(msgLow) && (session.repeat_count['NAME'] || 0) <= 2) {
                     session.data.stated_intent = msgLow;
-                    const ack = {
-                        EN: "I see you want to explore LASIK 👁️ — can I catch your name first so I can help you better?",
-                        HI: "समझ गया, आप LASIK करवाना चाहते हैं 👁️ — पहले आपका नाम बता दीजिए, फिर आगे बात करते हैं 😊"
-                    };
-                    setReply(ack[lang] || ack.EN);
-                    // Stay in NAME state — next message should be the name.
+                    session.state = 'CORE_CONSULT';
+                    const kb = buildKnowledgeResponse(message, session);
+                    setReply(kb || getGreetingReply(msgLow, lang));
                 } else if ((session.repeat_count['NAME'] || 0) > 2) {
                     session.data.contactName = 'WhatsApp Lead'; session.state = 'CORE_CONSULT';
                     setReply({ EN: 'No problem 😊\nAre you exploring LASIK, specs removal, or just checking options right now?', HI: 'कोई बात नहीं 😊\nक्या आप LASIK, specs removal, या सिर्फ options देख रहे हैं?' }[lang]);
@@ -1651,21 +1687,23 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 }
 
 function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = false) {
-    setImmediate(async () => {
-        try {
-            await sendToAPI(phone, session, trigger);
-            // If the agent is enabled but this reply came from rule-based, emit a
-            // lead_events row so we can measure fallback rate in the dashboard.
-            if (isAgentEnabled() && trigger !== 'agent') {
-                supabaseAdmin.from('lead_events').insert({
-                    phone, ts: new Date().toISOString(),
-                    event_type: 'agent_fallback',
-                    source: 'agent',
-                    payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
-                }).then(() => {}, () => {});
-            }
-        } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
-    });
+    if (!isLabPhone(phone)) {
+        setImmediate(async () => {
+            try {
+                await sendToAPI(phone, session, trigger);
+                // If the agent is enabled but this reply came from rule-based, emit a
+                // lead_events row so we can measure fallback rate in the dashboard.
+                if (isAgentEnabled() && trigger !== 'agent') {
+                    supabaseAdmin.from('lead_events').insert({
+                        phone, ts: new Date().toISOString(),
+                        event_type: 'agent_fallback',
+                        source: 'agent',
+                        payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
+                    }).then(() => {}, () => {});
+                }
+            } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
+        });
+    }
     return finalizeFn(isTestChat);
 }
 
@@ -1676,6 +1714,14 @@ function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = fa
 app.post('/chat', async (req, res) => {
     try { const reply = await handleIncomingMessage(req.body, true); res.json({ reply }); }
     catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+registerBotLabRoutes(app, {
+    CRM_API_KEY,
+    handleIncomingMessage,
+    getBotSessions: () => botSessions,
+    schedulePersist,
+    supabaseAdmin,
 });
 
 // ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────
