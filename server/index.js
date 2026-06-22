@@ -203,19 +203,7 @@ app.get('/api/auth/verify', async (req, res) => {
     const token = req.headers['x-crm-key'] || req.headers['x-session-token'];
     const session = parseDashboardSession(token);
     if (!session) return res.json({ valid: false });
-    let allowed_tabs = VALID_TABS;
-    if (session.role !== 'admin') {
-        try {
-            const { data } = await supabaseAdmin
-                .from('dashboard_users')
-                .select('allowed_tabs, role')
-                .eq('username', session.username)
-                .maybeSingle();
-            allowed_tabs = normalizeTabs(data?.allowed_tabs, data?.role || session.role);
-        } catch {
-            allowed_tabs = normalizeTabs(null, session.role);
-        }
-    }
+    const allowed_tabs = await getAllowedTabsForUser(session);
     res.json({ valid: true, username: session.username, role: session.role, allowed_tabs });
 });
 

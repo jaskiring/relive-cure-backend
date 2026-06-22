@@ -19,13 +19,7 @@ export function issueDashboardSession(username, role) {
 
 export function parseDashboardSession(token) {
     if (!token) return null;
-    const master = process.env.CRM_API_KEY;
-    if (master && token === master) {
-        return {
-            username: process.env.VITE_ADMIN_USERNAME || 'admin',
-            role: 'admin',
-        };
-    }
+    // Never treat the raw CRM_API_KEY as a dashboard session — old tokens leaked full access.
     const dot = token.lastIndexOf('.');
     if (dot < 1) return null;
     const body = token.slice(0, dot);
