@@ -36,12 +36,32 @@ function saveLabMeta() {
 
 loadLabMeta();
 
+function snapshotLeadRow(row) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        contact_name: row.contact_name,
+        city: row.city,
+        eye_power: row.eye_power,
+        eye_power_numeric: row.eye_power_numeric,
+        parameters_completed: row.parameters_completed,
+        intent_level: row.intent_level,
+        intent_score: row.intent_score,
+        request_call: row.request_call,
+        timeline: row.timeline,
+        insurance: row.insurance,
+        channel: row.channel,
+        last_user_message: row.last_user_message,
+    };
+}
+
 function snapshotSession(session) {
     if (!session) return null;
     const d = session.data || {};
     return {
         state: session.state || null,
         lang: session.lang || 'EN',
+        last_trigger: session._lastTrigger || null,
         data: {
             contactName: d.contactName || null,
             city: d.city || null,
@@ -50,6 +70,7 @@ function snapshotSession(session) {
             callback_offered: !!d.callback_offered,
             interest_cost: !!d.interest_cost,
             opted_out: !!d.opted_out,
+            is_cataract: !!d.is_cataract,
         },
     };
 }
@@ -143,16 +164,26 @@ export function registerBotLabRoutes(app, deps) {
         res.json({ success: true, session });
     });
 
-    app.get('/api/bot-lab/sessions/:phone', auth, (req, res) => {
+    app.get('/api/bot-lab/sessions/:phone', auth, async (req, res) => {
         const phone = req.params.phone;
         if (!isLabPhone(phone)) return res.status(400).json({ error: 'Invalid lab session id' });
         const session = getLabSession(phone);
         if (!session) return res.status(404).json({ error: 'Session not found' });
         const botSessions = getBotSessions();
+        let lead = null;
+        if (supabaseAdmin) {
+            const { data } = await supabaseAdmin
+                .from('leads_surgery')
+                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                .eq('phone_number', phone)
+                .maybeSingle();
+            lead = snapshotLeadRow(data);
+        }
         res.json({
             success: true,
             session,
             bot: snapshotSession(botSessions[phone]),
+            lead,
             agent: agentStatus(),
         });
     });
@@ -169,11 +200,26 @@ export function registerBotLabRoutes(app, deps) {
             const reply = await handleIncomingMessage({ phone, message }, true);
             appendLabMessage(phone, 'assistant', reply || '');
             const botSessions = getBotSessions();
+            const sess = botSessions[phone];
+            let lead = null;
+            if (supabaseAdmin) {
+                const { data } = await supabaseAdmin
+                    .from('leads_surgery')
+                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                    .eq('phone_number', phone)
+                    .maybeSingle();
+                lead = snapshotLeadRow(data);
+            }
+            const trigger = sess?._lastTrigger || null;
+            const replySource = trigger === 'agent' ? 'gemini' : (trigger ? 'rule-based' : 'unknown');
             res.json({
                 success: true,
                 reply: reply || '',
+                reply_source: replySource,
+                trigger,
                 session: labMeta[phone],
-                bot: snapshotSession(botSessions[phone]),
+                bot: snapshotSession(sess),
+                lead,
                 agent: agentStatus(),
             });
         } catch (e) {

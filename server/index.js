@@ -1101,7 +1101,7 @@ async function sendToAPI(phone, session, trigger = 'update') {
 
     const payload = {
         phone_number: phone, contact_name: d.contactName || 'WhatsApp Lead',
-        channel: 'whatsapp',
+        channel: isLabPhone(phone) ? 'bot_lab' : 'whatsapp',
         city: d.city || '', preferred_surgery_city: d.city || '',
         eye_power: eyePowerStr || '', eye_power_numeric: eyePowerNum,
         timeline: d.timeline || '', insurance: d.insurance || '',
@@ -1112,7 +1112,7 @@ async function sendToAPI(phone, session, trigger = 'update') {
         request_call: d.request_call || false, last_user_message: d.lastMessage || '',
         user_questions: userQuestions || '', callback_source: d.callback_source || '',
         ingestion_trigger: trigger, language: session.lang || 'EN',
-        source: 'whatsapp', bot_version: 'v6.2-stable',
+        source: isLabPhone(phone) ? 'bot_lab' : 'whatsapp', bot_version: 'v6.2-stable',
         first_message_at: d.first_message_at || session.last_activity_at || new Date().toISOString(),
         last_message_at: session.last_activity_at || new Date().toISOString(),
         message_count: d.message_count || 1, current_flow_state: session.state || 'UNKNOWN',
@@ -1464,20 +1464,22 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         session.repeat_count = session.repeat_count || {};
 
-        // ─── INTENT-FIRST — answer the question before collecting name ───
-        const substantiveIntents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
-        if (substantiveIntents.length > 0) {
-            const kbDirect = buildKnowledgeResponse(message, session);
-            if (kbDirect) {
-                if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
-                setReply(kbDirect);
-                return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat);
+        // ─── INTENT-FIRST — production ad leads only (lab uses Gemini when live) ───
+        if (!isLabPhone(phone)) {
+            const substantiveIntents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+            if (substantiveIntents.length > 0) {
+                const kbDirect = buildKnowledgeResponse(message, session);
+                if (kbDirect) {
+                    if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+                    setReply(kbDirect);
+                    return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat);
+                }
             }
-        }
-        if (session.state === 'GREETING') {
-            session.state = 'CORE_CONSULT';
-            setReply(getGreetingReply(msgLow, lang));
-            return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
+            if (session.state === 'GREETING') {
+                session.state = 'CORE_CONSULT';
+                setReply(getGreetingReply(msgLow, lang));
+                return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
+            }
         }
 
         // ─── LLM AGENT FIRST — every message tries Gemini while enabled + under quota.
@@ -1687,23 +1689,24 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 }
 
 function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = false) {
-    if (!isLabPhone(phone)) {
-        setImmediate(async () => {
-            try {
-                await sendToAPI(phone, session, trigger);
-                // If the agent is enabled but this reply came from rule-based, emit a
-                // lead_events row so we can measure fallback rate in the dashboard.
-                if (isAgentEnabled() && trigger !== 'agent') {
-                    supabaseAdmin.from('lead_events').insert({
-                        phone, ts: new Date().toISOString(),
-                        event_type: 'agent_fallback',
-                        source: 'agent',
-                        payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
-                    }).then(() => {}, () => {});
-                }
-            } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
-        });
+    session._lastTrigger = trigger;
+    const runIngest = async () => {
+        try {
+            await sendToAPI(phone, session, trigger);
+            if (!isLabPhone(phone) && isAgentEnabled() && trigger !== 'agent') {
+                supabaseAdmin.from('lead_events').insert({
+                    phone, ts: new Date().toISOString(),
+                    event_type: 'agent_fallback',
+                    source: 'agent',
+                    payload: { trigger, message: (session.data?.lastMessage || '').slice(0, 200) },
+                }).then(() => {}, () => {});
+            }
+        } catch (e) { console.error('[ASYNC_INGEST_ERROR]', e); }
+    };
+    if (isLabPhone(phone)) {
+        return runIngest().then(() => finalizeFn(isTestChat));
     }
+    setImmediate(() => { runIngest(); });
     return finalizeFn(isTestChat);
 }
 
