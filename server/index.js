@@ -2336,8 +2336,7 @@ app.post('/webhook', async (req, res) => {
 
 // ─── Refrens Sync Routes ──────────────────────────────────────────────────────
 app.post('/api/sync-refrens', async (req, res) => {
-    const key = req.headers['x-api-key'] || req.query.key;
-    if (key !== process.env.CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await requireCrmKey(req, res, { tab: 'analytics' }))) return;
     try {
         const result = await syncRefrensLeads(supabaseAdmin);
         res.json(result);
