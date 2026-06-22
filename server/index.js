@@ -614,6 +614,7 @@ const BOT_MSG = {
     ASK_CITY: { EN: 'Which city are you based in? 📍', HI: 'आप किस शहर में रहते हैं? 📍' },
     ASK_EYE_POWER: { EN: 'Do you wear glasses or lenses? If yes, what\'s your approximate power? 😊', HI: 'क्या आप glasses या lenses पहनते हैं? अगर हाँ, तो approximate power क्या है? 😊' },
     ASK_POWER_STABILITY: { EN: 'How long has your power been stable?', HI: 'आपकी power कितने समय से stable है?' },
+    ASK_INSURANCE: { EN: 'Do you have medical or health insurance? 😊', HI: 'क्या आपके पास medical या health insurance है? 😊' },
     INVALID_NAME: { EN: 'I didn\'t catch that 😊 What should I call you?', HI: 'समझ नहीं आया 😊 आपको क्या बुलाऊँ?' },
     WELCOME_BACK: { EN: 'Welcome back! 👋 Would you like to continue where we left off? (Yes/No)', HI: 'वापस आए! 👋 क्या आप वहीं से जारी रखना चाहते हैं? (हाँ/नहीं)' },
     NOT_INTERESTED: { EN: 'No worries at all 😊 If you ever want guidance on eye care, we\'re always here. Take care!', HI: 'कोई बात नहीं 😊 अगर कभी guidance चाहिए, हम यहाँ हैं। ख्याल रखें!' },
@@ -725,6 +726,7 @@ function getEscalationMessage(type, lang, firstName) {
 
 function shouldOfferCallback(session) {
     if (session.data.callback_offered) return false;
+    if (getMissingQualField(session)) return false;
     const d = session.data; let score = 0;
     if (d.city) score++;
     if (d.eyePower) score++;
@@ -1048,6 +1050,13 @@ function passiveExtract(message, session) {
     } else if (d.lastAskedField === 'EYE_POWER') {
         d.lastAskedField = null; // already answered, clear the flag
     }
+    if (!d.powerStability && d.lastAskedField === 'POWER_STABILITY') {
+        const t = message.trim();
+        if (t.length >= 1 && t.length <= 40) {
+            d.powerStability = t;
+            d.lastAskedField = null;
+        }
+    }
     if (!d.timeline) {
         if (/this month|is mahine|abhi|immediately|jaldi|urgent/i.test(m)) { d.timeline = message; d.urgency = 'high'; }
         else if (/2.?3 month|next month|agle mahine|soon/i.test(m)) { d.timeline = message; d.urgency = 'medium'; }
@@ -1056,6 +1065,18 @@ function passiveExtract(message, session) {
     if (!d.insurance) {
         if (/insurance hai|insured hoon|health insurance|bima hai|covered hai/i.test(m)) d.insurance = 'Yes';
         else if (/no insurance|insurance nahi|bima nahi|not insured/i.test(m)) d.insurance = 'No';
+        else if (d.lastAskedField === 'INSURANCE') {
+            const t = message.trim().toLowerCase();
+            if (/^(yes|yeah|yep|y|haan|ha|ji|hai|hain|covered|insured)\b/.test(t)) {
+                d.insurance = 'Yes';
+                d.lastAskedField = null;
+            } else if (/^(no|nope|n|nahi|nah|not)\b/.test(t)) {
+                d.insurance = 'No';
+                d.lastAskedField = null;
+            }
+        }
+    } else if (d.lastAskedField === 'INSURANCE') {
+        d.lastAskedField = null;
     }
 }
 
@@ -1194,18 +1215,35 @@ const INTENTS = {
 
 function detectAllIntents(message) { const m = message.toLowerCase(); return Object.entries(INTENTS).filter(([, words]) => words.some(w => m.includes(w))).map(([intent]) => intent); }
 
+function getMissingQualField(session) {
+    const d = session.data;
+    if (!d.city) return 'CITY';
+    if (!d.eyePower) return 'EYE_POWER';
+    if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) return 'POWER_STABILITY';
+    if (!d.insurance) return 'INSURANCE';
+    return null;
+}
+
 function getNextQuestion(session, context = 'normal') {
     const d = session.data; const lang = session.lang || 'EN';
     const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' && !isIndianCity(d.contactName) ? d.contactName.split(' ')[0] : '';
-    let field = null, text = '';
-    if (!d.city) { field = 'CITY'; text = t('ASK_CITY', lang); }
-    else if (!d.eyePower) { field = 'EYE_POWER'; text = t('ASK_EYE_POWER', lang); }
-    else if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) { field = 'POWER_STABILITY'; text = t('ASK_POWER_STABILITY', lang); }
+    const field = getMissingQualField(session);
+    let text = '';
     if (!field) return { text: '', field: null };
+    if (field === 'CITY') text = t('ASK_CITY', lang);
+    else if (field === 'EYE_POWER') text = t('ASK_EYE_POWER', lang);
+    else if (field === 'POWER_STABILITY') text = t('ASK_POWER_STABILITY', lang);
+    else if (field === 'INSURANCE') text = t('ASK_INSURANCE', lang);
     session.data.lastAskedField = field;
     if (context === 'normal' && firstName && field !== 'NAME') { const g = { EN: `Got it, ${firstName} 👍\n\n`, HI: `समझ गया, ${firstName} 👍\n\n` }; text = (g[lang] || g.EN) + text; }
     if (context === 'resume') {
-        const fn = { NAME: { EN: 'your name', HI: 'आपका नाम' }, CITY: { EN: 'your city', HI: 'आपका शहर' }, EYE_POWER: { EN: 'your eye power', HI: 'आपकी eye power' }, POWER_STABILITY: { EN: 'how stable your power is', HI: 'power कितनी stable है' } };
+        const fn = {
+            NAME: { EN: 'your name', HI: 'आपका नाम' },
+            CITY: { EN: 'your city', HI: 'आपका शहर' },
+            EYE_POWER: { EN: 'your eye power', HI: 'आपकी eye power' },
+            POWER_STABILITY: { EN: 'how stable your power is', HI: 'power कितनी stable है' },
+            INSURANCE: { EN: 'whether you have medical insurance', HI: 'क्या आपके पास medical insurance है' },
+        };
         const fld = fn[field] || { EN: field, HI: field };
         const r = { EN: `By the way, could you tell me ${fld.EN}?`, HI: `एक बात — ${fld.HI} बता सकते हैं?` };
         text = r[lang] || r.EN;
@@ -1217,7 +1255,9 @@ function getNextQuestion(session, context = 'normal') {
 function enrichAgentReply(session, message, msgLow, reply) {
     const d = session.data;
     const lang = session.lang || 'EN';
-    if (!reply || d.callback_offered || session.state === 'COMPLETE') return reply;
+    if (!reply) return reply;
+    const missing = getMissingQualField(session);
+    if (!missing && (d.callback_offered || session.state === 'COMPLETE')) return reply;
 
     if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
 
@@ -1238,7 +1278,7 @@ function enrichAgentReply(session, message, msgLow, reply) {
     if (!engaged) return reply;
 
     const rlow = reply.toLowerCase();
-    if (/city|शहर|eye power|glasses power|chashma|aankh.*power|power.*aankh/.test(rlow)) return reply;
+    if (/city|शहर|eye power|glasses power|chashma|aankh.*power|power.*aankh|insurance|bima|medical cover/.test(rlow)) return reply;
 
     const nextStep = getNextQuestion(session, 'resume');
     if (!nextStep.text || !nextStep.field) return reply;
@@ -1375,6 +1415,7 @@ function applyAgentExtract(session, ag) {
     }
     if (ag.timeline && typeof ag.timeline === 'string' && !d.timeline) d.timeline = ag.timeline.trim();
     if (ag.insurance === true && !d.insurance) d.insurance = 'Yes';
+    else if (ag.insurance === false && !d.insurance) d.insurance = 'No';
     if (ag.previous_surgery && typeof ag.previous_surgery === 'string' && !d.previous_surgery) d.previous_surgery = ag.previous_surgery.trim();
     if (ag.age_group && typeof ag.age_group === 'number' && !d.ageGroup) d.ageGroup = ag.age_group;
     if (ag.willing_to_travel === true) d.willing_to_travel = true;
@@ -1386,9 +1427,11 @@ function applyAgentExtract(session, ag) {
     if (ag.is_cataract) d.is_cataract = true;
     if (ag.wants_callback) {
         d.request_call = true;
-        if (!d.callback_offered) d.callback_offered = true;
-        d.human_handoff_started = true;
-        if (!d.callback_source) d.callback_source = 'agent';
+        if (!getMissingQualField(session)) {
+            if (!d.callback_offered) d.callback_offered = true;
+            d.human_handoff_started = true;
+            if (!d.callback_source) d.callback_source = 'agent';
+        }
     }
 }
 
@@ -1538,7 +1581,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
                 const hasData = session.data.city || session.data.eyePower || session.data.contactName;
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
-                if (session.data.request_call && session.state !== 'COMPLETE') {
+                if (session.data.request_call && session.state !== 'COMPLETE' && !getMissingQualField(session)) {
                     session.state = 'COMPLETE';
                     if (!session.data.callback_offered) session.data.callback_offered = true;
                     session.data.human_handoff_started = true;

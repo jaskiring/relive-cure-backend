@@ -72,6 +72,7 @@ function snapshotSession(session) {
             interest_cost: !!d.interest_cost,
             opted_out: !!d.opted_out,
             is_cataract: !!d.is_cataract,
+            insurance: d.insurance || null,
         },
     };
 }
