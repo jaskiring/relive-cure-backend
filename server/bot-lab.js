@@ -50,7 +50,7 @@ function snapshotLeadRow(row) {
         request_call: row.request_call,
         timeline: row.timeline,
         insurance: row.insurance,
-        channel: row.channel,
+        source: row.source,
         last_user_message: row.last_user_message,
     };
 }
@@ -175,7 +175,7 @@ export function registerBotLabRoutes(app, deps) {
         if (supabaseAdmin) {
             const { data } = await supabaseAdmin
                 .from('leads_surgery')
-                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
                 .eq('phone_number', phone)
                 .maybeSingle();
             lead = snapshotLeadRow(data);
@@ -203,10 +203,11 @@ export function registerBotLabRoutes(app, deps) {
             const botSessions = getBotSessions();
             const sess = botSessions[phone];
             let lead = null;
+            let ingestError = null;
             if (supabaseAdmin) {
                 const { data } = await supabaseAdmin
                     .from('leads_surgery')
-                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
                     .eq('phone_number', phone)
                     .maybeSingle();
                 lead = snapshotLeadRow(data);
@@ -216,11 +217,12 @@ export function registerBotLabRoutes(app, deps) {
                     await sendToAPI(phone, sess, 'lab_sync');
                     const { data: retry } = await supabaseAdmin
                         .from('leads_surgery')
-                        .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                        .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message')
                         .eq('phone_number', phone)
                         .maybeSingle();
                     lead = snapshotLeadRow(retry);
                 } catch (e) {
+                    ingestError = e.message;
                     console.warn('[BOT-LAB] lead sync retry failed:', e.message);
                 }
             }
@@ -239,6 +241,7 @@ export function registerBotLabRoutes(app, deps) {
                 session: labMeta[phone],
                 bot: snapshotSession(sess),
                 lead,
+                ingest_error: ingestError,
                 agent: agentStatus(),
             });
         } catch (e) {

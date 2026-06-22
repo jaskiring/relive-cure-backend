@@ -1101,7 +1101,6 @@ async function sendToAPI(phone, session, trigger = 'update') {
 
     const payload = {
         phone_number: phone, contact_name: d.contactName || 'WhatsApp Lead',
-        channel: isLabPhone(phone) ? 'bot_lab' : 'whatsapp',
         city: d.city || '', preferred_surgery_city: d.city || '',
         eye_power: eyePowerStr || '', eye_power_numeric: eyePowerNum,
         timeline: d.timeline || '', insurance: d.insurance || '',
@@ -1140,7 +1139,10 @@ async function sendToAPI(phone, session, trigger = 'update') {
                 kind: 'lead',
             }).catch(e => console.warn('[PUSH] inline lead fanout failed:', e.message));
         }
-    } catch (err) { console.error('[BOT→DB] ❌ Direct ingest failed:', err.message); }
+    } catch (err) {
+        console.error('[BOT→DB] ❌ Direct ingest failed:', err.message);
+        throw err;
+    }
 }
 
 // ─── DIRECT DB CHECK — no HTTP ────────────────────────────────────────────────
@@ -1209,6 +1211,43 @@ function getNextQuestion(session, context = 'normal') {
         text = r[lang] || r.EN;
     }
     return { text, field };
+}
+
+/** After Gemini answers, append one passive city/power ask (same as KB path) when details are still missing. */
+function enrichAgentReply(session, message, msgLow, reply) {
+    const d = session.data;
+    const lang = session.lang || 'EN';
+    if (!reply || d.callback_offered || session.state === 'COMPLETE') return reply;
+
+    if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+
+    const intents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+    if (intents.includes('COST')) d.interest_cost = true;
+    if (intents.includes('RECOVERY')) d.interest_recovery = true;
+    if (intents.includes('PAIN')) d.concern_pain = true;
+    if (intents.includes('SAFETY')) d.concern_safety = true;
+    if (intents.includes('CONCERN')) d.concern_power = true;
+    if (/lasik|specs|glasses|vision|eligibility/i.test(msgLow)) d.concern_power = true;
+    if (/₹|15,?000|90,?000|cost|price|kitna/i.test(reply)) d.interest_cost = true;
+
+    const engaged = (d.message_count || 0) >= 2
+        || intents.length > 0
+        || d.interest_cost || d.concern_power || d.request_call
+        || /^(sure|okay|ok|yes|haan|ha|theek|thik)$/i.test(msgLow.trim());
+
+    if (!engaged) return reply;
+
+    const rlow = reply.toLowerCase();
+    if (/city|शहर|eye power|glasses power|chashma|aankh.*power|power.*aankh/.test(rlow)) return reply;
+
+    const nextStep = getNextQuestion(session, 'resume');
+    if (!nextStep.text || !nextStep.field) return reply;
+
+    d.resumeAsked = d.resumeAsked || [];
+    if (d.resumeAsked.includes(nextStep.field)) return reply;
+    d.resumeAsked.push(nextStep.field);
+
+    return `${reply}\n\n${nextStep.text}`;
 }
 
 function buildKnowledgeResponse(message, session) {
@@ -1513,6 +1552,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                         toSend = agentResult.reply;
                     }
                     if (toSend !== null) {
+                        toSend = enrichAgentReply(session, message, msgLow, toSend);
                         session._agentHistory = (session._agentHistory || [])
                             .concat({ role: 'user', text: message }, { role: 'model', text: toSend })
                             .slice(-20);

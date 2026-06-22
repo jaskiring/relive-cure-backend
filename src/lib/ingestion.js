@@ -109,7 +109,9 @@ export const ingestLead = async (supabaseClient, leadData) => {
         first_message_at,
         last_message_at,
         current_flow_state,
-        callback_source
+        callback_source,
+        eye_power,
+        eye_power_numeric,
     } = leadData;
 
     if (!phone_number) {
@@ -166,8 +168,11 @@ export const ingestLead = async (supabaseClient, leadData) => {
         first_message_at: first_message_at || leadData.first_message_at || null,
         last_message_at: last_message_at || leadData.last_message_at || null,
         current_flow_state: current_flow_state || leadData.current_flow_state || null,
-        callback_source: callback_source || leadData.callback_source || null
+        callback_source: callback_source || leadData.callback_source || null,
     };
+
+    if (eye_power) payload.eye_power = typeof eye_power === 'object' ? (eye_power.raw || JSON.stringify(eye_power)) : String(eye_power);
+    if (eye_power_numeric != null && eye_power_numeric !== '') payload.eye_power_numeric = eye_power_numeric;
 
     console.log('[DB] Final Payload:', JSON.stringify(payload, null, 2));
 
