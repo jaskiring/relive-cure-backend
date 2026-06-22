@@ -20,7 +20,7 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
-import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
+import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus, getLastAgentFailReason } from './llm-agent.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { hydrateQuota } from './agent-quota.js';
@@ -827,7 +827,7 @@ const COMMON_WORD_BLACKLIST = new Set([
     'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
     'from', 'to', 'with', 'for', 'about', 'into', 'on', 'at', 'by',
     'specs removal', 'option', 'options', 'checking',
-    'looking', 'interested', 'consultation', 'help', 'info', 'surgery',
+    'looking', 'interested', 'consultation', 'help', 'info', 'more', 'details', 'surgery',
     'process', 'procedure', 'treatment', 'correct', 'good', 'fine',
     'actually', 'basically', 'currently', 'recently', 'definitely',
     'hindi', 'english', 'hinglish',
@@ -952,7 +952,10 @@ function isSalesIntent(msg) { return SALES_INTENT.some(w => msg.toLowerCase().in
 function isHighIntentFirst(msg) { return HIGH_INTENT_FIRST.some(w => msg.toLowerCase().includes(w)); }
 
 function isAdCtaMessage(msgLow) {
-    return msgLow.includes('can i get more info') || msgLow.includes('get more info') || msgLow.includes('more info on this');
+    const t = msgLow.trim();
+    if (t.includes('can i get more info') || t.includes('get more info') || t.includes('more info on this')) return true;
+    if (/\bmore\s+info\b/.test(t) && t.length < 60) return true;
+    return false;
 }
 
 function replyAsksForName(reply) {
@@ -1017,7 +1020,7 @@ function sanitizeAgentReply(message, session, reply) {
 function passiveExtract(message, session) {
     const m = message.toLowerCase(); const d = session.data;
     // Capture name from natural phrases so rule-based doesn't re-ask after a Gemini fallback.
-    if (!d.contactName || d.contactName === 'WhatsApp Lead') {
+    if (!isAdCtaMessage(m) && (!d.contactName || d.contactName === 'WhatsApp Lead')) {
         const namePatterns = [
             /\b(?:i'?m|i am|im|mera naam|naam hai)\s+([a-zA-Z\u0900-\u097F]{2,20})\b/i,
             /^([a-zA-Z\u0900-\u097F]{2,20})(?:\s+(?:here|hoon|hun|from|se))?\b/i,
@@ -1674,10 +1677,12 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
                 }
             } else {
-                session._lastAgentFail = isAgentEnabled() ? 'gemini_unavailable' : 'agent_off';
-                const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
+                session._lastAgentFail = getLastAgentFailReason() || (isAgentEnabled() ? 'gemini_unavailable' : 'agent_off');
+                const hasRealName = session.data.contactName && session.data.contactName !== 'WhatsApp Lead'
+                    && !COMMON_WORD_BLACKLIST.has(session.data.contactName.toLowerCase());
+                const hasData = session.data.city || session.data.eyePower || hasRealName;
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
-                console.log(`[AGENT:fallback] ${phone} → rule-based`);
+                console.log(`[AGENT:fallback] ${phone} → rule-based (${session._lastAgentFail})`);
             }
         }
 
@@ -1753,8 +1758,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         if (state === 'GREETING') {
             session.state = 'CORE_CONSULT';
-            if (!session.data.contactName) session.data.contactName = 'WhatsApp Lead';
-            setReply(isHighIntentFirst(msgLow) ? t('GREETING_HIGH_INTENT', lang) : t('GREETING', lang));
+            if (!session.data.contactName || COMMON_WORD_BLACKLIST.has((session.data.contactName || '').toLowerCase())) {
+                session.data.contactName = 'WhatsApp Lead';
+            }
+            setReply(getGreetingReply(msgLow, lang));
         }
 
         else if (state === 'ASK_RESUME') {

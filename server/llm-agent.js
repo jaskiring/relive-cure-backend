@@ -22,12 +22,37 @@
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus } from './agent-quota.js';
 
-const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
-const REQUEST_TIMEOUT_MS = 8000;
+const DEFAULT_MODEL = 'gemini-2.5-flash';
+const FALLBACK_MODEL = 'gemini-2.5-flash';
+const REQUEST_TIMEOUT_MS = 12000;
+const RATE_LIMIT_RETRY_MS = 2500;
+const RATE_LIMIT_BACKOFF_MS = 10_000;
 
-// Circuit breaker: after a 429, back off briefly (Gemini free tier ~5 RPM).
-// After daily cap exhaustion, block until next UTC midnight.
+function modelChain() {
+    const primary = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+    return [...new Set([primary, FALLBACK_MODEL].filter(Boolean))];
+}
+
+function isGoogleDailyQuota429(status, errText) {
+    return status === 429 && /free_tier_requests|RESOURCE_EXHAUSTED/i.test(errText || '');
+}
+
+// Circuit breaker: after repeated 429s, back off briefly (Gemini free tier ~5 RPM).
 let _backoffUntil = 0;  // epoch ms — short backoff for 429
+let _lastFailReason = null;
+
+export function getLastAgentFailReason() {
+    return _lastFailReason;
+}
+
+function _fail(reason) {
+    _lastFailReason = reason;
+    return null;
+}
+
+function _sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
 
 // Runtime mode override — set via POST /api/agent/mode from the dashboard.
 // When set, it takes priority over the BOT_AGENT_MODE env var.
@@ -58,6 +83,7 @@ export function agentStatus() {
         enabled: isAgentEnabled(),
         mode: agentMode(),
         model: process.env.GEMINI_MODEL || DEFAULT_MODEL,
+        fallback_model: FALLBACK_MODEL,
         quota: quotaStatus(),
     };
 }
@@ -165,20 +191,18 @@ const RESPONSE_SCHEMA = {
  *   Caller MUST treat null as "use the rule-based reply".
  */
 export async function runGeminiAgent({ message, history = [], sessionData = null }) {
+    _lastFailReason = null;
     if (!isAgentEnabled()) return null;
 
     // Circuit breaker: skip if backing off from a recent 429.
     if (Date.now() < _backoffUntil) {
         console.warn('[AGENT] circuit breaker open (post-429 backoff) → fallback');
-        return null;
+        return _fail('gemini_rate_limited');
     }
     if (!isUnderQuota()) {
         console.warn('[AGENT] daily free cap reached → fallback');
-        return null;
+        return _fail('gemini_quota_exhausted');
     }
-
-    const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
     // Build context line from session data so the agent NEVER re-asks collected info
     let contextLine = '';
@@ -220,79 +244,104 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             responseSchema: RESPONSE_SCHEMA,
             temperature: 0.3,
             maxOutputTokens: 1024,
-            thinkingConfig: { thinkingBudget: 512 },
         },
     };
 
-    tickRequest();  // count the attempt
+    const chain = modelChain();
+    for (let mi = 0; mi < chain.length; mi++) {
+        const model = chain[mi];
+        const thinkingBudget = model.includes('lite') ? 0 : 128;
+        body.generationConfig.thinkingConfig = { thinkingBudget };
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    let res;
-    try {
-        res = await globalThis.fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: ctrl.signal,
-        });
-    } catch (e) {
-        clearTimeout(timer);
-        tickFallback();
-        console.error('[AGENT] request failed → fallback:', e.message);
-        return null;
-    }
-    clearTimeout(timer);
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+            let res;
+            try {
+                res = await globalThis.fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                    signal: ctrl.signal,
+                });
+            } catch (e) {
+                clearTimeout(timer);
+                tickFallback();
+                const reason = e.name === 'AbortError' ? 'gemini_timeout' : 'gemini_network_error';
+                console.error(`[AGENT:${model}] ${reason} → fallback:`, e.message);
+                return _fail(reason);
+            }
+            clearTimeout(timer);
 
-    if (!res.ok) {
-        const txt = await res.text().catch(() => '');
-        tickFallback();
-        if (res.status === 429) {
-            _backoffUntil = Date.now() + 10_000; // retry after 10s
-            console.warn('[AGENT] 429 rate limited → backing off 10s');
-        } else {
-            console.error(`[AGENT] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
+            if (res.status === 429) {
+                const errText = await res.text().catch(() => '');
+                if (isGoogleDailyQuota429(res.status, errText) && mi < chain.length - 1) {
+                    console.warn(`[AGENT:${model}] Google daily free-tier cap hit → trying ${chain[mi + 1]}`);
+                    break; // next model in chain
+                }
+                if (attempt < 2) {
+                    console.warn(`[AGENT:${model}] 429 rate limited → retry in 2.5s`);
+                    await _sleep(RATE_LIMIT_RETRY_MS);
+                    continue;
+                }
+                tickFallback();
+                _backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+                console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s`);
+                return _fail('gemini_rate_limited');
+            }
+
+            if (!res.ok) {
+                const txt = await res.text().catch(() => '');
+                tickFallback();
+                console.error(`[AGENT:${model}] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
+                return _fail('gemini_http_error');
+            }
+
+            let data;
+            try { data = await res.json(); }
+            catch (e) {
+                tickFallback();
+                console.error(`[AGENT:${model}] bad JSON envelope → fallback`);
+                return _fail('gemini_bad_response');
+            }
+
+            const cand = data?.candidates?.[0];
+            if (data?.promptFeedback?.blockReason || !cand) {
+                tickFallback();
+                console.warn(`[AGENT:${model}] blocked/empty → fallback`);
+                return _fail('gemini_blocked');
+            }
+            const raw = (cand.content?.parts || []).map(p => p.text || '').join('').trim();
+            if (!raw) {
+                tickFallback();
+                console.warn(`[AGENT:${model}] empty text → fallback`);
+                return _fail('gemini_empty');
+            }
+
+            let parsed;
+            try {
+                parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
+            } catch (e) {
+                tickFallback();
+                console.error(`[AGENT:${model}] could not parse model JSON → fallback:`, raw.slice(0, 120));
+                return _fail('gemini_bad_json');
+            }
+            if (!parsed || typeof parsed.reply !== 'string' || !parsed.reply.trim()) {
+                tickFallback();
+                console.warn(`[AGENT:${model}] no usable reply → fallback`);
+                return _fail('gemini_no_reply');
+            }
+
+            tickRequest();
+            if (data?.usageMetadata) {
+                tickTokens(data.usageMetadata);
+                console.log(`[AGENT:${model}] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
+            }
+            return parsed;
         }
-        return null;
     }
 
-    let data;
-    try { data = await res.json(); }
-    catch (e) {
-        tickFallback();
-        console.error('[AGENT] bad JSON envelope → fallback');
-        return null;
-    }
-
-    const cand = data?.candidates?.[0];
-    if (data?.promptFeedback?.blockReason || !cand) {
-        tickFallback();
-        console.warn('[AGENT] blocked/empty → fallback');
-        return null;
-    }
-    const raw = (cand.content?.parts || []).map(p => p.text || '').join('').trim();
-    if (!raw) {
-        tickFallback();
-        console.warn('[AGENT] empty text → fallback');
-        return null;
-    }
-
-    let parsed;
-    try {
-        parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
-    } catch (e) {
-        tickFallback();
-        console.error('[AGENT] could not parse model JSON → fallback:', raw.slice(0, 120));
-        return null;
-    }
-    if (!parsed || typeof parsed.reply !== 'string' || !parsed.reply.trim()) {
-        tickFallback();
-        console.warn('[AGENT] no usable reply → fallback');
-        return null;
-    }
-    if (data?.usageMetadata) {
-        tickTokens(data.usageMetadata);
-        console.log(`[AGENT] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
-    }
-    return parsed;
+    return _fail('gemini_quota_exhausted');
 }
+

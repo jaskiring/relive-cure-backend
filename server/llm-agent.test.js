@@ -109,17 +109,46 @@ test('runGeminiAgent: parses valid JSON response', withEnv({ GEMINI_API_KEY: 'fa
     } finally { restore(); }
 }));
 
-test('runGeminiAgent: HTTP 429 → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
-    const restore = mockFetch({
-        ok: false,
-        status: 429,
-        text: async () => '{"error":{"message":"quota exceeded"}}'
-    });
+test('runGeminiAgent: HTTP 429 ×2 → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
+    let calls = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+        calls++;
+        return { ok: false, status: 429, text: async () => '{"error":{"message":"quota exceeded"}}' };
+    };
+    try {
+        const { runGeminiAgent, getLastAgentFailReason } = await loadModule();
+        const result = await runGeminiAgent({ message: 'hi', history: [] });
+        assert.equal(result, null);
+        assert.equal(getLastAgentFailReason(), 'gemini_rate_limited');
+        assert.equal(calls, 2, 'should retry once after 429');
+    } finally { globalThis.fetch = origFetch; }
+}));
+
+test('runGeminiAgent: HTTP 429 then success → parsed', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
+    let calls = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+        calls++;
+        if (calls === 1) {
+            return { ok: false, status: 429, text: async () => '{"error":{"message":"quota exceeded"}}' };
+        }
+        return {
+            ok: true,
+            json: async () => ({
+                candidates: [{
+                    content: { parts: [{ text: JSON.stringify({ reply: 'Hi! 😊' }) }] }
+                }]
+            })
+        };
+    };
     try {
         const { runGeminiAgent } = await loadModule();
         const result = await runGeminiAgent({ message: 'hi', history: [] });
-        assert.equal(result, null);
-    } finally { restore(); }
+        assert.ok(result);
+        assert.equal(result.reply, 'Hi! 😊');
+        assert.equal(calls, 2);
+    } finally { globalThis.fetch = origFetch; }
 }));
 
 test('runGeminiAgent: HTTP 500 → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
