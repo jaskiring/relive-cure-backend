@@ -1495,6 +1495,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
             if (agentResult && agentResult.reply) {
                 applyAgentExtract(session, agentResult);
+                session._lastAgentFail = null;
 
                 const hasData = session.data.city || session.data.eyePower || session.data.contactName;
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
@@ -1504,14 +1505,19 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     session.data.human_handoff_started = true;
                 }
 
-                if (agentMode() === 'live') {
-                    const sanitized = sanitizeAgentReply(message, session, agentResult.reply);
-                    if (sanitized !== null) {
+                // Bot Lab always shows the Gemini reply when the agent succeeds (ignore shadow).
+                const sendAgentToUser = agentMode() === 'live' || isLabPhone(phone);
+                if (sendAgentToUser) {
+                    let toSend = sanitizeAgentReply(message, session, agentResult.reply);
+                    if (toSend === null && isLabPhone(phone) && !isInventedAgentClaim(agentResult.reply)) {
+                        toSend = agentResult.reply;
+                    }
+                    if (toSend !== null) {
                         session._agentHistory = (session._agentHistory || [])
-                            .concat({ role: 'user', text: message }, { role: 'model', text: sanitized })
+                            .concat({ role: 'user', text: message }, { role: 'model', text: toSend })
                             .slice(-20);
-                        setReply(sanitized);
-                        console.log(`[AGENT:live] ✅ ${phone}`);
+                        setReply(toSend);
+                        console.log(`[AGENT:${isLabPhone(phone) ? 'lab' : 'live'}] ✅ ${phone}`);
                         applyConversationHardStop(phone, session, message, msgLow);
                         return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
                     }
@@ -1523,6 +1529,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
                 }
             } else {
+                session._lastAgentFail = isAgentEnabled() ? 'gemini_unavailable' : 'agent_off';
                 const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
                 console.log(`[AGENT:fallback] ${phone} → rule-based`);
@@ -1583,7 +1590,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         }
 
         const restartWords = ['hi', 'hello', 'hey', 'start', 'hii', 'helo', 'नमस्ते', 'हेलो', 'शुरू'];
-        if (restartWords.some(w => msgLow === w || message === w)) {
+        if (!isLabPhone(phone) && restartWords.some(w => msgLow === w || message === w)) {
             const hasData = session.data.contactName && session.data.contactName !== 'WhatsApp Lead';
             if (hasData && !session.resume_offered) { session.state = 'ASK_RESUME'; session.resume_offered = true; setReply(t('WELCOME_BACK', lang)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
@@ -1725,6 +1732,7 @@ registerBotLabRoutes(app, {
     getBotSessions: () => botSessions,
     schedulePersist,
     supabaseAdmin,
+    sendToAPI,
 });
 
 // ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────

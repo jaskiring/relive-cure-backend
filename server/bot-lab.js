@@ -62,6 +62,7 @@ function snapshotSession(session) {
         state: session.state || null,
         lang: session.lang || 'EN',
         last_trigger: session._lastTrigger || null,
+        agent_fail: session._lastAgentFail || null,
         data: {
             contactName: d.contactName || null,
             city: d.city || null,
@@ -148,7 +149,7 @@ export async function deleteLabSession(phone, { botSessions, schedulePersist, su
 }
 
 export function registerBotLabRoutes(app, deps) {
-    const { CRM_API_KEY, handleIncomingMessage, getBotSessions, schedulePersist, supabaseAdmin } = deps;
+    const { CRM_API_KEY, handleIncomingMessage, getBotSessions, schedulePersist, supabaseAdmin, sendToAPI } = deps;
 
     const auth = (req, res, next) => {
         if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -210,12 +211,30 @@ export function registerBotLabRoutes(app, deps) {
                     .maybeSingle();
                 lead = snapshotLeadRow(data);
             }
+            if (supabaseAdmin && sendToAPI && sess && !lead) {
+                try {
+                    await sendToAPI(phone, sess, 'lab_sync');
+                    const { data: retry } = await supabaseAdmin
+                        .from('leads_surgery')
+                        .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, channel, last_user_message')
+                        .eq('phone_number', phone)
+                        .maybeSingle();
+                    lead = snapshotLeadRow(retry);
+                } catch (e) {
+                    console.warn('[BOT-LAB] lead sync retry failed:', e.message);
+                }
+            }
             const trigger = sess?._lastTrigger || null;
-            const replySource = trigger === 'agent' ? 'gemini' : (trigger ? 'rule-based' : 'unknown');
+            const agentFail = sess?._lastAgentFail || null;
+            let replySource = trigger === 'agent' ? 'gemini' : (trigger ? 'rule-based' : 'unknown');
+            if (agentFail && replySource !== 'gemini') {
+                replySource = `rule-based (${agentFail})`;
+            }
             res.json({
                 success: true,
                 reply: reply || '',
                 reply_source: replySource,
+                agent_fail: agentFail,
                 trigger,
                 session: labMeta[phone],
                 bot: snapshotSession(sess),
