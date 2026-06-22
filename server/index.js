@@ -20,10 +20,6 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
-import { registerOrganicWaRoutes } from './organic-wa-routes.js';
-import { registerRepDeviceRoutes } from './rep-devices-routes.js';
-import { isDriveConfigured, uploadRecordingToDrive } from './google-drive.js';
-import { createCallRowHelpers } from './call-row-helpers.js';
 import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { hydrateQuota } from './agent-quota.js';
@@ -111,7 +107,7 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'repapp', 'settings'];
+const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
 const ROLE_DEFAULT_TABS = {
     admin: VALID_TABS,
     limited: ['chatbot', 'hr'],
@@ -347,91 +343,61 @@ async function linkCallToLead(phone) {
   } catch { /* best-effort */ }
   return { matched_lead_id: null, matched_source: null };
 }
-const { upsertCallRow, phoneCallStats } = createCallRowHelpers({ supabaseAdmin, normCallPhone, linkCallToLead });
 
 // POST /api/calls/upload-complete — the app reports a finished (and optionally
-// uploaded) call. Idempotent on (rep_id, call_log_id) and drive_file_id.
+// uploaded) call. Idempotent on drive_file_id when present.
 app.post('/api/calls/upload-complete', async (req, res) => {
   if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
   const b = req.body || {};
-  if (!normCallPhone(b.phone)) return res.status(400).json({ success: false, error: 'A valid phone number is required.' });
+  const phone = normCallPhone(b.phone);
+  if (!phone) return res.status(400).json({ success: false, error: 'A valid phone number is required.' });
+  const duration = Math.max(0, Math.round(Number(b.duration_sec) || 0));
+  const connected = (typeof b.connected === 'boolean') ? b.connected : duration >= 5;
+  const link = await linkCallToLead(phone);
+  const startedAt = b.call_started_at ? new Date(b.call_started_at).toISOString() : new Date().toISOString();
+  const row = {
+    rep_id: b.rep_id ? String(b.rep_id).slice(0, 80) : null,
+    rep_name: b.rep_name ? String(b.rep_name).slice(0, 120) : null,
+    phone,
+    direction: b.direction === 'inbound' ? 'inbound' : (b.direction === 'outbound' ? 'outbound' : null),
+    call_started_at: startedAt,
+    duration_sec: duration,
+    connected,
+    outcome: b.outcome ? String(b.outcome).slice(0, 80) : null,
+    followup_needed: !!b.followup_needed,
+    drive_file_id: b.drive_file_id ? String(b.drive_file_id).slice(0, 200) : null,
+    drive_file_url: b.drive_file_url ? String(b.drive_file_url).slice(0, 500) : null,
+    matched_lead_id: link.matched_lead_id,
+    matched_source: link.matched_source,
+    transcript_status: b.drive_file_id ? 'pending' : 'no_recording',
+    device_meta: b.device_meta && typeof b.device_meta === 'object' ? b.device_meta : null,
+    updated_at: new Date().toISOString(),
+  };
   try {
-    const result = await upsertCallRow(b, { emitLore: true });
-    if (!result.ok) return res.status(400).json({ success: false, error: result.error });
-    const startedAt = b.call_started_at ? new Date(b.call_started_at).toISOString() : new Date().toISOString();
-    const duration = Math.max(0, Math.round(Number(b.duration_sec) || 0));
-    const connected = typeof b.connected === 'boolean' ? b.connected : duration >= 5;
-    console.log(`[CALLS] ${b.direction || 'call'} ${connected ? 'connected' : 'no-answer'} ${duration}s · ${normCallPhone(b.phone)} · rep=${b.rep_name || b.rep_id || '?'}${result.action === 'skipped' ? ' (dedup)' : ''}`);
-    const devId = b.device_meta?.device_id ? String(b.device_meta.device_id).trim() : null;
-    if (devId) {
-      supabaseAdmin.from('rep_devices').update({
-        last_call_at: startedAt,
-        updated_at: new Date().toISOString(),
-      }).eq('device_id', devId).then(() => {}).catch(() => {});
+    let saved;
+    if (row.drive_file_id) {
+      // Idempotent upsert on drive_file_id so a retried upload doesn't double-insert.
+      const { data, error } = await supabaseAdmin.from('call_recordings').upsert(row, { onConflict: 'drive_file_id' }).select('id').maybeSingle();
+      if (error) throw error;
+      saved = data;
+    } else {
+      const { data, error } = await supabaseAdmin.from('call_recordings').insert(row).select('id').maybeSingle();
+      if (error) throw error;
+      saved = data;
     }
-    const link = await linkCallToLead(normCallPhone(b.phone));
-    return res.json({ success: true, id: result.id || null, action: result.action, linked: link.matched_source });
+    // Fire-and-forget Lore event so the call shows in the lead timeline.
+    supabaseAdmin.from('lead_events').insert({
+      phone, ts: startedAt, event_type: 'call', source: 'call',
+      payload: { direction: row.direction, duration_sec: duration, connected, outcome: row.outcome, followup_needed: row.followup_needed, rep_name: row.rep_name, drive_file_url: row.drive_file_url, call_id: saved?.id || null },
+    }).then(() => {}, (e) => console.warn('[CALLS] lead_events emit failed:', e?.message));
+    console.log(`[CALLS] ${row.direction || 'call'} ${connected ? 'connected' : 'no-answer'} ${duration}s · ${phone} · rep=${row.rep_name || row.rep_id || '?'}${row.outcome ? ` · ${row.outcome}` : ''}`);
+    return res.json({ success: true, id: saved?.id || null, linked: link.matched_source });
   } catch (err) {
     const hint = /(does not exist|schema cache)/i.test(err.message || '')
       ? 'call_recordings table missing — run server/migrations/create_call_recordings.sql in Supabase first.'
       : err.message;
     console.error('[CALLS] upload-complete failed:', hint);
     return res.status(500).json({ success: false, error: hint });
-  }
-});
-
-// POST /api/calls/sync-log — batch upload of Android call-log history (deduped per rep).
-app.post('/api/calls/sync-log', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
-  const b = req.body || {};
-  const calls = Array.isArray(b.calls) ? b.calls : [];
-  if (!calls.length) return res.json({ success: true, inserted: 0, skipped: 0 });
-  const repId = b.rep_id ? String(b.rep_id).slice(0, 80) : null;
-  let inserted = 0;
-  let skipped = 0;
-  let latestTs = 0;
-  try {
-    for (const row of calls.slice(0, 500)) {
-      const started = row.call_started_at ? new Date(row.call_started_at).getTime() : 0;
-      if (started > latestTs) latestTs = started;
-      const payload = {
-        ...row,
-        rep_id: repId,
-        rep_name: b.rep_name,
-        device_meta: b.device_id ? { device_id: String(b.device_id) } : null,
-      };
-      const r = await upsertCallRow(payload, { emitLore: false });
-      if (r.action === 'skipped') skipped += 1;
-      else inserted += 1;
-    }
-    console.log(`[CALLS] sync-log rep=${b.rep_name || repId || '?'} +${inserted} skip=${skipped}`);
-    return res.json({ success: true, inserted, skipped, synced_until: latestTs ? new Date(latestTs).toISOString() : null });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// GET /api/calls/stats?phone= — per-lead call aggregates (contacted / connected / recorded).
-app.get('/api/calls/stats', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
-  try {
-    const stats = await phoneCallStats(req.query.phone);
-    if (!stats) return res.status(400).json({ success: false, error: 'Valid phone required.' });
-    return res.json({ success: true, stats });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// GET /api/calls/history?phone= — full call log for a lead (newest first).
-app.get('/api/calls/history', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
-  try {
-    const stats = await phoneCallStats(req.query.phone);
-    if (!stats) return res.status(400).json({ success: false, error: 'Valid phone required.' });
-    return res.json({ success: true, ...stats });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -454,7 +420,7 @@ app.patch('/api/calls/:id', async (req, res) => {
   }
 });
 
-// POST /api/calls/upload-recording — rep app → shared Google Drive (preferred) or Supabase fallback.
+// POST /api/calls/upload-recording — rep app uploads OEM .m4a to Supabase Storage (increment 2–3 shortcut vs Drive).
 app.post('/api/calls/upload-recording', upload.single('file'), async (req, res) => {
   if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
   const file = req.file;
@@ -462,98 +428,27 @@ app.post('/api/calls/upload-recording', upload.single('file'), async (req, res) 
   if (!file?.buffer?.length) return res.status(400).json({ success: false, error: 'Audio file required.' });
   if (!callId) return res.status(400).json({ success: false, error: 'call_id required.' });
   const repId = req.body?.rep_id ? String(req.body.rep_id).slice(0, 80) : 'unknown';
-  const repName = req.body?.rep_name ? String(req.body.rep_name).slice(0, 40).replace(/[^\w-]/g, '_') : repId;
-  const phone = req.body?.phone ? String(req.body.phone).replace(/[^\d]/g, '').slice(-10) : 'unknown';
   const ext = (file.originalname || 'recording.m4a').split('.').pop() || 'm4a';
-  const safeExt = ext.replace(/[^a-z0-9]/gi, '') || 'm4a';
-  const filename = `${repName}_${phone}_${callId.slice(0, 8)}.${safeExt}`;
-
+  const storagePath = `rep/${repId}/${callId}.${ext.replace(/[^a-z0-9]/gi, '')}`;
   try {
-    let driveFileId;
-    let driveFileUrl;
-    let storageMode = 'supabase';
-
-    if (isDriveConfigured()) {
-      const up = await uploadRecordingToDrive({
-        buffer: file.buffer,
-        filename,
-        mimeType: file.mimetype || 'audio/mp4',
-      });
-      driveFileId = up.fileId;
-      driveFileUrl = up.webUrl;
-      storageMode = 'drive';
-      console.log(`[CALLS] recording → Drive ${driveFileId} (${filename})`);
-    } else {
-      const storagePath = `rep/${repId}/${callId}.${safeExt}`;
-      const { error: upErr } = await supabaseAdmin.storage.from('call-recordings').upload(storagePath, file.buffer, {
-        contentType: file.mimetype || 'audio/mp4',
-        upsert: true,
-      });
-      if (upErr) throw upErr;
-      const { data: pub } = supabaseAdmin.storage.from('call-recordings').getPublicUrl(storagePath);
-      driveFileId = storagePath;
-      driveFileUrl = pub?.publicUrl || null;
-      console.log(`[CALLS] recording → Supabase ${storagePath} (Drive not configured)`);
-    }
-
+    const { error: upErr } = await supabaseAdmin.storage.from('call-recordings').upload(storagePath, file.buffer, {
+      contentType: file.mimetype || 'audio/mp4',
+      upsert: true,
+    });
+    if (upErr) throw upErr;
+    const { data: pub } = supabaseAdmin.storage.from('call-recordings').getPublicUrl(storagePath);
     const { data, error } = await supabaseAdmin.from('call_recordings').update({
-      drive_file_id: driveFileId,
-      drive_file_url: driveFileUrl,
+      drive_file_id: storagePath,
+      drive_file_url: pub?.publicUrl || null,
       transcript_status: 'pending',
-      has_recording: true,
-      device_meta: { storage_mode: storageMode, filename },
       updated_at: new Date().toISOString(),
-    }).eq('id', callId).select('id, drive_file_url, transcript_status, phone').maybeSingle();
+    }).eq('id', callId).select('id, drive_file_url, transcript_status').maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ success: false, error: 'Call row not found — report call metadata first.' });
-
-    const deviceId = req.body?.device_id ? String(req.body.device_id).trim() : null;
-    if (deviceId) {
-      supabaseAdmin.from('rep_devices').update({
-        last_upload_ok_at: new Date().toISOString(),
-        setup_status: 'ready',
-        upload_target: storageMode,
-        updated_at: new Date().toISOString(),
-      }).eq('device_id', deviceId).then(() => {}).catch(() => {});
-    }
-    return res.json({
-      success: true,
-      id: data.id,
-      url: data.drive_file_url,
-      storage_mode: storageMode,
-      transcript_status: data.transcript_status,
-    });
+    console.log(`[CALLS] recording uploaded ${storagePath} → call ${callId}`);
+    return res.json({ success: true, id: data.id, url: data.drive_file_url, transcript_status: data.transcript_status });
   } catch (err) {
     console.error('[CALLS] upload-recording failed:', err.message);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// PATCH /api/calls/:id/transcript — M4 transcribe script writes transcript + Lore event.
-app.patch('/api/calls/:id/transcript', async (req, res) => {
-  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
-  const id = String(req.params.id || '').trim();
-  const transcript = req.body?.transcript ? String(req.body.transcript).slice(0, 50000) : null;
-  if (!id || !transcript) return res.status(400).json({ success: false, error: 'transcript required' });
-  try {
-    const { data, error } = await supabaseAdmin.from('call_recordings').update({
-      transcript,
-      transcript_status: 'done',
-      updated_at: new Date().toISOString(),
-    }).eq('id', id).select('id, phone, rep_name').maybeSingle();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ success: false, error: 'Call not found' });
-    if (data.phone && process.env.LEAD_EVENTS_ENABLED !== 'false') {
-      supabaseAdmin.from('lead_events').insert({
-        phone: data.phone,
-        ts: new Date().toISOString(),
-        event_type: 'call_transcribed',
-        source: 'lore_engine',
-        payload: { transcript: transcript.slice(0, 500), call_id: id, rep_name: data.rep_name },
-      }).then(() => {}).catch(e => console.warn('[CALLS] lore transcript event failed:', e.message));
-    }
-    return res.json({ success: true, id: data.id });
-  } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2418,9 +2313,6 @@ if (SELF_URL) {
     setInterval(async () => { try { const r = await globalThis.fetch(SELF_URL); console.log(`[KEEPALIVE] → ${r.status}`); } catch (e) { console.warn('[KEEPALIVE] Ping failed:', e.message); } }, 4 * 60 * 1000);
     console.log(`[KEEPALIVE] Enabled → ${SELF_URL}`);
 }
-
-registerOrganicWaRoutes(app, { CRM_API_KEY, supabaseAdmin, saveWhatsAppMessage });
-registerRepDeviceRoutes(app, { CRM_API_KEY, supabaseAdmin });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[API] ✅ Server running on port ${PORT}`);
