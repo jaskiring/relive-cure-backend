@@ -262,8 +262,16 @@ export function registerBotLabRoutes(app, deps) {
             const trigger = sess?._lastTrigger || null;
             const agentFail = sess?._lastAgentFail || null;
             const usedModel = getLastAgentModel();
-            const provider = usedModel?.includes('gemma') ? 'gemma' : (usedModel ? 'gemini' : (agentStatus().provider || 'gemini'));
-            let replySource = trigger === 'agent' ? provider : (trigger ? 'rule-based' : 'unknown');
+            let replySource = 'unknown';
+            if (trigger === 'agent') {
+                if (usedModel?.includes('gemma')) replySource = 'gemma';
+                else if (usedModel?.includes('flash-lite')) replySource = 'flash-lite';
+                else if (usedModel?.includes('2.0-flash')) replySource = 'flash-2.0';
+                else if (usedModel?.includes('flash')) replySource = 'gemini';
+                else replySource = 'gemini';
+            } else if (trigger) {
+                replySource = 'rule-based';
+            }
             if (agentFail && trigger !== 'agent') {
                 replySource = `rule-based (${agentFail})`;
             }

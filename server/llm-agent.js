@@ -1,5 +1,5 @@
 // server/llm-agent.js
-// Google AI agent for the WhatsApp bot (Gemma 4 primary, Gemini Flash fallback).
+// Google AI agent for the WhatsApp bot (Gemini Flash-Lite primary, Gemma fallback).
 //
 // Ships dark: requires GEMINI_API_KEY + BOT_AGENT_MODE in {shadow, live}.
 // On any failure (timeout, 429, malformed JSON, network, quota), returns null
@@ -8,32 +8,80 @@
 // Activation (Railway env vars):
 //   GEMINI_API_KEY    = <AI Studio key>                    (required)
 //   BOT_AGENT_MODE    = shadow | live                      (required to enable)
-//   GEMINI_MODEL      = gemma-4-26b-a4b-it                 (default; ~1.5k free RPD)
-//   GEMINI_DAILY_CAP  = 1400                               (app-side counter)
+//   GEMINI_MODEL      = gemini-2.5-flash-lite              (default; ~1.5k free RPD, ~2s)
+//   GEMINI_DAILY_CAP  = 5600                               (4 models × ~1.4k buffer)
 //
-// No SDK dependency — calls the Gemini REST endpoint via globalThis.fetch.
+// Model chain (auto-fallback on daily 429): each model has its own ~1,500 RPD pool on
+// AI Studio free tier when billing is linked (see ai.google.dev/rate-limits).
+// LLM only extracts fields — WhatsApp replies are composed rule-based in index.js.
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus } from './agent-quota.js';
 
-const GEMMA_MODEL = 'gemma-4-26b-a4b-it';
-const DEFAULT_MODEL = GEMMA_MODEL;
-const FALLBACK_MODEL = 'gemini-2.5-flash';
-const GEMINI_TIMEOUT_MS = 12000;
-const GEMMA_TIMEOUT_MS = 45000;
-const RATE_LIMIT_RETRY_MS = 2500;
-const RATE_LIMIT_BACKOFF_MS = 10_000;
+/** Free-tier models ordered fastest-first. Each has a separate daily request pool. */
+export const FREE_TIER_MODELS = [
+    { id: 'gemini-2.5-flash-lite', rpd: 1500, provider: 'gemini', label: 'Flash-Lite' },
+    { id: 'gemini-2.5-flash', rpd: 1500, provider: 'gemini', label: 'Flash' },
+    { id: 'gemini-2.0-flash', rpd: 1500, provider: 'gemini', label: 'Flash 2.0' },
+    { id: 'gemma-4-26b-a4b-it', rpd: 1500, provider: 'gemma', label: 'Gemma' },
+];
+
+const PRIMARY_MODEL = FREE_TIER_MODELS[0].id;
+const DEFAULT_MODEL = PRIMARY_MODEL;
+const FREE_TIER_RPD_PER_MODEL = 1500;
+const GEMINI_TIMEOUT_MS = 8000;
+const GEMMA_TIMEOUT_MS = 12000;
+const RATE_LIMIT_RETRY_MS = 1500;
+const RATE_LIMIT_BACKOFF_MS = 5000;
+
+/** Skip models that already hit Google daily quota today (avoids 3× dead calls before Gemma). */
+let _exhaustedDate = null;
+const _exhaustedModels = new Set();
+
+function _todayKey() { return new Date().toISOString().slice(0, 10); }
+
+function markModelDailyExhausted(model) {
+    const d = _todayKey();
+    if (_exhaustedDate !== d) {
+        _exhaustedDate = d;
+        _exhaustedModels.clear();
+    }
+    _exhaustedModels.add(model);
+}
+
+function isModelDailyExhausted(model) {
+    if (_exhaustedDate !== _todayKey()) return false;
+    return _exhaustedModels.has(model);
+}
+
+function activeModelChain() {
+    return modelChain().filter((m) => !isModelDailyExhausted(m));
+}
 
 function isGemmaModel(model) {
     return /gemma/i.test(model || '');
 }
 
-function modelChain() {
+export function modelChain() {
     const primary = process.env.GEMINI_MODEL || DEFAULT_MODEL;
     if (process.env.AGENT_NO_FALLBACK === '1') return [primary];
-    const fallbacks = [];
-    if (isGemmaModel(primary)) fallbacks.push(FALLBACK_MODEL);
-    else if (primary !== GEMMA_MODEL) fallbacks.push(GEMMA_MODEL);
-    return [...new Set([primary, ...fallbacks])];
+    const chain = [primary];
+    for (const { id } of FREE_TIER_MODELS) {
+        if (!chain.includes(id)) chain.push(id);
+    }
+    return chain;
+}
+
+export function freeTierCapacity() {
+    const chain = modelChain();
+    const models = chain.map((id) => {
+        const meta = FREE_TIER_MODELS.find((m) => m.id === id);
+        return { id, rpd: meta?.rpd ?? FREE_TIER_RPD_PER_MODEL, provider: meta?.provider ?? 'gemini', label: meta?.label ?? id };
+    });
+    return {
+        models,
+        rpd_per_model: FREE_TIER_RPD_PER_MODEL,
+        total_rpd: models.length * FREE_TIER_RPD_PER_MODEL,
+    };
 }
 
 function requestTimeoutMs(model) {
@@ -41,7 +89,10 @@ function requestTimeoutMs(model) {
 }
 
 function isGoogleDailyQuota429(status, errText) {
-    return status === 429 && /free_tier_requests|RESOURCE_EXHAUSTED/i.test(errText || '');
+    if (status !== 429) return false;
+    const t = errText || '';
+    // Per-model daily pool exhausted — try next model in chain (not transient RPM).
+    return /GenerateRequestsPerDay|free_tier_requests|PerDayPerProjectPerModel/i.test(t);
 }
 
 // Circuit breaker: after repeated 429s, back off briefly (Gemini free tier ~5 RPM).
@@ -92,12 +143,18 @@ export function setAgentMode(mode) {
 
 export function agentStatus() {
     const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+    const chain = modelChain();
+    const capacity = freeTierCapacity();
     return {
         enabled: isAgentEnabled(),
         mode: agentMode(),
         model,
         provider: isGemmaModel(model) ? 'gemma' : 'gemini',
-        fallback_model: modelChain().slice(1)[0] || null,
+        model_chain: chain,
+        fallback_model: chain[1] || null,
+        fallback_chain: chain.slice(1),
+        free_tier: capacity,
+        exhausted_models: [..._exhaustedModels],
         last_model: _lastModelUsed,
         quota: quotaStatus(),
     };
@@ -176,12 +233,39 @@ Only extract what the user ACTUALLY SAID in THIS message. If they didn't mention
 
 Always return the JSON. "reply" is the WhatsApp message to send.`;
 
+/** Short prompt for Gemma — extraction only; reply text is composed rule-based in index.js */
+const EXTRACT_PROMPT = `Extract LASIK lead fields from the WhatsApp message. Return ONE JSON object only.
+Fields (null/false if not stated): name, city, eye_power, timeline, insurance (bool), previous_surgery, age_group (number), willing_to_travel (bool), asks_cost, asks_recovery, asks_pain, asks_safety, power_concern, wants_callback, is_cataract (bool).
+Always include "reply": "." (ignored).
+Example: {"reply":".","city":null,"insurance":null,"asks_cost":false}`;
+
 const GEMMA_JSON_SUFFIX = `
 
-OUTPUT FORMAT (critical): Reply with ONLY one JSON object. No markdown fences, no explanation, no thinking text.
-Keys: reply (required string), name, city, eye_power, timeline, insurance (boolean), previous_surgery, age_group,
-willing_to_travel, asks_cost, asks_recovery, asks_pain, asks_safety, power_concern, wants_callback, is_cataract.
-Use null for unknown fields. Booleans false when not mentioned.`;
+OUTPUT: One JSON object only. "reply" MUST be a plain string (the WhatsApp message), not an object.
+Example: {"reply":"Hi! LASIK starts from ₹15,000. Which city are you in?","city":null,"insurance":null}
+No markdown, no thinking text, no extra keys beyond the schema fields.`;
+
+/** Extraction-only schema — replies are composed rule-based in index.js */
+const EXTRACT_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+        name: { type: 'STRING', nullable: true },
+        city: { type: 'STRING', nullable: true },
+        eye_power: { type: 'STRING', nullable: true },
+        timeline: { type: 'STRING', nullable: true },
+        insurance: { type: 'BOOLEAN', nullable: true },
+        previous_surgery: { type: 'STRING', nullable: true },
+        age_group: { type: 'NUMBER', nullable: true },
+        willing_to_travel: { type: 'BOOLEAN', nullable: true },
+        asks_cost: { type: 'BOOLEAN', nullable: true },
+        asks_recovery: { type: 'BOOLEAN', nullable: true },
+        asks_pain: { type: 'BOOLEAN', nullable: true },
+        asks_safety: { type: 'BOOLEAN', nullable: true },
+        power_concern: { type: 'BOOLEAN', nullable: true },
+        wants_callback: { type: 'BOOLEAN', nullable: true },
+        is_cataract: { type: 'BOOLEAN', nullable: true },
+    },
+};
 
 const RESPONSE_SCHEMA = {
     type: 'OBJECT',
@@ -216,7 +300,9 @@ function extractCandidateText(cand) {
 function parseAgentJson(raw) {
     const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
     try {
-        return JSON.parse(cleaned);
+        let obj = JSON.parse(cleaned);
+        if (Array.isArray(obj) && obj[0] && typeof obj[0] === 'object') obj = obj[0];
+        return obj;
     } catch {
         const match = cleaned.match(/\{[\s\S]*\}/);
         if (match) return JSON.parse(match[0]);
@@ -227,17 +313,19 @@ function parseAgentJson(raw) {
 function buildRequestBody(model, contents) {
     const gemma = isGemmaModel(model);
     const generationConfig = {
-        temperature: 0.3,
-        maxOutputTokens: gemma ? 512 : 1024,
+        temperature: 0.2,
+        maxOutputTokens: gemma ? 160 : 128,
         responseMimeType: 'application/json',
+        responseSchema: EXTRACT_SCHEMA,
     };
-    if (!gemma) {
-        generationConfig.responseSchema = RESPONSE_SCHEMA;
-        generationConfig.thinkingConfig = { thinkingBudget: model.includes('lite') ? 0 : 128 };
+    if (gemma) {
+        generationConfig.thinkingConfig = { thinkingLevel: 'MINIMAL' };
+    } else {
+        generationConfig.thinkingConfig = { thinkingBudget: 0 };
     }
     return {
         systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT + (gemma ? GEMMA_JSON_SUFFIX : '') }],
+            parts: [{ text: EXTRACT_PROMPT }],
         },
         contents,
         generationConfig,
@@ -293,18 +381,22 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
 
     const fullMessage = contextLine + message;
 
-    const contents = [
-        ...history
-            .filter(h => h && h.text)
-            .slice(-16)
-            .map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.text }] })),
-        { role: 'user', parts: [{ text: fullMessage }] },
-    ];
-
-    const chain = modelChain();
+    const chain = activeModelChain();
+    if (!chain.length) {
+        console.warn('[AGENT] all models daily-exhausted → fallback');
+        return _fail('agent_quota_exhausted');
+    }
     for (let mi = 0; mi < chain.length; mi++) {
         const model = chain[mi];
-        const reqBody = buildRequestBody(model, contents);
+        const histSlice = isGemmaModel(model) ? -4 : -8;
+        const modelContents = [
+            ...history
+                .filter(h => h && h.text)
+                .slice(histSlice)
+                .map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.text }] })),
+            { role: 'user', parts: [{ text: fullMessage }] },
+        ];
+        const reqBody = buildRequestBody(model, modelContents);
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
         const prefix = failReasonPrefix(model);
 
@@ -331,9 +423,12 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
 
             if (res.status === 429) {
                 const errText = await res.text().catch(() => '');
-                if (isGoogleDailyQuota429(res.status, errText) && mi < chain.length - 1) {
-                    console.warn(`[AGENT:${model}] Google daily free-tier cap hit → trying ${chain[mi + 1]}`);
-                    break;
+                if (isGoogleDailyQuota429(res.status, errText)) {
+                    markModelDailyExhausted(model);
+                    if (mi < chain.length - 1) {
+                        console.warn(`[AGENT:${model}] Google daily free-tier cap hit → trying ${chain[mi + 1]}`);
+                        break;
+                    }
                 }
                 if (attempt < 2) {
                     console.warn(`[AGENT:${model}] 429 rate limited → retry in 2.5s`);
@@ -388,11 +483,11 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_bad_json`);
             }
-            if (!parsed || typeof parsed.reply !== 'string' || !parsed.reply.trim()) {
+            if (!parsed) {
                 tickFallback();
-                console.warn(`[AGENT:${model}] no usable reply → fallback`);
+                console.warn(`[AGENT:${model}] empty parse → fallback`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_no_reply`);
+                return _fail(`${prefix}_bad_json`);
             }
 
             tickRequest();

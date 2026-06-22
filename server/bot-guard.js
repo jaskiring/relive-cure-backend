@@ -1,7 +1,7 @@
 // Shared bot safety helpers — used by index.js and test suites.
 
 export const INDIAN_CITIES = [
-    'delhi', 'mumbai', 'bangalore', 'bengaluru', 'hyderabad', 'pune', 'gurgaon', 'gurugram',
+    'delhi', 'mumbai', 'bangalore', 'banglore', 'bengaluru', 'hyderabad', 'pune', 'gurgaon', 'gurugram',
     'noida', 'chennai', 'kolkata', 'jaipur', 'ahmedabad', 'chandigarh', 'lucknow', 'surat',
     'bhopal', 'indore', 'nagpur', 'faridabad', 'meerut', 'rajkot', 'varanasi', 'amritsar',
     'allahabad', 'prayagraj', 'coimbatore', 'jodhpur', 'madurai', 'raipur', 'kota', 'mohali',

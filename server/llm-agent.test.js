@@ -197,19 +197,19 @@ test('runGeminiAgent: malformed JSON → null', withEnv({ GEMINI_API_KEY: 'fake-
     } finally { restore(); }
 }));
 
-test('runGeminiAgent: empty reply → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
+test('runGeminiAgent: empty extract object still ok (reply composed rule-based)', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live', GEMINI_MODEL: 'gemini-2.5-flash-lite' }, async () => {
     const restore = mockFetch({
         ok: true,
         json: async () => ({
             candidates: [{
-                content: { parts: [{ text: JSON.stringify({ reply: '' }) }] }
+                content: { parts: [{ text: JSON.stringify({ city: 'Delhi', insurance: null }) }] }
             }]
         })
     });
     try {
         const { runGeminiAgent } = await loadModule();
         const result = await runGeminiAgent({ message: 'hi', history: [] });
-        assert.equal(result, null);
+        assert.equal(result?.city, 'Delhi');
     } finally { restore(); }
 }));
 
@@ -223,6 +223,75 @@ test('runGeminiAgent: fetch throws → null', withEnv({ GEMINI_API_KEY: 'fake-ke
         assert.equal(result, null);
     } finally { globalThis.fetch = origFetch; restore(); }
 }));
+
+test('modelChain: primary first then all free-tier fallbacks', withEnv({
+    GEMINI_API_KEY: 'fake-key',
+    BOT_AGENT_MODE: 'live',
+    GEMINI_MODEL: 'gemini-2.5-flash-lite',
+    AGENT_NO_FALLBACK: undefined,
+}, async () => {
+    delete process.env.AGENT_NO_FALLBACK;
+    const { modelChain } = await loadModule();
+    assert.deepEqual(modelChain(), [
+        'gemini-2.5-flash-lite',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemma-4-26b-a4b-it',
+    ]);
+}));
+
+test('runGeminiAgent: daily quota on primary tries next model in chain', async () => {
+    const { resetForTest } = await import('./agent-quota.js');
+    resetForTest();
+    const saved = {
+        GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+        BOT_AGENT_MODE: process.env.BOT_AGENT_MODE,
+        GEMINI_MODEL: process.env.GEMINI_MODEL,
+        AGENT_NO_FALLBACK: process.env.AGENT_NO_FALLBACK,
+    };
+    process.env.GEMINI_API_KEY = 'fake-key';
+    process.env.BOT_AGENT_MODE = 'live';
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash-lite';
+    delete process.env.AGENT_NO_FALLBACK;
+    let calls = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+        calls++;
+        if (String(url).includes('gemini-2.5-flash-lite')) {
+            return {
+                ok: false,
+                status: 429,
+                text: async () => JSON.stringify({
+                    error: {
+                        status: 'RESOURCE_EXHAUSTED',
+                        message: 'Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 1500, model: gemini-2.5-flash-lite GenerateRequestsPerDayPerProjectPerModel-FreeTier',
+                    },
+                }),
+            };
+        }
+        return {
+            ok: true,
+            json: async () => ({
+                candidates: [{
+                    content: { parts: [{ text: JSON.stringify({ city: 'Mumbai' }) }] },
+                }],
+            }),
+        };
+    };
+    try {
+        const { runGeminiAgent, getLastAgentModel } = await loadModule();
+        const result = await runGeminiAgent({ message: 'mumbai', history: [] });
+        assert.equal(result?.city, 'Mumbai');
+        assert.equal(getLastAgentModel(), 'gemini-2.5-flash');
+        assert.ok(calls >= 2, 'should call primary then fallback');
+    } finally {
+        globalThis.fetch = origFetch;
+        for (const [k, v] of Object.entries(saved)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    }
+});
 
 test('runGeminiAgent: strips ```json fences before parsing', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
     const fenced = '```json\n' + JSON.stringify({ reply: 'fenced reply' }) + '\n```';

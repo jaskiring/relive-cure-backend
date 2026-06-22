@@ -6,7 +6,11 @@
 // Uses a LAZY dynamic import for supabase-admin so the module loads (and unit
 // tests run) without SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in the env.
 
-const DEFAULT_DAILY_CAP = 1200;
+// App-side cap across all models in the fallback chain (4 × ~1.5k RPD − buffer).
+const FREE_TIER_MODELS_IN_CHAIN = 4;
+const FREE_TIER_RPD = 1500;
+const FREE_TIER_BUFFER = 100;
+const DEFAULT_DAILY_CAP = FREE_TIER_MODELS_IN_CHAIN * (FREE_TIER_RPD - FREE_TIER_BUFFER);
 
 let _mem = { date: null, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
 let _writeTimer = null;

@@ -45,7 +45,7 @@ console.log('[BOOT] ✅ Server starting...');
 console.log('[BOOT] BOT_SECRET SET:', !!process.env.BOT_SECRET);
 console.log('[BOOT] PHONE_NUMBER_ID SET:', !!process.env.PHONE_NUMBER_ID);
 console.log('[BOOT] NODE_VERSION:', process.version);
-console.log('[BOOT] LLM AGENT:', isAgentEnabled() ? `${agentMode().toUpperCase()} (${process.env.GEMINI_MODEL || 'gemma-4-26b-a4b-it'})` : 'OFF (rule-based bot)');
+console.log('[BOOT] LLM AGENT:', isAgentEnabled() ? `${agentMode().toUpperCase()} (${process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite'})` : 'OFF (rule-based bot)');
 console.log('═══════════════════════════════════════');
 
 const app = express();
@@ -91,7 +91,7 @@ app.get('/api/agent/quota', async (req, res) => {
             ...status,
             quota: { ...q, remaining },
             resets_at: resetsAt.toISOString(),
-            note: 'Calls = our API attempt counter. Tokens = summed from Gemini usageMetadata on each successful response.',
+            note: 'Each model in model_chain has its own ~1,500 RPD free pool (billing linked). App cap = sum across chain. Tokens = Gemini usageMetadata per success.',
         });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
@@ -108,7 +108,7 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
+const VALID_TABS = ['pulse', 'chatbot', 'botlab', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
 const ROLE_DEFAULT_TABS = {
     admin: VALID_TABS,
     limited: ['chatbot', 'hr'],
@@ -138,6 +138,7 @@ app.post('/api/auth/login', async (req, res) => {
             success: true,
             token: CRM_API_KEY,
             sessionToken: getSessionToken(),
+            username: validUsername,
             role: 'admin',
             designation: null,
             allowed_tabs: VALID_TABS,
@@ -157,6 +158,7 @@ app.post('/api/auth/login', async (req, res) => {
                 success: true,
                 token: CRM_API_KEY,
                 sessionToken: getSessionToken(),
+                username: data.username,
                 role,
                 designation: data.designation || null,
                 allowed_tabs: allowedTabs,
@@ -595,13 +597,20 @@ const SESSION_FILE = path.join(__dirname, 'sessions.json');
 function detectLanguageWithConfidence(message) {
     if (!message) return { lang: 'EN', confidence: 'low' };
     if (/[\u0900-\u097F]/.test(message)) return { lang: 'HI', confidence: 'high' };
-    const hinglishWords = ['kya', 'hai', 'haan', 'nahi', 'mujhe', 'mera', 'meri', 'aap', 'karo', 'chahiye', 'bata', 'batao', 'theek', 'achha', 'bolna', 'kuch', 'kaisa', 'kaise', 'kitna', 'kitne', 'kab', 'kahan', 'kyun', 'kaun', 'lagta', 'lagti', 'hoga', 'hogi', 'karwana', 'karwani', 'hun', 'hoon', 'matlab', 'acha', 'sahi'];
+    const hinglishWords = ['kya', 'hai', 'haan', 'nahi', 'mujhe', 'mera', 'meri', 'aap', 'karo', 'chahiye', 'bata', 'batao', 'theek', 'achha', 'bolna', 'kuch', 'kaisa', 'kaise', 'kitna', 'kitne', 'kab', 'kahan', 'kyun', 'kaun', 'lagta', 'lagti', 'hoga', 'hogi', 'karwana', 'karwani', 'hun', 'hoon', 'hu', 'matlab', 'acha', 'sahi', 'shyad', 'shayad', 'motia', 'motiyabind', 'se', 'par', 'bhi', 'ji'];
     const m = message.toLowerCase();
     const count = hinglishWords.filter(w => m.includes(w)).length;
     if (count >= 2) return { lang: 'HI', confidence: 'high' };
+    if (count === 1 && /\b(mujhe|mera|hai|hu|hun|hoon|nahi|haan)\b/.test(m)) return { lang: 'HI', confidence: 'high' };
     if (count === 1) return { lang: 'HI', confidence: 'medium' };
     if (/\b(the|is|are|was|what|how|can|will|my|i am|you are|your|when|where|does|did)\b/i.test(m)) return { lang: 'EN', confidence: 'high' };
     return { lang: 'EN', confidence: 'low' };
+}
+
+function resolveReplyLang(session, message) {
+    const { lang, confidence } = detectLanguageWithConfidence(message);
+    if (confidence !== 'low') session.lang = lang;
+    return session.lang || 'EN';
 }
 
 function t(key, lang) { const e = BOT_MSG[key]; if (!e) return ''; return e[lang] || e['EN']; }
@@ -666,6 +675,17 @@ function parseEyePower(message) {
         return { raw: m, parsed: `R:${n} L:${n}`, numeric: n, confidence: 'high', right: n, left: n };
     }
 
+    // Handle "-4 right -6 left" / "4 right 6 left" (number before eye side)
+    const numRlMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+right\b.*?([+-]?\d+(?:\.\d+)?)\s+left\b/i);
+    if (numRlMatch) {
+        let r = parseFloat(numRlMatch[1]);
+        let l = parseFloat(numRlMatch[2]);
+        if (r > 0 && !numRlMatch[1].includes('+')) r = -r;
+        if (l > 0 && !numRlMatch[2].includes('+')) l = -l;
+        const avg = (Math.abs(r) + Math.abs(l)) / 2;
+        return { raw: m, parsed: `R:${r} L:${l}`, numeric: -avg, confidence: 'high', right: r, left: l };
+    }
+
     // Handle "right 4 left 5" or "right eye 4 left eye 5"
     const rlMatch = m.match(/right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*[,\s]+left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
     if (rlMatch) {
@@ -706,8 +726,9 @@ function getEyePowerNumeric(ep) { if (!ep) return null; if (typeof ep === 'strin
 function getEyePowerString(ep) { if (!ep) return null; if (typeof ep === 'string') return ep; return ep.parsed || ep.raw || null; }
 
 function getMissingQualField(session) {
+    sanitizeSessionFields(session);
     const d = session.data;
-    if (!d.city) return 'CITY';
+    if (!isPlausibleCity(d.city)) return 'CITY';
     if (!d.eyePower) return 'EYE_POWER';
     if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) return 'POWER_STABILITY';
     if (!d.insurance) return 'INSURANCE';
@@ -760,6 +781,7 @@ function getEscalationMessage(type, lang, firstName) {
 function shouldOfferCallback(session) {
     if (session.data.callback_offered) return false;
     if (getMissingQualField(session)) return false;
+    if (!fieldCollected(session, 'INSURANCE')) return false;
     const d = session.data; let score = 0;
     if (d.city) score++;
     if (d.eyePower) score++;
@@ -807,6 +829,7 @@ const NAME_BLACKLIST = new Set([
     'कल', 'आज', 'परसों',
     // Hinglish fillers found as names in real data
     'not', 'in', 'koi', 'kuch', 'dost', 'yaar', 'kuchbhi',
+    'mujhe', 'shyad', 'shayad', 'lagta', 'lagti', 'soch', 'think',
 ]);
 
 // ─── SAFETY NET: Medical + common word blacklists ────────────────────────────
@@ -917,9 +940,71 @@ const CITY_BLACKLIST = new Set([
     'lasik', 'specs removal', 'specs', 'surgery', 'option', 'options',
     'checking', 'number', 'number h', 'glass', 'glasses', 'lens',
     'lenses', 'but', 'and', 'mr', 'yes please', 'rate', 'cost',
-    'price', 'love', 'operation', 'eye', 'eyes', 'chashma', 'ok',
-    'yes', 'no', 'haan', 'nahi'
+    'price', 'love', 'operation', 'eye', 'eyes', 'chashma', 'ok', 'okay',
+    'yes', 'no', 'haan', 'nahi', 'theek', 'thik', 'accha', 'achha', 'fine',
+    'sure', 'right', 'cool', 'done', 'complete', 'thanks', 'thank you', 'bilkul',
+    'got it', 'alright', 'understood', 'hmm', 'hm', 'maybe', 'think',
 ]);
+
+const CITY_ACK_WORDS = new Set([
+    'ok', 'okay', 'yes', 'no', 'haan', 'ha', 'nahi', 'nah', 'theek', 'thik',
+    'accha', 'achha', 'fine', 'sure', 'right', 'cool', 'done', 'bilkul', 'ji',
+    'got it', 'alright', 'understood', 'hmm', 'maybe',
+]);
+
+function normalizeCityAlias(raw) {
+    if (!raw) return null;
+    const low = raw.trim().toLowerCase();
+    const aliases = {
+        banglore: 'Bangalore', bengaluru: 'Bangalore', bangalore: 'Bangalore',
+        bombay: 'Mumbai', gurgaon: 'Gurgaon', gurugram: 'Gurugram',
+        calcutta: 'Kolkata', madras: 'Chennai',
+    };
+    if (aliases[low]) return aliases[low];
+    if (isIndianCity(low)) return titleCaseCity(low);
+    return isPlausibleCity(raw) ? titleCaseCity(raw) : null;
+}
+
+function isPlausibleCity(city) {
+    if (!city || typeof city !== 'string') return false;
+    const low = city.trim().toLowerCase();
+    if (low.length < 2 || low.length > 40) return false;
+    if (CITY_BLACKLIST.has(low) || CITY_ACK_WORDS.has(low)) return false;
+    if (COMMON_WORD_BLACKLIST?.has(low)) return false;
+    return true;
+}
+
+function sanitizeSessionFields(session) {
+    const d = session.data;
+    if (d.city && !isPlausibleCity(d.city)) {
+        d.city = null;
+        d.resumeAsked = (d.resumeAsked || []).filter(f => f !== 'CITY');
+        if (d.lastAskedField === 'CITY') d.lastAskedField = null;
+    }
+}
+
+function fieldCollected(session, field) {
+    const d = session.data;
+    if (field === 'CITY') return isPlausibleCity(d.city);
+    if (field === 'EYE_POWER') return !!d.eyePower;
+    if (field === 'POWER_STABILITY') {
+        const n = getEyePowerNumeric(d.eyePower);
+        return !!(d.powerStability || n === null || n > -5);
+    }
+    if (field === 'INSURANCE') return !!d.insurance;
+    return false;
+}
+
+function isCataractMention(msgLow) {
+    return /motia|motiyabind|मोतियाबिंद|cataract/i.test(msgLow);
+}
+
+function getCataractAck(lang) {
+    return {
+        EN: 'Cataract is different from LASIK — our specialist can guide you properly on a call 😊',
+        HI: 'Samajh gaya — motiyabind aur LASIK alag cheezein hain 😊 Specialist call par sahi guide karenge.',
+    }[lang] || 'Samajh gaya — motiyabind aur LASIK alag cheezein hain 😊 Specialist call par sahi guide karenge.';
+}
 
 // ─── SAFETY NET: Loop guard ──────────────────────────────────────────────────
 const recentOutbound = {};  // phone → [hash1, hash2, hash3]
@@ -942,7 +1027,7 @@ function safeFirstName(session) {
 }
 
 const NOT_INTERESTED_TRIGGERS = ['not interested', 'no thanks', 'don\'t want', 'dont want', 'wrong number', 'galat number', 'nahi chahiye', 'band karo', 'mat bhejo', 'unsubscribe', 'stop messaging', 'please stop', 'remove me'];
-const ESCALATION_TRIGGERS = ['icl', 'implantable', 'implant lens', 'cataract', 'motiyabind', 'मोतियाबिंद', 'आईसीएल', 'talk to doctor', 'doctor se baat', 'doctor chahiye', 'doctor se milna'];
+const ESCALATION_TRIGGERS = ['icl', 'implantable', 'implant lens', 'cataract', 'motia', 'motiyabind', 'मोतियाबिंद', 'आईसीएल', 'talk to doctor', 'doctor se baat', 'doctor chahiye', 'doctor se milna'];
 const SALES_INTENT = ['call me', 'call back', 'callback', 'call chahiye', 'mujhe call', 'contact me', 'book appointment', 'appointment chahiye', 'baat karni hai', 'agent se baat', 'talk to specialist', 'specialist se baat', 'human se baat', 'real person', 'connect me', 'phone karo', 'call karo'];
 const HIGH_INTENT_FIRST = ['lasik', 'surgery', 'operation', 'laser eye', 'laser treatment', 'chashma hatana', 'glasses hatana', 'aankhon ka operation', 'karwana', 'karwani', 'vision correction', 'eye surgery'];
 
@@ -950,6 +1035,11 @@ function isNotInterested(msg) { return NOT_INTERESTED_TRIGGERS.some(w => msg.toL
 function isEscalationTrigger(msg) { return ESCALATION_TRIGGERS.some(w => msg.toLowerCase().includes(w)); }
 function isSalesIntent(msg) { return SALES_INTENT.some(w => msg.toLowerCase().includes(w)); }
 function isHighIntentFirst(msg) { return HIGH_INTENT_FIRST.some(w => msg.toLowerCase().includes(w)); }
+
+function isPlainGreeting(msgLow) {
+    const t = msgLow.trim();
+    return /^(hi|hello|hey|hii|helo|hola|namaste|नमस्ते|हेलो|hello there|good (morning|afternoon|evening))[\s!.?]*$/iu.test(t);
+}
 
 function isAdCtaMessage(msgLow) {
     const t = msgLow.trim();
@@ -967,6 +1057,95 @@ function getGreetingReply(msgLow, lang) {
     if (isAdCtaMessage(msgLow)) return t('GREETING_MORE_INFO', lang);
     if (isHighIntentFirst(msgLow)) return t('GREETING_HIGH_INTENT', lang);
     return t('GREETING', lang);
+}
+
+/** After LLM extraction: build the WhatsApp reply using the same rule-based flow as production. */
+function composeAgentReply(session, message, msgLow) {
+    const lang = resolveReplyLang(session, message);
+
+    if (isEscalationTrigger(msgLow) || isCataractMention(msgLow)) {
+        session.data.is_cataract = true;
+        if (!session.data.escalation_note) session.data.escalation_note = message;
+        if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+        sanitizeSessionFields(session);
+        const missing = getMissingQualField(session);
+        if (missing) {
+            const ack = getCataractAck(lang);
+            const next = getNextQuestion(session, 'normal');
+            return next.text ? `${ack}\n\n${next.text}` : ack;
+        }
+        session.data.request_call = true;
+        if (!session.data.callback_offered) session.data.callback_offered = true;
+        session.state = 'COMPLETE';
+        session.data.human_handoff_started = true;
+        session.data.callback_source = 'escalation';
+        return getEscalationMessage('educational', lang, safeFirstName(session));
+    }
+    if (isSalesIntent(msgLow)) {
+        session.data.request_call = true;
+        if (!session.data.callback_offered) session.data.callback_offered = true;
+        session.state = 'COMPLETE';
+        session.data.human_handoff_started = true;
+        session.data.callback_source = 'sales_intent';
+        return getEscalationMessage('callback', lang, safeFirstName(session));
+    }
+
+    const intents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+    if (intents.includes('LOCATION')) {
+        let text = KB.LOCATION[lang] || KB.LOCATION.EN;
+        if (!session.data.city) {
+            const next = getNextQuestion(session);
+            if (next.text) text += `\n\n${next.text}`;
+        }
+        if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+        return text;
+    }
+
+    const kb = buildKnowledgeResponse(message, session);
+    if (kb) {
+        if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+        return kb;
+    }
+
+    if (session.state === 'GREETING') {
+        session.state = 'CORE_CONSULT';
+        return getGreetingReply(msgLow, lang);
+    }
+
+    if (session.state === 'COMPLETE') {
+        const kbDone = buildKnowledgeResponse(message, session);
+        if (kbDone) return kbDone;
+        const ack = getAcknowledgement(message, lang);
+        return ack ? `${ack}\n\n${getRandomCompleteReply(lang)}` : getRandomCompleteReply(lang);
+    }
+
+    if (!session.data.powerStability && getEyePowerNumeric(session.data.eyePower) !== null && getEyePowerNumeric(session.data.eyePower) <= -5) {
+        session.data.powerStability = message;
+    }
+
+    if (shouldOfferCallback(session) && fieldCollected(session, 'INSURANCE')) {
+        if (!session.data.callback_offered) session.data.callback_offered = true;
+        session.data.request_call = true;
+        session.state = 'COMPLETE';
+        session.data.human_handoff_started = true;
+        const ack = getAcknowledgement(message, lang);
+        const cbMsg = getEscalationMessage('candidate', lang, safeFirstName(session));
+        return ack ? `${ack}\n\n${cbMsg}` : cbMsg;
+    }
+
+    const next = getNextQuestion(session);
+    if (next.field) {
+        const ack = getAcknowledgement(message, lang);
+        if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+        return ack ? `${ack}\n\n${next.text}` : next.text;
+    }
+
+    session.data.request_call = true;
+    if (!session.data.callback_offered) session.data.callback_offered = true;
+    session.state = 'COMPLETE';
+    session.data.human_handoff_started = true;
+    session.data.callback_source = 'completion';
+    return getRandomCompleteReply(lang);
 }
 
 /** After a live Gemini reply: pause bot for opt-out / abuse without changing the reply. */
@@ -1035,8 +1214,16 @@ function passiveExtract(message, session) {
     }
     if (!d.city) {
         for (const city of INDIAN_CITIES) { if (m.includes(city)) { d.city = city.charAt(0).toUpperCase() + city.slice(1); break; } }
+        const seCity = m.match(/([a-z]{3,20})\s+se\s+(?:hu|hun|hoon|hai)\b/i);
+        if (!d.city && seCity?.[1]) {
+            const norm = normalizeCityAlias(seCity[1]);
+            if (norm) d.city = norm;
+        }
         const fromMatch = m.match(/(?:from|i'm from|i am from|main.*se hoon|main.*se hun)\s+([a-z]+)/i);
-        if (fromMatch && !d.city && fromMatch[1].length > 2) d.city = fromMatch[1].charAt(0).toUpperCase() + fromMatch[1].slice(1);
+        if (fromMatch && !d.city && fromMatch[1].length > 2) {
+            const norm = normalizeCityAlias(fromMatch[1]);
+            if (norm) d.city = norm;
+        }
         // Permissive: when the bot JUST asked CITY, accept any 1-2 word letter
         // reply as a city (covers Bharatpur, Sikar, Bareilly — anything not in
         // the hardcoded list). Devanagari and roman both accepted.
@@ -1048,43 +1235,39 @@ function passiveExtract(message, session) {
             // Don't accept short generic replies — those are handled by other paths.
             // Also check the first word so "No sorry" / "Yes please" are rejected.
             const _tLow = t.toLowerCase();
-            const _genericFirst = ['yes','no','ok','haan','nahi','sure','hi','hello','start','later','baad mein','baad','sorry','not','nope','yep'];
+            const _genericFirst = ['yes','no','ok','okay','haan','nahi','sure','hi','hello','start','later','baad mein','baad','sorry','not','nope','yep','theek','thik','accha','achha','fine','cool','done','bilkul','right','got it','alright','understood','hmm','maybe','think'];
             const notGeneric = !_genericFirst.includes(_tLow) && !_genericFirst.includes(_tLow.split(/\s+/)[0]);
             // Don't accept LASIK intent words, medical terms, or other non-city answers as cities
             const notBlacklisted = !CITY_BLACKLIST.has(t.toLowerCase());
-            if (isShort && isLetters && notGeneric && notBlacklisted) {
+            if (isShort && isLetters && notGeneric && notBlacklisted && isPlausibleCity(t)) {
                 d.city = words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
             }
         }
         if (d.city && d.lastAskedField === 'CITY') d.lastAskedField = null;
     }
-    if (!d.eyePower) {
-        const powerContext = ['power', 'number', 'minus', 'plus', 'diopter', 'aankhein', 'eye', 'vision'];
-        const hasContext = powerContext.some(w => m.includes(w)) || /[-+]\d/.test(message);
-        const powerMatch = message.match(/[-+]?\d+(\.\d+)?/);
-        const justAskedPower = d.lastAskedField === 'EYE_POWER';
+    const justAskedPower = d.lastAskedField === 'EYE_POWER';
+    const parsedPower = parseEyePower(message);
+    const hasBothEyes = parsedPower?.right != null && parsedPower?.left != null;
+    const powerMatch = message.match(/[-+]?\d+(\.\d+)?/);
+    const powerContext = ['power', 'number', 'minus', 'plus', 'diopter', 'aankhein', 'eye', 'vision', 'right', 'left'];
+    const hasContext = powerContext.some(w => m.includes(w)) || /[-+]\d/.test(message);
+    if (!d.eyePower || hasBothEyes || justAskedPower) {
         // ─── SAFETY: "No glasses/lens" handler ───
-        // User says "no lens", "no glasses", "nahi pehanta" etc. when asked about eye power
-        // → They likely mean "no contact lenses, only glasses". Clarify instead of looping.
-        // But if they clearly say "no glasses no lens" or "bina chashma", accept as no-power.
         const noGlassesStrong = /\b(no glass|no lens|bina chashma|chashma nahi|chasma nahi|nahi pehanta|nahi pehnta|nahi lagata|without glass)\b/i.test(m);
         const noLensOnly = /^no\s*lens(es)?$/i.test(message.trim()) || /^no$/i.test(message.trim());
         if (justAskedPower && noGlassesStrong && !noLensOnly) {
-            // Strong "no glasses" signal — mark as no-power and move on
             d.eyePower = { raw: 'No glasses/lenses', parsed: 'none', numeric: null, confidence: 'user_stated' };
             d.lastAskedField = null;
         } else if (justAskedPower && noLensOnly) {
-            // "No lens" alone = probably means no contacts, might still have glasses
-            // Don't capture yet — the bot will clarify via getNextQuestion
-            // Just mark as a partial response so we don't loop
             d._noLensStated = true;
-        } else if (powerMatch && (hasContext || /both\s+eyes?/i.test(m) || session.state === 'EYE_POWER' || justAskedPower)) {
-            d.eyePower = parseEyePower(message);
+        } else if (parsedPower && (parsedPower.numeric != null || hasBothEyes)
+            && (hasContext || /both\s+eyes?/i.test(m) || justAskedPower || hasBothEyes)) {
+            d.eyePower = parsedPower;
             d.concern_power = true;
-            d.lastAskedField = null; // clear so it doesn't keep matching
+            d.lastAskedField = null;
         }
-    } else if (d.lastAskedField === 'EYE_POWER') {
-        d.lastAskedField = null; // already answered, clear the flag
+    } else if (justAskedPower) {
+        d.lastAskedField = null;
     }
     if (!d.powerStability && d.lastAskedField === 'POWER_STABILITY') {
         const t = message.trim();
@@ -1099,29 +1282,17 @@ function passiveExtract(message, session) {
         else if (/exploring|soch raha|dekh raha|just looking/i.test(m)) { d.timeline = message; d.urgency = 'low'; }
     }
     if (!d.insurance) {
-        const onlyMissingInsurance = getMissingQualField(session) === 'INSURANCE';
-        if (onlyMissingInsurance) {
-            const t = message.trim().toLowerCase();
-            if (/^(yes|yeah|yep|y|haan|ha|ji|covered)\b/.test(t) || /have insurance|insurance hai|bima hai/.test(t)) {
-                d.insurance = 'Yes';
-                d.lastAskedField = null;
-            } else if (/^(no|nope|n|nahi|nah|not)\b/.test(t) || /don'?t have|dont have|no insurance|insurance nahi/.test(t)) {
-                d.insurance = 'No';
-                d.lastAskedField = null;
-            }
+        const t = message.trim().toLowerCase();
+        const insuranceTurn = d.lastAskedField === 'INSURANCE' || getMissingQualField(session) === 'INSURANCE';
+        if (insuranceTurn && (/^(yes|yeah|yep|y|haan|ha|ji|covered)\b/.test(t) || /have insurance|insurance hai|bima hai/.test(t))) {
+            d.insurance = 'Yes';
+            d.lastAskedField = null;
+        } else if (insuranceTurn && (/^(no|nope|n|nahi|nah|not)\b/.test(t) || /don'?t have|dont have|no insurance|insurance nahi/.test(t))) {
+            d.insurance = 'No';
+            d.lastAskedField = null;
         }
         if (!d.insurance && /insurance hai|insured hoon|health insurance|bima hai|covered hai/i.test(m)) d.insurance = 'Yes';
         else if (!d.insurance && /no insurance|insurance nahi|bima nahi|not insured/i.test(m)) d.insurance = 'No';
-        else if (!d.insurance && d.lastAskedField === 'INSURANCE') {
-            const t = message.trim().toLowerCase();
-            if (/^(yes|yeah|yep|y|haan|ha|ji|hai|hain|covered|insured)\b/.test(t)) {
-                d.insurance = 'Yes';
-                d.lastAskedField = null;
-            } else if (/^(no|nope|n|nahi|nah|not)\b/.test(t)) {
-                d.insurance = 'No';
-                d.lastAskedField = null;
-            }
-        }
     } else if (d.lastAskedField === 'INSURANCE') {
         d.lastAskedField = null;
     }
@@ -1165,6 +1336,8 @@ async function sendToAPI(phone, session, trigger = 'update') {
         eyePowerStr ? `Eye power: ${eyePowerStr}` : null,
         d.powerStability ? `Power stable: ${d.powerStability}` : null,
         eyePowerNum !== null ? `Eye power numeric: ${eyePowerNum}` : null,
+        d.previous_surgery ? `Previous surgery: ${d.previous_surgery}` : null,
+        d.ageGroup ? `Age: ${d.ageGroup}` : null,
         d.is_cataract ? 'Cataract mentioned' : null,
         d.opted_out ? 'User opted out' : null
     ].filter(Boolean).join(' | ');
@@ -1288,13 +1461,20 @@ const INTENTS = {
 function detectAllIntents(message) { const m = message.toLowerCase(); return Object.entries(INTENTS).filter(([, words]) => words.some(w => m.includes(w))).map(([intent]) => intent); }
 
 function getNextQuestion(session, context = 'normal') {
+    sanitizeSessionFields(session);
     const d = session.data; const lang = session.lang || 'EN';
     const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' && !isIndianCity(d.contactName) ? d.contactName.split(' ')[0] : '';
     const field = getMissingQualField(session);
     let text = '';
     if (!field) return { text: '', field: null };
     d.resumeAsked = d.resumeAsked || [];
-    if (d.resumeAsked.includes(field)) return { text: '', field: null };
+    // Skip only when the field is actually collected — user may ignore a question (e.g. cataract tangent).
+    if (context === 'resume' && d.resumeAsked.includes(field) && fieldCollected(session, field)) {
+        return { text: '', field: null };
+    }
+    if (d.resumeAsked.includes(field) && !fieldCollected(session, field)) {
+        context = 'normal';
+    }
     if (field === 'CITY') text = t('ASK_CITY', lang);
     else if (field === 'EYE_POWER') text = t('ASK_EYE_POWER', lang);
     else if (field === 'POWER_STABILITY') text = t('ASK_POWER_STABILITY', lang);
@@ -1471,16 +1651,21 @@ function applyAgentExtract(session, ag) {
             }
         }
     }
-    if (ag.city && typeof ag.city === 'string' && !d.city) d.city = ag.city.trim();
-    if (ag.eye_power && typeof ag.eye_power === 'string' && !d.eyePower) {
+    if (ag.city && typeof ag.city === 'string' && !d.city) {
+        const norm = normalizeCityAlias(ag.city.trim());
+        if (norm) d.city = norm;
+    }
+    if (ag.eye_power && typeof ag.eye_power === 'string') {
         const p = parseEyePower(ag.eye_power);
-        if (p && p.numeric !== null) { d.eyePower = p; d.concern_power = true; }
-        else if (p && p.raw) { d.eyePower = p; d.concern_power = true; } // "high" case
-        else d.concern_power = true;
+        const hasBoth = p?.right != null && p?.left != null;
+        if (!d.eyePower || hasBoth) {
+            if (p && (p.numeric != null || hasBoth)) { d.eyePower = p; d.concern_power = true; }
+            else if (p?.raw) { d.eyePower = p; d.concern_power = true; }
+        }
     }
     if (ag.timeline && typeof ag.timeline === 'string' && !d.timeline) d.timeline = ag.timeline.trim();
-    if (ag.insurance === true && !d.insurance) d.insurance = 'Yes';
-    else if (ag.insurance === false && !d.insurance) d.insurance = 'No';
+    if (ag.insurance === true) d.insurance = 'Yes';
+    // Never auto-set insurance "No" from LLM extract — only passiveExtract after we ask.
     if (ag.previous_surgery && typeof ag.previous_surgery === 'string' && !d.previous_surgery) d.previous_surgery = ag.previous_surgery.trim();
     if (ag.age_group && typeof ag.age_group === 'number' && !d.ageGroup) d.ageGroup = ag.age_group;
     if (ag.willing_to_travel === true) d.willing_to_travel = true;
@@ -1591,13 +1776,14 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         let session = botSessions[phone];
         const { lang: detectedLang, confidence: langConf } = detectLanguageWithConfidence(message);
         if (langConf !== 'low' || !session.lang) session.lang = detectedLang;
-        const lang = session.lang;
+        const lang = resolveReplyLang(session, message);
 
         session.last_activity_at = new Date().toISOString();
         if (!session.data.first_message_at) session.data.first_message_at = session.last_activity_at;
         session.data.message_count = (session.data.message_count || 0) + 1;
         session.data.lastMessage = message;
         passiveExtract(message, session);
+        sanitizeSessionFields(session);
         resetInactivityTimer(phone);
 
         if (session.state === 'COMPLETE' || session.state === 'CORE_CONSULT') {
@@ -1611,9 +1797,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
         session.repeat_count = session.repeat_count || {};
 
-        // ─── INTENT-FIRST — production ad leads only (lab uses Gemini when live) ───
-        if (!isLabPhone(phone)) {
-            const substantiveIntents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+        const substantiveIntents = detectAllIntents(message).filter(i => i !== 'YES' && i !== 'NO');
+
+        // ─── INTENT-FIRST — ad CTAs & clear KB intents (skip slow LLM when rules suffice) ───
+        {
             if (substantiveIntents.length > 0) {
                 const kbDirect = buildKnowledgeResponse(message, session);
                 if (kbDirect) {
@@ -1622,16 +1809,40 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     return finalizeWithIngest(phone, session, 'knowledge', finalize, isTestChat);
                 }
             }
-            if (session.state === 'GREETING') {
+            if (session.state === 'GREETING' && substantiveIntents.length === 0
+                && (isAdCtaMessage(msgLow) || (msgLow.length < 50 && !/[-+]?\d/.test(message)))) {
                 session.state = 'CORE_CONSULT';
                 setReply(getGreetingReply(msgLow, lang));
                 return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
             }
         }
 
-        // ─── LLM AGENT FIRST — every message tries Gemini while enabled + under quota.
-        //     Rule-based (including safety handlers) runs only when agent is off,
-        //     daily cap is exhausted, or the API fails. ───
+        // Plain hi/hello — never call slow LLM (common in Bot Lab RETURNING/CORE_CONSULT sessions).
+        if (isPlainGreeting(msgLow)) {
+            if (session.state === 'RETURNING') {
+                const fn = safeFirstName(session);
+                const r = {
+                    EN: `Hi${fn ? `, ${fn}` : ''}! 👋 How can I help you today?`,
+                    HI: `नमस्ते${fn ? `, ${fn}` : ''}! 👋 आज कैसे help करूँ?`,
+                };
+                setReply(r[lang] || r.EN);
+            } else {
+                session.state = 'CORE_CONSULT';
+                setReply(getGreetingReply(msgLow, lang));
+            }
+            return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
+        }
+
+        // Short messages with nothing to extract — skip LLM (saves 10–20s when Gemma is last resort).
+        if (substantiveIntents.length === 0 && msgLow.length < 12 && !/[-+]?\d/.test(message) && !isPlainGreeting(msgLow)) {
+            const next = getNextQuestion(session);
+            if (next.text) {
+                setReply(next.text);
+                return finalizeWithIngest(phone, session, 'rule-based', finalize, isTestChat);
+            }
+        }
+
+        // ─── LLM AGENT — extraction + rule-based reply ───
         if (isAgentEnabled()) {
             let agentResult = null;
             try {
@@ -1640,8 +1851,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 console.error('[AGENT] error → rule-based fallback:', e.message);
             }
 
-            if (agentResult && agentResult.reply) {
+            if (agentResult) {
                 applyAgentExtract(session, agentResult);
+                passiveExtract(message, session);
+                sanitizeSessionFields(session);
                 session._lastAgentFail = null;
 
                 const hasData = session.data.city || session.data.eyePower || session.data.contactName;
@@ -1652,15 +1865,11 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     session.data.human_handoff_started = true;
                 }
 
-                // Bot Lab always shows the Gemini reply when the agent succeeds (ignore shadow).
                 const sendAgentToUser = agentMode() === 'live' || isLabPhone(phone);
                 if (sendAgentToUser) {
-                    let toSend = sanitizeAgentReply(message, session, agentResult.reply);
-                    if (toSend === null && isLabPhone(phone) && !isInventedAgentClaim(agentResult.reply)) {
-                        toSend = agentResult.reply;
-                    }
-                    if (toSend !== null) {
-                        toSend = enrichAgentReply(session, message, msgLow, toSend);
+                    let toSend = composeAgentReply(session, message, msgLow);
+                    if (toSend && !isInventedAgentClaim(toSend)) {
+                        toSend = toSend.trim();
                         session._agentHistory = (session._agentHistory || [])
                             .concat({ role: 'user', text: message }, { role: 'model', text: toSend })
                             .slice(-20);
@@ -1671,10 +1880,11 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     }
                     console.log(`[AGENT:live] guard → rule-based for ${phone}`);
                 } else {
+                    const shadowReply = composeAgentReply(session, message, msgLow);
                     session._agentHistory = (session._agentHistory || [])
-                        .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
+                        .concat({ role: 'user', text: message }, { role: 'model', text: shadowReply || '' })
                         .slice(-20);
-                    console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
+                    console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${(shadowReply || '').slice(0, 120)}"`);
                 }
             } else {
                 session._lastAgentFail = getLastAgentFailReason() || (isAgentEnabled() ? 'gemini_unavailable' : 'agent_off');
@@ -1746,7 +1956,26 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             else if (!hasData) { session.state = 'GREETING'; session.ingested = false; session.resume_offered = false; session.repeat_count = {}; }
         }
 
-        if (isEscalationTrigger(msgLow)) { session.data.escalation_note = message; session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'escalation'; const fn = safeFirstName(session); setReply(getEscalationMessage('educational', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
+        if (isEscalationTrigger(msgLow) || isCataractMention(msgLow)) {
+            session.data.is_cataract = true;
+            if (!session.data.escalation_note) session.data.escalation_note = message;
+            sanitizeSessionFields(session);
+            const missing = getMissingQualField(session);
+            if (missing) {
+                const next = getNextQuestion(session, 'normal');
+                setReply(next.text ? `${getCataractAck(lang)}\n\n${next.text}` : getCataractAck(lang));
+                if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+                return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
+            }
+            session.data.request_call = true;
+            if (!session.data.callback_offered) session.data.callback_offered = true;
+            session.state = 'COMPLETE';
+            session.data.human_handoff_started = true;
+            session.data.callback_source = 'escalation';
+            const fn = safeFirstName(session);
+            setReply(getEscalationMessage('educational', lang, fn));
+            return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
+        }
 
         if (isSalesIntent(msgLow)) { session.data.request_call = true; if (!session.data.callback_offered) session.data.callback_offered = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true; session.data.callback_source = 'sales_intent'; const fn = safeFirstName(session); setReply(getEscalationMessage('callback', lang, fn)); return finalizeWithIngest(phone, session, 'update', finalize, isTestChat); }
 
@@ -1819,7 +2048,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 return finalizeWithIngest(phone, session, 'update', finalize, isTestChat);
             }
 
-            if (shouldOfferCallback(session)) {
+            if (shouldOfferCallback(session) && fieldCollected(session, 'INSURANCE')) {
                 if (!session.data.callback_offered) session.data.callback_offered = true;
                 session.data.request_call = true; session.state = 'COMPLETE'; session.data.human_handoff_started = true;
                 const fn = safeFirstName(session);
@@ -2430,6 +2659,145 @@ app.patch('/api/admin/users/:username', async (req, res) => {
         if (error) return res.status(400).json({ success: false, error: error.message });
         if (!data) return res.status(404).json({ success: false, error: 'User not found' });
         return res.json({ success: true, user: { ...data, allowed_tabs: normalizeTabs(data.allowed_tabs, data.role) } });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ─── Tab access requests ─────────────────────────────────────────────────────
+
+app.get('/api/auth/tab-requests', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const username = String(req.query.username || '').trim();
+    if (!username) return res.status(400).json({ success: false, error: 'username required' });
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .select('id, username, tab, status, created_at, reviewed_at')
+            .eq('username', username)
+            .order('created_at', { ascending: false });
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        return res.json({ success: true, requests: data || [] });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/auth/tab-requests', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const username = String(req.body?.username || '').trim();
+    const tab = String(req.body?.tab || '').trim();
+    if (!username || !tab) return res.status(400).json({ success: false, error: 'username and tab required' });
+    if (!VALID_TABS.includes(tab)) return res.status(400).json({ success: false, error: 'invalid tab' });
+    const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
+    if (username.toLowerCase() === reserved) {
+        return res.status(400).json({ success: false, error: 'Admin already has full access' });
+    }
+    try {
+        const { data: user } = await supabaseAdmin
+            .from('dashboard_users')
+            .select('allowed_tabs, role')
+            .eq('username', username)
+            .maybeSingle();
+        if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+        const tabs = normalizeTabs(user.allowed_tabs, user.role || 'limited');
+        if (tabs.includes(tab)) return res.status(400).json({ success: false, error: 'Already has access' });
+
+        const { data: pending } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .select('id')
+            .eq('username', username)
+            .eq('tab', tab)
+            .eq('status', 'pending')
+            .maybeSingle();
+        if (pending) return res.json({ success: true, request: pending, message: 'Request already pending' });
+
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .insert({ username, tab, status: 'pending' })
+            .select('id, username, tab, status, created_at')
+            .single();
+        if (error) return res.status(400).json({ success: false, error: error.message });
+        return res.json({ success: true, request: data });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/admin/tab-requests', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const status = String(req.query.status || 'pending').trim();
+    try {
+        let q = supabaseAdmin
+            .from('dashboard_tab_requests')
+            .select('id, username, tab, status, created_at, reviewed_at, reviewed_by')
+            .order('created_at', { ascending: true });
+        if (status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        return res.json({ success: true, requests: data || [] });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/admin/tab-requests/:id/approve', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const { id } = req.params;
+    const reviewedBy = String(req.body?.reviewed_by || 'admin').trim();
+    try {
+        const { data: reqRow, error: fetchErr } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+        if (fetchErr) return res.status(500).json({ success: false, error: fetchErr.message });
+        if (!reqRow || reqRow.status !== 'pending') return res.status(404).json({ success: false, error: 'Pending request not found' });
+
+        const { data: user } = await supabaseAdmin
+            .from('dashboard_users')
+            .select('allowed_tabs, role')
+            .eq('username', reqRow.username)
+            .maybeSingle();
+        if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+
+        const tabs = normalizeTabs(user.allowed_tabs, user.role || 'limited');
+        if (!tabs.includes(reqRow.tab)) tabs.push(reqRow.tab);
+
+        const { error: userErr } = await supabaseAdmin
+            .from('dashboard_users')
+            .update({ allowed_tabs: tabs })
+            .eq('username', reqRow.username);
+        if (userErr) return res.status(500).json({ success: false, error: userErr.message });
+
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .update({ status: 'approved', reviewed_at: new Date().toISOString(), reviewed_by: reviewedBy })
+            .eq('id', id)
+            .select('id, username, tab, status, reviewed_at')
+            .single();
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        return res.json({ success: true, request: data, allowed_tabs: tabs });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/admin/tab-requests/:id/deny', async (req, res) => {
+    if (!requireCrmKey(req, res)) return;
+    const { id } = req.params;
+    const reviewedBy = String(req.body?.reviewed_by || 'admin').trim();
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('dashboard_tab_requests')
+            .update({ status: 'denied', reviewed_at: new Date().toISOString(), reviewed_by: reviewedBy })
+            .eq('id', id)
+            .eq('status', 'pending')
+            .select('id, username, tab, status, reviewed_at')
+            .maybeSingle();
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        if (!data) return res.status(404).json({ success: false, error: 'Pending request not found' });
+        return res.json({ success: true, request: data });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
