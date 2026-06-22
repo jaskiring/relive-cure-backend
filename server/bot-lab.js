@@ -2,7 +2,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { agentStatus } from './llm-agent.js';
+import { agentStatus, getLastAgentModel } from './llm-agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LAB_FILE = path.join(__dirname, 'bot-lab-sessions.json');
@@ -261,8 +261,10 @@ export function registerBotLabRoutes(app, deps) {
             }
             const trigger = sess?._lastTrigger || null;
             const agentFail = sess?._lastAgentFail || null;
-            let replySource = trigger === 'agent' ? 'gemini' : (trigger ? 'rule-based' : 'unknown');
-            if (agentFail && replySource !== 'gemini') {
+            const usedModel = getLastAgentModel();
+            const provider = usedModel?.includes('gemma') ? 'gemma' : (usedModel ? 'gemini' : (agentStatus().provider || 'gemini'));
+            let replySource = trigger === 'agent' ? provider : (trigger ? 'rule-based' : 'unknown');
+            if (agentFail && trigger !== 'agent') {
                 replySource = `rule-based (${agentFail})`;
             }
             res.json({

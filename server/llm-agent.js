@@ -1,36 +1,43 @@
 // server/llm-agent.js
-// Gemini 2.5 Flash agent (free tier) for the WhatsApp bot. v2.
+// Google AI agent for the WhatsApp bot (Gemma 4 primary, Gemini Flash fallback).
 //
 // Ships dark: requires GEMINI_API_KEY + BOT_AGENT_MODE in {shadow, live}.
 // On any failure (timeout, 429, malformed JSON, network, quota), returns null
 // and the caller falls back to the rule-based state machine.
 //
-// The caller tries Gemini FIRST on every message while enabled and under quota.
-// Rule-based (including call-me, cataract, KB templates) only runs when the
-// agent is off, daily cap is hit, or the API fails.
-//
-// Shadow mode (default when enabled): the agent runs and its reply is
-// returned to the caller for logging, but the CALLER sends the rule-based
-// reply to the customer. Live mode: caller sends the agent's reply.
-//
 // Activation (Railway env vars):
-//   GEMINI_API_KEY    = <free AI Studio key>           (required)
-//   BOT_AGENT_MODE    = shadow | live                  (required to enable)
-//   GEMINI_MODEL      = gemini-2.5-flash               (optional override)
+//   GEMINI_API_KEY    = <AI Studio key>                    (required)
+//   BOT_AGENT_MODE    = shadow | live                      (required to enable)
+//   GEMINI_MODEL      = gemma-4-26b-a4b-it                 (default; ~1.5k free RPD)
+//   GEMINI_DAILY_CAP  = 1400                               (app-side counter)
 //
 // No SDK dependency — calls the Gemini REST endpoint via globalThis.fetch.
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus } from './agent-quota.js';
 
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+const GEMMA_MODEL = 'gemma-4-26b-a4b-it';
+const DEFAULT_MODEL = GEMMA_MODEL;
 const FALLBACK_MODEL = 'gemini-2.5-flash';
-const REQUEST_TIMEOUT_MS = 12000;
+const GEMINI_TIMEOUT_MS = 12000;
+const GEMMA_TIMEOUT_MS = 45000;
 const RATE_LIMIT_RETRY_MS = 2500;
 const RATE_LIMIT_BACKOFF_MS = 10_000;
 
+function isGemmaModel(model) {
+    return /gemma/i.test(model || '');
+}
+
 function modelChain() {
     const primary = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-    return [...new Set([primary, FALLBACK_MODEL].filter(Boolean))];
+    if (process.env.AGENT_NO_FALLBACK === '1') return [primary];
+    const fallbacks = [];
+    if (isGemmaModel(primary)) fallbacks.push(FALLBACK_MODEL);
+    else if (primary !== GEMMA_MODEL) fallbacks.push(GEMMA_MODEL);
+    return [...new Set([primary, ...fallbacks])];
+}
+
+function requestTimeoutMs(model) {
+    return isGemmaModel(model) ? GEMMA_TIMEOUT_MS : GEMINI_TIMEOUT_MS;
 }
 
 function isGoogleDailyQuota429(status, errText) {
@@ -40,9 +47,14 @@ function isGoogleDailyQuota429(status, errText) {
 // Circuit breaker: after repeated 429s, back off briefly (Gemini free tier ~5 RPM).
 let _backoffUntil = 0;  // epoch ms — short backoff for 429
 let _lastFailReason = null;
+let _lastModelUsed = null;
 
 export function getLastAgentFailReason() {
     return _lastFailReason;
+}
+
+export function getLastAgentModel() {
+    return _lastModelUsed;
 }
 
 function _fail(reason) {
@@ -79,11 +91,14 @@ export function setAgentMode(mode) {
 }
 
 export function agentStatus() {
+    const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
     return {
         enabled: isAgentEnabled(),
         mode: agentMode(),
-        model: process.env.GEMINI_MODEL || DEFAULT_MODEL,
-        fallback_model: FALLBACK_MODEL,
+        model,
+        provider: isGemmaModel(model) ? 'gemma' : 'gemini',
+        fallback_model: modelChain().slice(1)[0] || null,
+        last_model: _lastModelUsed,
         quota: quotaStatus(),
     };
 }
@@ -161,6 +176,13 @@ Only extract what the user ACTUALLY SAID in THIS message. If they didn't mention
 
 Always return the JSON. "reply" is the WhatsApp message to send.`;
 
+const GEMMA_JSON_SUFFIX = `
+
+OUTPUT FORMAT (critical): Reply with ONLY one JSON object. No markdown fences, no explanation, no thinking text.
+Keys: reply (required string), name, city, eye_power, timeline, insurance (boolean), previous_surgery, age_group,
+willing_to_travel, asks_cost, asks_recovery, asks_pain, asks_safety, power_concern, wants_callback, is_cataract.
+Use null for unknown fields. Booleans false when not mentioned.`;
+
 const RESPONSE_SCHEMA = {
     type: 'OBJECT',
     properties: {
@@ -184,6 +206,48 @@ const RESPONSE_SCHEMA = {
     required: ['reply'],
 };
 
+function extractCandidateText(cand) {
+    const parts = cand?.content?.parts || [];
+    const visible = parts.filter(p => p.text && !p.thought).map(p => p.text);
+    if (visible.length) return visible.join('').trim();
+    return parts.map(p => p.text || '').join('').trim();
+}
+
+function parseAgentJson(raw) {
+    const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+    try {
+        return JSON.parse(cleaned);
+    } catch {
+        const match = cleaned.match(/\{[\s\S]*\}/);
+        if (match) return JSON.parse(match[0]);
+        throw new Error('no json object');
+    }
+}
+
+function buildRequestBody(model, contents) {
+    const gemma = isGemmaModel(model);
+    const generationConfig = {
+        temperature: 0.3,
+        maxOutputTokens: gemma ? 512 : 1024,
+        responseMimeType: 'application/json',
+    };
+    if (!gemma) {
+        generationConfig.responseSchema = RESPONSE_SCHEMA;
+        generationConfig.thinkingConfig = { thinkingBudget: model.includes('lite') ? 0 : 128 };
+    }
+    return {
+        systemInstruction: {
+            parts: [{ text: SYSTEM_PROMPT + (gemma ? GEMMA_JSON_SUFFIX : '') }],
+        },
+        contents,
+        generationConfig,
+    };
+}
+
+function failReasonPrefix(model) {
+    return isGemmaModel(model) ? 'gemma' : 'gemini';
+}
+
 /**
  * Run the Gemini agent for one inbound message.
  * @param {{ message: string, history?: Array<{role:'user'|'model', text:string}>, sessionData?: object }} args
@@ -192,6 +256,7 @@ const RESPONSE_SCHEMA = {
  */
 export async function runGeminiAgent({ message, history = [], sessionData = null }) {
     _lastFailReason = null;
+    _lastModelUsed = null;
     if (!isAgentEnabled()) return null;
 
     // Circuit breaker: skip if backing off from a recent 429.
@@ -236,40 +301,30 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
         { role: 'user', parts: [{ text: fullMessage }] },
     ];
 
-    const body = {
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: RESPONSE_SCHEMA,
-            temperature: 0.3,
-            maxOutputTokens: 1024,
-        },
-    };
-
     const chain = modelChain();
     for (let mi = 0; mi < chain.length; mi++) {
         const model = chain[mi];
-        const thinkingBudget = model.includes('lite') ? 0 : 128;
-        body.generationConfig.thinkingConfig = { thinkingBudget };
+        const reqBody = buildRequestBody(model, contents);
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+        const prefix = failReasonPrefix(model);
 
         for (let attempt = 1; attempt <= 2; attempt++) {
             const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+            const timer = setTimeout(() => ctrl.abort(), requestTimeoutMs(model));
             let res;
             try {
                 res = await globalThis.fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body),
+                    body: JSON.stringify(reqBody),
                     signal: ctrl.signal,
                 });
             } catch (e) {
                 clearTimeout(timer);
                 tickFallback();
-                const reason = e.name === 'AbortError' ? 'gemini_timeout' : 'gemini_network_error';
+                const reason = e.name === 'AbortError' ? `${prefix}_timeout` : `${prefix}_network_error`;
                 console.error(`[AGENT:${model}] ${reason} → fallback:`, e.message);
+                if (mi < chain.length - 1) break;
                 return _fail(reason);
             }
             clearTimeout(timer);
@@ -278,7 +333,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 const errText = await res.text().catch(() => '');
                 if (isGoogleDailyQuota429(res.status, errText) && mi < chain.length - 1) {
                     console.warn(`[AGENT:${model}] Google daily free-tier cap hit → trying ${chain[mi + 1]}`);
-                    break; // next model in chain
+                    break;
                 }
                 if (attempt < 2) {
                     console.warn(`[AGENT:${model}] 429 rate limited → retry in 2.5s`);
@@ -288,14 +343,16 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback();
                 _backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
                 console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s`);
-                return _fail('gemini_rate_limited');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_rate_limited`);
             }
 
             if (!res.ok) {
                 const txt = await res.text().catch(() => '');
                 tickFallback();
                 console.error(`[AGENT:${model}] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
-                return _fail('gemini_http_error');
+                if (mi < chain.length - 1 && (res.status >= 500 || res.status === 404)) break;
+                return _fail(`${prefix}_http_error`);
             }
 
             let data;
@@ -303,37 +360,43 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             catch (e) {
                 tickFallback();
                 console.error(`[AGENT:${model}] bad JSON envelope → fallback`);
-                return _fail('gemini_bad_response');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_bad_response`);
             }
 
             const cand = data?.candidates?.[0];
             if (data?.promptFeedback?.blockReason || !cand) {
                 tickFallback();
                 console.warn(`[AGENT:${model}] blocked/empty → fallback`);
-                return _fail('gemini_blocked');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_blocked`);
             }
-            const raw = (cand.content?.parts || []).map(p => p.text || '').join('').trim();
+            const raw = extractCandidateText(cand);
             if (!raw) {
                 tickFallback();
                 console.warn(`[AGENT:${model}] empty text → fallback`);
-                return _fail('gemini_empty');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_empty`);
             }
 
             let parsed;
             try {
-                parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
+                parsed = parseAgentJson(raw);
             } catch (e) {
                 tickFallback();
                 console.error(`[AGENT:${model}] could not parse model JSON → fallback:`, raw.slice(0, 120));
-                return _fail('gemini_bad_json');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_bad_json`);
             }
             if (!parsed || typeof parsed.reply !== 'string' || !parsed.reply.trim()) {
                 tickFallback();
                 console.warn(`[AGENT:${model}] no usable reply → fallback`);
-                return _fail('gemini_no_reply');
+                if (mi < chain.length - 1) break;
+                return _fail(`${prefix}_no_reply`);
             }
 
             tickRequest();
+            _lastModelUsed = model;
             if (data?.usageMetadata) {
                 tickTokens(data.usageMetadata);
                 console.log(`[AGENT:${model}] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
@@ -342,6 +405,6 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
         }
     }
 
-    return _fail('gemini_quota_exhausted');
+    return _fail('agent_quota_exhausted');
 }
 

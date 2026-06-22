@@ -23,12 +23,14 @@ function withEnv(env, fn) {
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
+        if (!('AGENT_NO_FALLBACK' in env)) process.env.AGENT_NO_FALLBACK = '1';
         try { return await fn(); }
         finally {
             for (const [k, v] of Object.entries(saved)) {
                 if (v === undefined) delete process.env[k];
                 else process.env[k] = v;
             }
+            if (!('AGENT_NO_FALLBACK' in saved)) delete process.env.AGENT_NO_FALLBACK;
         }
     };
 }
@@ -109,7 +111,7 @@ test('runGeminiAgent: parses valid JSON response', withEnv({ GEMINI_API_KEY: 'fa
     } finally { restore(); }
 }));
 
-test('runGeminiAgent: HTTP 429 ×2 → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
+test('runGeminiAgent: HTTP 429 ×2 → null', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live', GEMINI_MODEL: 'gemma-4-26b-a4b-it' }, async () => {
     let calls = 0;
     const origFetch = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -120,12 +122,12 @@ test('runGeminiAgent: HTTP 429 ×2 → null', withEnv({ GEMINI_API_KEY: 'fake-ke
         const { runGeminiAgent, getLastAgentFailReason } = await loadModule();
         const result = await runGeminiAgent({ message: 'hi', history: [] });
         assert.equal(result, null);
-        assert.equal(getLastAgentFailReason(), 'gemini_rate_limited');
+        assert.equal(getLastAgentFailReason(), 'gemma_rate_limited');
         assert.equal(calls, 2, 'should retry once after 429');
     } finally { globalThis.fetch = origFetch; }
 }));
 
-test('runGeminiAgent: HTTP 429 then success → parsed', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live' }, async () => {
+test('runGeminiAgent: HTTP 429 then success → parsed', withEnv({ GEMINI_API_KEY: 'fake-key', BOT_AGENT_MODE: 'live', GEMINI_MODEL: 'gemini-2.5-flash' }, async () => {
     let calls = 0;
     const origFetch = globalThis.fetch;
     globalThis.fetch = async () => {

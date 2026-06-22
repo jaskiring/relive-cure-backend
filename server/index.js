@@ -45,7 +45,7 @@ console.log('[BOOT] ✅ Server starting...');
 console.log('[BOOT] BOT_SECRET SET:', !!process.env.BOT_SECRET);
 console.log('[BOOT] PHONE_NUMBER_ID SET:', !!process.env.PHONE_NUMBER_ID);
 console.log('[BOOT] NODE_VERSION:', process.version);
-console.log('[BOOT] LLM AGENT:', isAgentEnabled() ? `${agentMode().toUpperCase()} (${process.env.GEMINI_MODEL || 'gemini-2.5-flash'})` : 'OFF (rule-based bot)');
+console.log('[BOOT] LLM AGENT:', isAgentEnabled() ? `${agentMode().toUpperCase()} (${process.env.GEMINI_MODEL || 'gemma-4-26b-a4b-it'})` : 'OFF (rule-based bot)');
 console.log('═══════════════════════════════════════');
 
 const app = express();
