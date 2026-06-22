@@ -23,6 +23,7 @@ import { saveWhatsAppMessage } from './whatsapp-store.js';
 import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus, getLastAgentFailReason } from './llm-agent.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
+import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
 import { hydrateQuota } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
@@ -67,7 +68,8 @@ app.get('/api/agent/mode', (req, res) => {
     res.json({ success: true, ...agentStatus() });
 });
 
-app.post('/api/agent/mode', (req, res) => {
+app.post('/api/agent/mode', async (req, res) => {
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { mode } = req.body;
     if (!mode || !['shadow', 'live', 'off'].includes(mode)) {
         return res.status(400).json({ success: false, error: 'mode must be "shadow", "live", or "off"' });
@@ -108,7 +110,7 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const VALID_TABS = ['pulse', 'chatbot', 'botlab', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
+const VALID_TABS = ['pulse', 'chatbot', 'botlab', 'inbox', 'analytics', 'marketing', 'hr', 'settings', 'export_leads'];
 const ROLE_DEFAULT_TABS = {
     admin: VALID_TABS,
     limited: ['chatbot', 'hr'],
@@ -119,6 +121,35 @@ const ROLE_DEFAULT_TABS = {
 function normalizeTabs(tabs, roleFallback = 'limited') {
     const arr = Array.isArray(tabs) ? tabs.filter(t => VALID_TABS.includes(t)) : [];
     return arr.length ? arr : (ROLE_DEFAULT_TABS[roleFallback] || ['chatbot']);
+}
+
+async function getAllowedTabsForUser(session) {
+    if (!session) return [];
+    if (session.role === 'admin') return VALID_TABS;
+    try {
+        const { data } = await supabaseAdmin
+            .from('dashboard_users')
+            .select('allowed_tabs, role')
+            .eq('username', session.username)
+            .maybeSingle();
+        return normalizeTabs(data?.allowed_tabs, data?.role || session.role);
+    } catch {
+        return normalizeTabs(null, session.role);
+    }
+}
+
+async function requireCrmKey(req, res, opts = {}) {
+    if (!requireDashboardAuth(req, res, { adminOnly: opts.adminOnly })) return false;
+    if (opts.adminOnly) return true;
+    const need = opts.permission || opts.tab;
+    if (need) {
+        const tabs = await getAllowedTabsForUser(req.dashboardUser);
+        if (!tabs.includes(need)) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return false;
+        }
+    }
+    return true;
 }
 
 function getSessionToken() {
@@ -136,7 +167,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (username === validUsername && password === validPassword) {
         return res.json({
             success: true,
-            token: CRM_API_KEY,
+            token: issueDashboardSession(validUsername, 'admin'),
             sessionToken: getSessionToken(),
             username: validUsername,
             role: 'admin',
@@ -156,7 +187,7 @@ app.post('/api/auth/login', async (req, res) => {
             const allowedTabs = normalizeTabs(data.allowed_tabs, role);
             return res.json({
                 success: true,
-                token: CRM_API_KEY,
+                token: issueDashboardSession(data.username, role),
                 sessionToken: getSessionToken(),
                 username: data.username,
                 role,
@@ -168,13 +199,24 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
 
-app.get('/api/auth/verify', (req, res) => {
-    const sessionToken = req.headers['x-session-token'];
-    if (!sessionToken) return res.json({ valid: false });
-    const validUsername = process.env.VITE_ADMIN_USERNAME;
-    const validPassword = process.env.VITE_ADMIN_PASSWORD;
-    if (!validUsername || !validPassword) return res.json({ valid: false });
-    res.json({ valid: sessionToken === getSessionToken() });
+app.get('/api/auth/verify', async (req, res) => {
+    const token = req.headers['x-crm-key'] || req.headers['x-session-token'];
+    const session = parseDashboardSession(token);
+    if (!session) return res.json({ valid: false });
+    let allowed_tabs = VALID_TABS;
+    if (session.role !== 'admin') {
+        try {
+            const { data } = await supabaseAdmin
+                .from('dashboard_users')
+                .select('allowed_tabs, role')
+                .eq('username', session.username)
+                .maybeSingle();
+            allowed_tabs = normalizeTabs(data?.allowed_tabs, data?.role || session.role);
+        } catch {
+            allowed_tabs = normalizeTabs(null, session.role);
+        }
+    }
+    res.json({ valid: true, username: session.username, role: session.role, allowed_tabs });
 });
 
 // ─── Refrens cookies ──────────────────────────────────────────────────────────
@@ -579,7 +621,7 @@ app.get('/api/check-lead/:phone', async (req, res) => {
 
 // ─── Delete Lead ──────────────────────────────────────────────────────────────
 app.delete('/api/leads/:id', async (req, res) => {
-    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     try {
         const { error } = await supabaseAdmin.from('leads_surgery').delete().eq('id', req.params.id);
         if (error) throw error;
@@ -2121,7 +2163,7 @@ registerBotLabRoutes(app, {
 
 // ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────
 app.post('/api/whatsapp/send', async (req, res) => {
-    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await requireCrmKey(req, res, { tab: 'inbox' }))) return;
     const { phone, message } = req.body || {};
     if (!phone || !message || !String(message).trim()) {
         return res.status(400).json({ error: 'phone and message are required' });
@@ -2140,7 +2182,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
 // Multipart form fields: `file` (the media), `phone`, optional `caption`, optional `type` override.
 // Type is auto-detected from the file's MIME if not provided. Auto-captured into whatsapp_messages.
 app.post('/api/whatsapp/send-media', upload.single('file'), async (req, res) => {
-    if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await requireCrmKey(req, res, { tab: 'inbox' }))) return;
     const { phone, caption, type: typeOverride } = req.body || {};
     const file = req.file;
     if (!phone || !file || !file.buffer) {
@@ -2318,6 +2360,7 @@ app.post('/api/sync-refrens', async (req, res) => {
 });
 
 app.get('/api/refrens-analytics', async (req, res) => {
+    if (!(await requireCrmKey(req, res, { tab: 'analytics' }))) return;
     try {
         // Paginate to fetch all leads (Supabase default cap is 1000/page)
         let allData = [];
@@ -2342,6 +2385,7 @@ app.get('/api/refrens-analytics', async (req, res) => {
 });
 
 app.get('/api/sync-status', async (req, res) => {
+    if (!(await requireCrmKey(req, res, { tab: 'analytics' }))) return;
     try {
         const { count, error: countErr } = await supabaseAdmin
             .from('refrens_leads')
@@ -2388,18 +2432,10 @@ import {
     getAllCampaignLeadsExport as metaGetAllLeadsExport,
 } from './meta-marketing.js';
 
-function requireCrmKey(req, res) {
-    const key = req.headers['x-crm-key'] || req.headers['x-api-key'];
-    if (key !== CRM_API_KEY) {
-        res.status(401).json({ success: false, error: 'Unauthorized' });
-        return false;
-    }
-    return true;
-}
 
 // GET /api/meta/status — connection status, account name, last sync time
 app.get('/api/meta/status', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         // Allow ?refresh=1 to bust the in-memory verification cache (e.g. after the user changes env vars)
         if (req.query.refresh === '1') metaBustCache();
@@ -2413,7 +2449,7 @@ app.get('/api/meta/status', async (req, res) => {
 // POST /api/meta/sync — pull campaigns + last-30d insights now
 // Optional body: { since: 'YYYY-MM-DD', until: 'YYYY-MM-DD' }
 app.post('/api/meta/sync', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const { since, until } = req.body || {};
         const result = await metaRunSync({ since, until });
@@ -2428,7 +2464,7 @@ app.post('/api/meta/sync', async (req, res) => {
 
 // GET /api/meta/campaigns — list campaigns + their last-30d totals + CPL
 app.get('/api/meta/campaigns', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const campaigns = await metaListCampaigns();
         return res.json({ success: true, campaigns });
@@ -2440,7 +2476,7 @@ app.get('/api/meta/campaigns', async (req, res) => {
 // GET /api/meta/campaign/:id — full drill-down for one campaign
 //   ↳ metadata + 30d totals + 7d totals + 7d-vs-prior-7d deltas + daily breakdown
 app.get('/api/meta/campaign/:id', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const detail = await metaCampaignDetail(req.params.id);
         return res.json({ success: true, ...detail });
@@ -2452,7 +2488,7 @@ app.get('/api/meta/campaign/:id', async (req, res) => {
 
 // GET /api/meta/campaign/:id/leads — leads attributed to this campaign + funnel
 app.get('/api/meta/campaign/:id/leads', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const result = await metaCampaignLeads(req.params.id);
         return res.json({ success: true, ...result });
@@ -2464,7 +2500,7 @@ app.get('/api/meta/campaign/:id/leads', async (req, res) => {
 // POST /api/meta/backfill-links — re-run lead linker for unmatched meta_leads
 // Useful after a Refrens sync brings in leads that came before we had attribution.
 app.post('/api/meta/backfill-links', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const result = await metaBackfillLinks();
         return res.json({ success: true, ...result });
@@ -2477,7 +2513,7 @@ app.post('/api/meta/backfill-links', async (req, res) => {
 // Body (optional): { since: 'YYYY-MM-DD' }
 // Returns per-campaign results sorted by leads imported, plus aggregate totals.
 app.post('/api/meta/import-leads-all', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const { since } = req.body || {};
         console.log(`[META] Bulk historical import requested — since=${since || 'all time'}`);
@@ -2492,7 +2528,7 @@ app.post('/api/meta/import-leads-all', async (req, res) => {
 
 // GET /api/meta/campaign/:id/recommendations — actionable suggestions for one campaign
 app.get('/api/meta/campaign/:id/recommendations', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const [detail, leads] = await Promise.all([
             metaCampaignDetail(req.params.id),
@@ -2521,7 +2557,7 @@ app.get('/api/meta/campaign/:id/recommendations', async (req, res) => {
 //   since       — ISO date string to filter leads after this date
 // This doesn't need the Page webhook — it reads directly from the Lead Ads API.
 app.post('/api/meta/import-leads', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const { campaignId, since } = req.body || {};
         console.log(`[META] Historical lead import requested — campaignId=${campaignId || 'all'}, since=${since || 'all time'}`);
@@ -2536,7 +2572,7 @@ app.post('/api/meta/import-leads', async (req, res) => {
 
 // GET /api/meta/campaign/:id/ads — per-ad performance breakdown (live Graph API)
 app.get('/api/meta/campaign/:id/ads', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const result = await metaCampaignAds(req.params.id);
         return res.json({ success: true, ...result });
@@ -2547,7 +2583,7 @@ app.get('/api/meta/campaign/:id/ads', async (req, res) => {
 
 // GET /api/meta/campaign/:id/audience — age/gender/region/placement breakdowns
 app.get('/api/meta/campaign/:id/audience', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { tab: 'marketing' }))) return;
     try {
         const result = await metaCampaignAudience(req.params.id);
         return res.json({ success: true, ...result });
@@ -2560,7 +2596,7 @@ app.get('/api/meta/campaign/:id/audience', async (req, res) => {
 // GET /api/meta/leads/export — all meta leads across all campaigns (enriched), for Excel download
 // Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD (both optional)
 app.get('/api/meta/leads/export', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { permission: 'export_leads' }))) return;
     try {
         const { from, to } = req.query;
         const result = await metaGetAllLeadsExport({ from, to });
@@ -2584,7 +2620,7 @@ function hashPassword(password) {
 // dashboard_users table created via migrations/create_dashboard_users.sql
 
 app.get('/api/admin/users', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     try {
         const { data, error } = await supabaseAdmin
             .from('dashboard_users')
@@ -2602,7 +2638,7 @@ app.get('/api/admin/users', async (req, res) => {
 });
 
 app.post('/api/admin/users', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { username, password, role, designation, allowed_tabs } = req.body || {};
     if (!username || !password) return res.status(400).json({ success: false, error: 'username and password required' });
     const validRoles = ['admin', 'limited', 'hr', 'rep'];
@@ -2631,7 +2667,7 @@ app.post('/api/admin/users', async (req, res) => {
 });
 
 app.patch('/api/admin/users/:username', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { username } = req.params;
     const { designation, role, allowed_tabs, password } = req.body || {};
     const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
@@ -2667,7 +2703,7 @@ app.patch('/api/admin/users/:username', async (req, res) => {
 // ─── Tab access requests ─────────────────────────────────────────────────────
 
 app.get('/api/auth/tab-requests', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res))) return;
     const username = String(req.query.username || '').trim();
     if (!username) return res.status(400).json({ success: false, error: 'username required' });
     try {
@@ -2684,7 +2720,7 @@ app.get('/api/auth/tab-requests', async (req, res) => {
 });
 
 app.post('/api/auth/tab-requests', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res))) return;
     const username = String(req.body?.username || '').trim();
     const tab = String(req.body?.tab || '').trim();
     if (!username || !tab) return res.status(400).json({ success: false, error: 'username and tab required' });
@@ -2725,7 +2761,7 @@ app.post('/api/auth/tab-requests', async (req, res) => {
 });
 
 app.get('/api/admin/tab-requests', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const status = String(req.query.status || 'pending').trim();
     try {
         let q = supabaseAdmin
@@ -2742,7 +2778,7 @@ app.get('/api/admin/tab-requests', async (req, res) => {
 });
 
 app.post('/api/admin/tab-requests/:id/approve', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { id } = req.params;
     const reviewedBy = String(req.body?.reviewed_by || 'admin').trim();
     try {
@@ -2784,7 +2820,7 @@ app.post('/api/admin/tab-requests/:id/approve', async (req, res) => {
 });
 
 app.post('/api/admin/tab-requests/:id/deny', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { id } = req.params;
     const reviewedBy = String(req.body?.reviewed_by || 'admin').trim();
     try {
@@ -2804,7 +2840,7 @@ app.post('/api/admin/tab-requests/:id/deny', async (req, res) => {
 });
 
 app.delete('/api/admin/users/:username', async (req, res) => {
-    if (!requireCrmKey(req, res)) return;
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     const { username } = req.params;
     const reserved = (process.env.VITE_ADMIN_USERNAME || 'admin').toLowerCase();
     if (username.toLowerCase() === reserved) return res.status(400).json({ success: false, error: 'Cannot delete the built-in admin' });
@@ -2822,8 +2858,7 @@ app.delete('/api/admin/users/:username', async (req, res) => {
 
 // ─── CSV Upload Sync ─────────────────────────────────────────────────────────
 app.post('/api/upload-refrens-csv', express.text({ type: 'text/csv', limit: '10mb' }), async (req, res) => {
-    const key = req.headers['x-api-key'];
-    if (key !== process.env.CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await requireCrmKey(req, res, { tab: 'analytics' }))) return;
     try {
         const { parse } = await import('csv-parse/sync');
         const rows = parse(req.body.replace(/^\uFEFF/, ''), { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
