@@ -20,7 +20,12 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
+import { registerOrganicWaRoutes } from './organic-wa-routes.js';
+import { registerRepDeviceRoutes } from './rep-devices-routes.js';
+import { isDriveConfigured, uploadRecordingToDrive } from './google-drive.js';
+import { createCallRowHelpers } from './call-row-helpers.js';
 import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus } from './llm-agent.js';
+import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { hydrateQuota } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
@@ -106,7 +111,7 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'settings'];
+const VALID_TABS = ['pulse', 'chatbot', 'inbox', 'analytics', 'marketing', 'hr', 'repapp', 'settings'];
 const ROLE_DEFAULT_TABS = {
     admin: VALID_TABS,
     limited: ['chatbot', 'hr'],
@@ -342,61 +347,91 @@ async function linkCallToLead(phone) {
   } catch { /* best-effort */ }
   return { matched_lead_id: null, matched_source: null };
 }
+const { upsertCallRow, phoneCallStats } = createCallRowHelpers({ supabaseAdmin, normCallPhone, linkCallToLead });
 
 // POST /api/calls/upload-complete — the app reports a finished (and optionally
-// uploaded) call. Idempotent on drive_file_id when present.
+// uploaded) call. Idempotent on (rep_id, call_log_id) and drive_file_id.
 app.post('/api/calls/upload-complete', async (req, res) => {
   if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
   const b = req.body || {};
-  const phone = normCallPhone(b.phone);
-  if (!phone) return res.status(400).json({ success: false, error: 'A valid phone number is required.' });
-  const duration = Math.max(0, Math.round(Number(b.duration_sec) || 0));
-  const connected = (typeof b.connected === 'boolean') ? b.connected : duration >= 5;
-  const link = await linkCallToLead(phone);
-  const startedAt = b.call_started_at ? new Date(b.call_started_at).toISOString() : new Date().toISOString();
-  const row = {
-    rep_id: b.rep_id ? String(b.rep_id).slice(0, 80) : null,
-    rep_name: b.rep_name ? String(b.rep_name).slice(0, 120) : null,
-    phone,
-    direction: b.direction === 'inbound' ? 'inbound' : (b.direction === 'outbound' ? 'outbound' : null),
-    call_started_at: startedAt,
-    duration_sec: duration,
-    connected,
-    outcome: b.outcome ? String(b.outcome).slice(0, 80) : null,
-    followup_needed: !!b.followup_needed,
-    drive_file_id: b.drive_file_id ? String(b.drive_file_id).slice(0, 200) : null,
-    drive_file_url: b.drive_file_url ? String(b.drive_file_url).slice(0, 500) : null,
-    matched_lead_id: link.matched_lead_id,
-    matched_source: link.matched_source,
-    transcript_status: b.drive_file_id ? 'pending' : 'no_recording',
-    device_meta: b.device_meta && typeof b.device_meta === 'object' ? b.device_meta : null,
-    updated_at: new Date().toISOString(),
-  };
+  if (!normCallPhone(b.phone)) return res.status(400).json({ success: false, error: 'A valid phone number is required.' });
   try {
-    let saved;
-    if (row.drive_file_id) {
-      // Idempotent upsert on drive_file_id so a retried upload doesn't double-insert.
-      const { data, error } = await supabaseAdmin.from('call_recordings').upsert(row, { onConflict: 'drive_file_id' }).select('id').maybeSingle();
-      if (error) throw error;
-      saved = data;
-    } else {
-      const { data, error } = await supabaseAdmin.from('call_recordings').insert(row).select('id').maybeSingle();
-      if (error) throw error;
-      saved = data;
+    const result = await upsertCallRow(b, { emitLore: true });
+    if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+    const startedAt = b.call_started_at ? new Date(b.call_started_at).toISOString() : new Date().toISOString();
+    const duration = Math.max(0, Math.round(Number(b.duration_sec) || 0));
+    const connected = typeof b.connected === 'boolean' ? b.connected : duration >= 5;
+    console.log(`[CALLS] ${b.direction || 'call'} ${connected ? 'connected' : 'no-answer'} ${duration}s · ${normCallPhone(b.phone)} · rep=${b.rep_name || b.rep_id || '?'}${result.action === 'skipped' ? ' (dedup)' : ''}`);
+    const devId = b.device_meta?.device_id ? String(b.device_meta.device_id).trim() : null;
+    if (devId) {
+      supabaseAdmin.from('rep_devices').update({
+        last_call_at: startedAt,
+        updated_at: new Date().toISOString(),
+      }).eq('device_id', devId).then(() => {}).catch(() => {});
     }
-    // Fire-and-forget Lore event so the call shows in the lead timeline.
-    supabaseAdmin.from('lead_events').insert({
-      phone, ts: startedAt, event_type: 'call', source: 'call',
-      payload: { direction: row.direction, duration_sec: duration, connected, outcome: row.outcome, followup_needed: row.followup_needed, rep_name: row.rep_name, drive_file_url: row.drive_file_url, call_id: saved?.id || null },
-    }).then(() => {}, (e) => console.warn('[CALLS] lead_events emit failed:', e?.message));
-    console.log(`[CALLS] ${row.direction || 'call'} ${connected ? 'connected' : 'no-answer'} ${duration}s · ${phone} · rep=${row.rep_name || row.rep_id || '?'}${row.outcome ? ` · ${row.outcome}` : ''}`);
-    return res.json({ success: true, id: saved?.id || null, linked: link.matched_source });
+    const link = await linkCallToLead(normCallPhone(b.phone));
+    return res.json({ success: true, id: result.id || null, action: result.action, linked: link.matched_source });
   } catch (err) {
     const hint = /(does not exist|schema cache)/i.test(err.message || '')
       ? 'call_recordings table missing — run server/migrations/create_call_recordings.sql in Supabase first.'
       : err.message;
     console.error('[CALLS] upload-complete failed:', hint);
     return res.status(500).json({ success: false, error: hint });
+  }
+});
+
+// POST /api/calls/sync-log — batch upload of Android call-log history (deduped per rep).
+app.post('/api/calls/sync-log', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const b = req.body || {};
+  const calls = Array.isArray(b.calls) ? b.calls : [];
+  if (!calls.length) return res.json({ success: true, inserted: 0, skipped: 0 });
+  const repId = b.rep_id ? String(b.rep_id).slice(0, 80) : null;
+  let inserted = 0;
+  let skipped = 0;
+  let latestTs = 0;
+  try {
+    for (const row of calls.slice(0, 500)) {
+      const started = row.call_started_at ? new Date(row.call_started_at).getTime() : 0;
+      if (started > latestTs) latestTs = started;
+      const payload = {
+        ...row,
+        rep_id: repId,
+        rep_name: b.rep_name,
+        device_meta: b.device_id ? { device_id: String(b.device_id) } : null,
+      };
+      const r = await upsertCallRow(payload, { emitLore: false });
+      if (r.action === 'skipped') skipped += 1;
+      else inserted += 1;
+    }
+    console.log(`[CALLS] sync-log rep=${b.rep_name || repId || '?'} +${inserted} skip=${skipped}`);
+    return res.json({ success: true, inserted, skipped, synced_until: latestTs ? new Date(latestTs).toISOString() : null });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/calls/stats?phone= — per-lead call aggregates (contacted / connected / recorded).
+app.get('/api/calls/stats', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  try {
+    const stats = await phoneCallStats(req.query.phone);
+    if (!stats) return res.status(400).json({ success: false, error: 'Valid phone required.' });
+    return res.json({ success: true, stats });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/calls/history?phone= — full call log for a lead (newest first).
+app.get('/api/calls/history', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  try {
+    const stats = await phoneCallStats(req.query.phone);
+    if (!stats) return res.status(400).json({ success: false, error: 'Valid phone required.' });
+    return res.json({ success: true, ...stats });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -419,7 +454,7 @@ app.patch('/api/calls/:id', async (req, res) => {
   }
 });
 
-// POST /api/calls/upload-recording — rep app uploads OEM .m4a to Supabase Storage (increment 2–3 shortcut vs Drive).
+// POST /api/calls/upload-recording — rep app → shared Google Drive (preferred) or Supabase fallback.
 app.post('/api/calls/upload-recording', upload.single('file'), async (req, res) => {
   if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
   const file = req.file;
@@ -427,27 +462,98 @@ app.post('/api/calls/upload-recording', upload.single('file'), async (req, res) 
   if (!file?.buffer?.length) return res.status(400).json({ success: false, error: 'Audio file required.' });
   if (!callId) return res.status(400).json({ success: false, error: 'call_id required.' });
   const repId = req.body?.rep_id ? String(req.body.rep_id).slice(0, 80) : 'unknown';
+  const repName = req.body?.rep_name ? String(req.body.rep_name).slice(0, 40).replace(/[^\w-]/g, '_') : repId;
+  const phone = req.body?.phone ? String(req.body.phone).replace(/[^\d]/g, '').slice(-10) : 'unknown';
   const ext = (file.originalname || 'recording.m4a').split('.').pop() || 'm4a';
-  const storagePath = `rep/${repId}/${callId}.${ext.replace(/[^a-z0-9]/gi, '')}`;
+  const safeExt = ext.replace(/[^a-z0-9]/gi, '') || 'm4a';
+  const filename = `${repName}_${phone}_${callId.slice(0, 8)}.${safeExt}`;
+
   try {
-    const { error: upErr } = await supabaseAdmin.storage.from('call-recordings').upload(storagePath, file.buffer, {
-      contentType: file.mimetype || 'audio/mp4',
-      upsert: true,
-    });
-    if (upErr) throw upErr;
-    const { data: pub } = supabaseAdmin.storage.from('call-recordings').getPublicUrl(storagePath);
+    let driveFileId;
+    let driveFileUrl;
+    let storageMode = 'supabase';
+
+    if (isDriveConfigured()) {
+      const up = await uploadRecordingToDrive({
+        buffer: file.buffer,
+        filename,
+        mimeType: file.mimetype || 'audio/mp4',
+      });
+      driveFileId = up.fileId;
+      driveFileUrl = up.webUrl;
+      storageMode = 'drive';
+      console.log(`[CALLS] recording → Drive ${driveFileId} (${filename})`);
+    } else {
+      const storagePath = `rep/${repId}/${callId}.${safeExt}`;
+      const { error: upErr } = await supabaseAdmin.storage.from('call-recordings').upload(storagePath, file.buffer, {
+        contentType: file.mimetype || 'audio/mp4',
+        upsert: true,
+      });
+      if (upErr) throw upErr;
+      const { data: pub } = supabaseAdmin.storage.from('call-recordings').getPublicUrl(storagePath);
+      driveFileId = storagePath;
+      driveFileUrl = pub?.publicUrl || null;
+      console.log(`[CALLS] recording → Supabase ${storagePath} (Drive not configured)`);
+    }
+
     const { data, error } = await supabaseAdmin.from('call_recordings').update({
-      drive_file_id: storagePath,
-      drive_file_url: pub?.publicUrl || null,
+      drive_file_id: driveFileId,
+      drive_file_url: driveFileUrl,
       transcript_status: 'pending',
+      has_recording: true,
+      device_meta: { storage_mode: storageMode, filename },
       updated_at: new Date().toISOString(),
-    }).eq('id', callId).select('id, drive_file_url, transcript_status').maybeSingle();
+    }).eq('id', callId).select('id, drive_file_url, transcript_status, phone').maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ success: false, error: 'Call row not found — report call metadata first.' });
-    console.log(`[CALLS] recording uploaded ${storagePath} → call ${callId}`);
-    return res.json({ success: true, id: data.id, url: data.drive_file_url, transcript_status: data.transcript_status });
+
+    const deviceId = req.body?.device_id ? String(req.body.device_id).trim() : null;
+    if (deviceId) {
+      supabaseAdmin.from('rep_devices').update({
+        last_upload_ok_at: new Date().toISOString(),
+        setup_status: 'ready',
+        upload_target: storageMode,
+        updated_at: new Date().toISOString(),
+      }).eq('device_id', deviceId).then(() => {}).catch(() => {});
+    }
+    return res.json({
+      success: true,
+      id: data.id,
+      url: data.drive_file_url,
+      storage_mode: storageMode,
+      transcript_status: data.transcript_status,
+    });
   } catch (err) {
     console.error('[CALLS] upload-recording failed:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PATCH /api/calls/:id/transcript — M4 transcribe script writes transcript + Lore event.
+app.patch('/api/calls/:id/transcript', async (req, res) => {
+  if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  const id = String(req.params.id || '').trim();
+  const transcript = req.body?.transcript ? String(req.body.transcript).slice(0, 50000) : null;
+  if (!id || !transcript) return res.status(400).json({ success: false, error: 'transcript required' });
+  try {
+    const { data, error } = await supabaseAdmin.from('call_recordings').update({
+      transcript,
+      transcript_status: 'done',
+      updated_at: new Date().toISOString(),
+    }).eq('id', id).select('id, phone, rep_name').maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: 'Call not found' });
+    if (data.phone && process.env.LEAD_EVENTS_ENABLED !== 'false') {
+      supabaseAdmin.from('lead_events').insert({
+        phone: data.phone,
+        ts: new Date().toISOString(),
+        event_type: 'call_transcribed',
+        source: 'lore_engine',
+        payload: { transcript: transcript.slice(0, 500), call_id: id, rep_name: data.rep_name },
+      }).then(() => {}).catch(e => console.warn('[CALLS] lore transcript event failed:', e.message));
+    }
+    return res.json({ success: true, id: data.id });
+  } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -817,6 +923,7 @@ function isValidName(str) {
     // Reject if FIRST word is a blacklisted question word (covers "kya hota he ye proccess")
     const firstWord = low.split(/\s+/)[0];
     if (NAME_BLACKLIST.has(firstWord)) return false;
+    if (isIndianCity(trimmed)) return false;
     if (/[\u0900-\u097F]/.test(trimmed)) return trimmed.length >= 2;
     if (!/^[a-zA-Z\s]+$/.test(trimmed)) return false;
     return trimmed.split(/\s+/).some(w => w.length >= 2);
@@ -898,7 +1005,7 @@ function trackOutbound(phone, reply) {
 // ─── Helper: safe first name (never "WhatsApp") ─────────────────────────────
 function safeFirstName(session) {
     const cn = session.data?.contactName;
-    if (!cn || cn === 'WhatsApp Lead') return '';
+    if (!cn || cn === 'WhatsApp Lead' || isIndianCity(cn)) return '';
     return cn.split(' ')[0];
 }
 
@@ -939,7 +1046,17 @@ function applyConversationHardStop(phone, session, message, msgLow) {
     return null;
 }
 
-const INDIAN_CITIES = ['delhi', 'mumbai', 'bangalore', 'bengaluru', 'hyderabad', 'pune', 'gurgaon', 'gurugram', 'noida', 'chennai', 'kolkata', 'jaipur', 'ahmedabad', 'chandigarh', 'lucknow', 'surat', 'bhopal', 'indore', 'nagpur', 'faridabad', 'meerut', 'rajkot', 'varanasi', 'amritsar', 'allahabad', 'prayagraj', 'coimbatore', 'jodhpur', 'madurai', 'raipur', 'kota', 'mohali', 'panchkula', 'dehradun', 'ghaziabad'];
+function sanitizeAgentReply(message, session, reply) {
+    const lang = session.lang || 'EN';
+    const intents = detectAllIntents(message);
+    if (intents.includes('LOCATION')) {
+        let text = KB.LOCATION[lang] || KB.LOCATION.EN;
+        if (!session.data.city) text += `\n\n${t('ASK_CITY', lang)}`;
+        return text;
+    }
+    if (isInventedAgentClaim(reply)) return null;
+    return reply;
+}
 
 function passiveExtract(message, session) {
     const m = message.toLowerCase(); const d = session.data;
@@ -951,7 +1068,7 @@ function passiveExtract(message, session) {
         ];
         for (const re of namePatterns) {
             const nm = message.match(re);
-            if (nm?.[1] && isValidName(nm[1])) {
+            if (nm?.[1] && isValidName(nm[1]) && !isIndianCity(nm[1])) {
                 d.contactName = nm[1].charAt(0).toUpperCase() + nm[1].slice(1).toLowerCase();
                 break;
             }
@@ -1147,7 +1264,7 @@ const INTENTS = {
     COST: ['cost', 'price', 'charges', 'fees', 'kharcha', 'rate', 'expense', 'amount', 'how much', 'how much does', 'how much is', 'money', 'kitna padega', 'kitne ka', 'kitna hai', 'kitna paisa', 'paisa kitna', 'paisa lagega', 'kitne paise', 'कितना खर्चा', 'कीमत', 'फीस', 'खर्च'],
     TIMELINE: ['when', 'how soon', 'schedule', 'kab', 'jaldi', 'next week', 'this week', 'soon', 'immediately', 'कब', 'जल्दी'],
     SAFETY: ['scared', 'fear', 'safe', 'risk', 'side effects', 'nervous', 'afraid', 'dar lag raha', 'danger', 'dangerous', 'डर', 'खतरा', 'सुरक्षित'],
-    LOCATION: ['where', 'location', 'address', 'kahan hai', 'nearest', 'clinic', 'hospital', 'centre', 'कहाँ', 'पता'],
+    LOCATION: ['where', 'location', 'address', 'kahan hai', 'nearest', 'clinic', 'hospital', 'centre', 'branch', 'कहाँ', 'पता', 'शाखा'],
     ALTERNATIVES: ['contact lens', 'glasses', 'specs', 'chashma', 'alternative', 'lenses', 'spectacles', 'vs', 'compare', 'चश्मा', 'लेंस'],
     CONCERN: ['issue with my eye', 'issue with my eyes', 'issue in my eye', 'problem with my eye', 'problem in my eye', 'eye problem', 'eye issue', 'eyes problem', 'eyesight problem', 'blurry', 'blurred', 'blur', "can't see", 'cant see', 'cannot see', "can't read", 'unable to see', 'weak eyesight', 'weak eyes', 'weak eye', 'poor vision', 'bad vision', 'low vision', 'vision problem', 'vision issue', 'trouble seeing', 'difficulty seeing', 'thick glasses', 'high power', 'aankh', 'aankhon', 'aankhon mein', 'dikhai nahi', 'dikhta nahi', 'saaf nahi dikhta', 'nazar kamzor', 'kamzor nazar', 'धुंधला', 'दिखाई नहीं', 'नज़र', 'कमज़ोर']
 };
@@ -1156,7 +1273,7 @@ function detectAllIntents(message) { const m = message.toLowerCase(); return Obj
 
 function getNextQuestion(session, context = 'normal') {
     const d = session.data; const lang = session.lang || 'EN';
-    const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' ? d.contactName.split(' ')[0] : '';
+    const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' && !isIndianCity(d.contactName) ? d.contactName.split(' ')[0] : '';
     let field = null, text = '';
     if (!d.city) { field = 'CITY'; text = t('ASK_CITY', lang); }
     else if (!d.eyePower) { field = 'EYE_POWER'; text = t('ASK_EYE_POWER', lang); }
@@ -1279,9 +1396,14 @@ async function sendWhatsAppReply(phone, reply) {
 // the rule-based machine.
 function applyAgentExtract(session, ag) {
     const d = session.data;
-    if (ag.name && typeof ag.name === 'string' && isValidName(ag.name)) {
-        if (!d.contactName || d.contactName === 'WhatsApp Lead' || d.contactName.toLowerCase() !== ag.name.trim().toLowerCase()) {
-            d.contactName = ag.name.trim();
+    if (ag.name && typeof ag.name === 'string') {
+        const nm = ag.name.trim();
+        if (isIndianCity(nm)) {
+            if (!d.city) d.city = titleCaseCity(nm.split(/[,\s]+/)[0]);
+        } else if (isValidName(nm)) {
+            if (!d.contactName || d.contactName === 'WhatsApp Lead' || d.contactName.toLowerCase() !== nm.toLowerCase()) {
+                d.contactName = nm;
+            }
         }
     }
     if (ag.city && typeof ag.city === 'string' && !d.city) d.city = ag.city.trim();
@@ -1430,10 +1552,6 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             if (agentResult && agentResult.reply) {
                 applyAgentExtract(session, agentResult);
 
-                session._agentHistory = (session._agentHistory || [])
-                    .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
-                    .slice(-20);
-
                 const hasData = session.data.city || session.data.eyePower || session.data.contactName;
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
                 if (session.data.request_call && session.state !== 'COMPLETE') {
@@ -1443,12 +1561,23 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 }
 
                 if (agentMode() === 'live') {
-                    setReply(agentResult.reply);
-                    console.log(`[AGENT:live] ✅ ${phone}`);
-                    applyConversationHardStop(phone, session, message, msgLow);
-                    return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
+                    const sanitized = sanitizeAgentReply(message, session, agentResult.reply);
+                    if (sanitized !== null) {
+                        session._agentHistory = (session._agentHistory || [])
+                            .concat({ role: 'user', text: message }, { role: 'model', text: sanitized })
+                            .slice(-20);
+                        setReply(sanitized);
+                        console.log(`[AGENT:live] ✅ ${phone}`);
+                        applyConversationHardStop(phone, session, message, msgLow);
+                        return finalizeWithIngest(phone, session, 'agent', finalize, isTestChat);
+                    }
+                    console.log(`[AGENT:live] guard → rule-based for ${phone}`);
+                } else {
+                    session._agentHistory = (session._agentHistory || [])
+                        .concat({ role: 'user', text: message }, { role: 'model', text: agentResult.reply })
+                        .slice(-20);
+                    console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
                 }
-                console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${agentResult.reply.slice(0, 120)}"`);
             } else {
                 const hasData = session.data.city || session.data.eyePower || (session.data.contactName && session.data.contactName !== 'WhatsApp Lead');
                 if (session.state === 'GREETING' && hasData) session.state = 'CORE_CONSULT';
@@ -1554,7 +1683,12 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         }
 
         else if (state === 'NAME') {
-            if (!isValidName(message)) {
+            if (isIndianCity(message)) {
+                session.data.city = titleCaseCity(message.split(/[,\s]+/)[0]);
+                session.state = 'CORE_CONSULT';
+                const next = getNextQuestion(session);
+                setReply(next.text || (lang === 'HI' ? 'धन्यवाद! 😊' : 'Thanks! 😊'));
+            } else if (!isValidName(message)) {
                 // F7: If the user opened with their concern instead of a name
                 // (e.g. "Lasik", "surgery", "chashma hatana"), acknowledge it
                 // warmly and ask for the name again — don't sound robotic.
@@ -2284,6 +2418,9 @@ if (SELF_URL) {
     setInterval(async () => { try { const r = await globalThis.fetch(SELF_URL); console.log(`[KEEPALIVE] → ${r.status}`); } catch (e) { console.warn('[KEEPALIVE] Ping failed:', e.message); } }, 4 * 60 * 1000);
     console.log(`[KEEPALIVE] Enabled → ${SELF_URL}`);
 }
+
+registerOrganicWaRoutes(app, { CRM_API_KEY, supabaseAdmin, saveWhatsAppMessage });
+registerRepDeviceRoutes(app, { CRM_API_KEY, supabaseAdmin });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[API] ✅ Server running on port ${PORT}`);

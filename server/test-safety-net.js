@@ -7,6 +7,7 @@
  */
 
 import crypto from 'crypto';
+import { isIndianCity, isInventedAgentClaim, hasLocationIntent } from './bot-guard.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. EXTRACT ALL SAFETY FUNCTIONS (identical copies from index.js)
@@ -55,6 +56,7 @@ function isValidName(str) {
     if (trimmed.split(/\s+/).length >= 3) return false;
     const firstWord = low.split(/\s+/)[0];
     if (NAME_BLACKLIST.has(firstWord)) return false;
+    if (isIndianCity(trimmed)) return false;
     if (/[\u0900-\u097F]/.test(trimmed)) return trimmed.length >= 2;
     if (!/^[a-zA-Z\s]+$/.test(trimmed)) return false;
     return trimmed.split(/\s+/).some(w => w.length >= 2);
@@ -130,7 +132,7 @@ function trackOutbound(phone, reply) {
 
 function safeFirstName(session) {
     const cn = session.data?.contactName;
-    if (!cn || cn === 'WhatsApp Lead') return '';
+    if (!cn || cn === 'WhatsApp Lead' || isIndianCity(cn)) return '';
     return cn.split(' ')[0];
 }
 
@@ -187,6 +189,8 @@ test('A', '"Specs" (intent word)', isValidName('Specs'), false);
 test('A', '"Number" (common word)', isValidName('Number'), false);
 test('A', '"Jharkhand want treatment..." (sentence, phone 918789124352)', 
     isValidName('Jharkhand want treatment not in gurugram'), false);
+test('A', '"Hyderabad" (city not name, phone 918328590366 / Dinesh)', isValidName('Hyderabad'), false);
+test('A', '"Hyderabad ,Telangana" (city not name)', isValidName('Hyderabad ,Telangana'), false);
 
 console.log('\n━━━ SUITE A2: Name Validation (should ACCEPT valid names) ━━━');
 test('A2', '"Mukesh Tiwari" (real name, phone 918349626105)', isValidName('Mukesh Tiwari'), true);
@@ -348,6 +352,17 @@ test('H', 'undefined → empty', safeFirstName({ data: {} }), '');
 test('H', '"Mukesh Tiwari" → "Mukesh"', safeFirstName({ data: { contactName: 'Mukesh Tiwari' } }), 'Mukesh');
 test('H', '"Nisha" → "Nisha"', safeFirstName({ data: { contactName: 'Nisha' } }), 'Nisha');
 test('H', '"Ramu kaka" → "Ramu"', safeFirstName({ data: { contactName: 'Ramu kaka' } }), 'Ramu');
+test('H', '"Hyderabad" (mis-stored city as name) → empty', safeFirstName({ data: { contactName: 'Hyderabad' } }), '');
+
+// ─── SUITE N: Dinesh conversation + agent guard (918328590366) ───────────────
+console.log('\n━━━ SUITE N: Dinesh / Hyderabad regression (918328590366) ━━━');
+test('N', '"Dinesh" is valid name', isValidName('Dinesh'), true);
+test('N', '"Hyderabad" is Indian city', isIndianCity('Hyderabad'), true);
+test('N', '"Where is your branch" → location intent', hasLocationIntent('Where is your branch'), true);
+test('N', 'branch reply invented → blocked', isInventedAgentClaim('We have a branch in Hyderabad!'), true);
+test('N', 'pickup/drop reply invented → blocked', isInventedAgentClaim('Yes, we offer pickup and drop services for your convenience in Hyderabad.'), true);
+test('N', 'free valuation reply invented → blocked', isInventedAgentClaim('Yes, your eye valuation is free!'), true);
+test('N', '"Pickup,drop available" → NOT location intent alone', hasLocationIntent('Pickup,drop available'), false);
 
 // ─── SUITE I: Full Conversation Replay (Lipoma disaster) ─────────────────────
 console.log('\n━━━ SUITE I: Full Conversation Replay — Lipoma (918387925428) ━━━');
