@@ -38,12 +38,15 @@ loadLabMeta();
 
 function snapshotLeadRow(row) {
     if (!row) return null;
+    const eyeFromUq = row.user_questions
+        ? (String(row.user_questions).match(/Eye power:\s*([^|]+)/i)?.[1]?.trim() || null)
+        : null;
     return {
         id: row.id,
         contact_name: row.contact_name,
         city: row.city,
-        eye_power: row.eye_power,
-        eye_power_numeric: row.eye_power_numeric,
+        eye_power: row.eye_power || eyeFromUq,
+        eye_power_numeric: row.eye_power_numeric ?? null,
         parameters_completed: row.parameters_completed,
         intent_level: row.intent_level,
         intent_score: row.intent_score,
@@ -207,7 +210,7 @@ export function registerBotLabRoutes(app, deps) {
         if (supabaseAdmin) {
             const { data } = await supabaseAdmin
                 .from('leads_surgery')
-                .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
+                .select('id, contact_name, city, user_questions, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
                 .eq('phone_number', phone)
                 .maybeSingle();
             lead = snapshotLeadRow(mergeLeadFromSession(data, sess));
@@ -249,7 +252,7 @@ export function registerBotLabRoutes(app, deps) {
             if (supabaseAdmin) {
                 const { data } = await supabaseAdmin
                     .from('leads_surgery')
-                    .select('id, contact_name, city, eye_power, eye_power_numeric, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
+                    .select('id, contact_name, city, user_questions, parameters_completed, intent_level, intent_score, request_call, timeline, insurance, source, last_user_message, message_count, current_flow_state')
                     .eq('phone_number', phone)
                     .maybeSingle();
                 lead = snapshotLeadRow(mergeLeadFromSession(data, sess));

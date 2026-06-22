@@ -705,6 +705,31 @@ function parseEyePower(message) {
 function getEyePowerNumeric(ep) { if (!ep) return null; if (typeof ep === 'string') return parseFloat(ep) || null; return ep.numeric || null; }
 function getEyePowerString(ep) { if (!ep) return null; if (typeof ep === 'string') return ep; return ep.parsed || ep.raw || null; }
 
+function getMissingQualField(session) {
+    const d = session.data;
+    if (!d.city) return 'CITY';
+    if (!d.eyePower) return 'EYE_POWER';
+    if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) return 'POWER_STABILITY';
+    if (!d.insurance) return 'INSURANCE';
+    return null;
+}
+
+/** When the bot reply already asks a field, mark it so we don't ask again and passiveExtract knows context. */
+function markFieldsAskedInReply(reply, session) {
+    if (!reply || !session?.data) return;
+    const d = session.data;
+    const r = reply.toLowerCase();
+    d.resumeAsked = d.resumeAsked || [];
+    const mark = (field) => {
+        d.lastAskedField = field;
+        if (!d.resumeAsked.includes(field)) d.resumeAsked.push(field);
+    };
+    if (!d.insurance && /insurance|bima|medical (insurance|cover)/.test(r)) mark('INSURANCE');
+    else if (!d.city && /which city|your city|city are you|located in|शहर/.test(r)) mark('CITY');
+    else if (!d.eyePower && /eye power|glasses.*power|contact lens|approximate power|lens number/.test(r)) mark('EYE_POWER');
+    else if (!d.powerStability && /power been stable|stable your power|how stable/.test(r)) mark('POWER_STABILITY');
+}
+
 function getAcknowledgement(message, lang) {
     const m = message.toLowerCase();
     const acks = [
@@ -1071,9 +1096,20 @@ function passiveExtract(message, session) {
         else if (/exploring|soch raha|dekh raha|just looking/i.test(m)) { d.timeline = message; d.urgency = 'low'; }
     }
     if (!d.insurance) {
-        if (/insurance hai|insured hoon|health insurance|bima hai|covered hai/i.test(m)) d.insurance = 'Yes';
-        else if (/no insurance|insurance nahi|bima nahi|not insured/i.test(m)) d.insurance = 'No';
-        else if (d.lastAskedField === 'INSURANCE') {
+        const onlyMissingInsurance = getMissingQualField(session) === 'INSURANCE';
+        if (onlyMissingInsurance) {
+            const t = message.trim().toLowerCase();
+            if (/^(yes|yeah|yep|y|haan|ha|ji|covered)\b/.test(t) || /have insurance|insurance hai|bima hai/.test(t)) {
+                d.insurance = 'Yes';
+                d.lastAskedField = null;
+            } else if (/^(no|nope|n|nahi|nah|not)\b/.test(t) || /don'?t have|dont have|no insurance|insurance nahi/.test(t)) {
+                d.insurance = 'No';
+                d.lastAskedField = null;
+            }
+        }
+        if (!d.insurance && /insurance hai|insured hoon|health insurance|bima hai|covered hai/i.test(m)) d.insurance = 'Yes';
+        else if (!d.insurance && /no insurance|insurance nahi|bima nahi|not insured/i.test(m)) d.insurance = 'No';
+        else if (!d.insurance && d.lastAskedField === 'INSURANCE') {
             const t = message.trim().toLowerCase();
             if (/^(yes|yeah|yep|y|haan|ha|ji|hai|hain|covered|insured)\b/.test(t)) {
                 d.insurance = 'Yes';
@@ -1190,6 +1226,9 @@ function hydrateSessionDataFromLead(row) {
     if (row.eye_power) {
         const parsed = parseEyePower(String(row.eye_power));
         data.eyePower = parsed?.numeric != null ? parsed : { raw: row.eye_power, parsed: row.eye_power, numeric: row.eye_power_numeric ?? null, confidence: 'db' };
+    } else if (row.user_questions) {
+        const m = String(row.user_questions).match(/Eye power:\s*([^|]+)/i);
+        if (m) data.eyePower = parseEyePower(m[1].trim()) || { raw: m[1].trim(), parsed: m[1].trim(), numeric: null, confidence: 'db' };
     }
     if (row.request_call) data.request_call = true;
     if (row.concern_power) data.concern_power = true;
@@ -1199,7 +1238,7 @@ function hydrateSessionDataFromLead(row) {
 
 async function checkExistingLead(phone) {
     try {
-        const { data, error } = await supabaseAdmin.from('leads_surgery').select('id, phone_number, contact_name, city, insurance, timeline, eye_power, eye_power_numeric, message_count, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, concern_power, urgency_level, pushed_to_crm, request_call').eq('phone_number', phone).maybeSingle();
+        const { data, error } = await supabaseAdmin.from('leads_surgery').select('id, phone_number, contact_name, city, insurance, timeline, user_questions, message_count, status, lead_stage, interest_cost, interest_recovery, concern_pain, concern_safety, concern_power, urgency_level, pushed_to_crm, request_call').eq('phone_number', phone).maybeSingle();
         if (error) throw error;
         return data || null;
     } catch (e) { console.error('[BOT] checkExistingLead error:', e.message); return null; }
@@ -1245,25 +1284,19 @@ const INTENTS = {
 
 function detectAllIntents(message) { const m = message.toLowerCase(); return Object.entries(INTENTS).filter(([, words]) => words.some(w => m.includes(w))).map(([intent]) => intent); }
 
-function getMissingQualField(session) {
-    const d = session.data;
-    if (!d.city) return 'CITY';
-    if (!d.eyePower) return 'EYE_POWER';
-    if (d.eyePower && !d.powerStability && getEyePowerNumeric(d.eyePower) !== null && getEyePowerNumeric(d.eyePower) <= -5) return 'POWER_STABILITY';
-    if (!d.insurance) return 'INSURANCE';
-    return null;
-}
-
 function getNextQuestion(session, context = 'normal') {
     const d = session.data; const lang = session.lang || 'EN';
     const firstName = d.contactName && d.contactName !== 'WhatsApp Lead' && !isIndianCity(d.contactName) ? d.contactName.split(' ')[0] : '';
     const field = getMissingQualField(session);
     let text = '';
     if (!field) return { text: '', field: null };
+    d.resumeAsked = d.resumeAsked || [];
+    if (d.resumeAsked.includes(field)) return { text: '', field: null };
     if (field === 'CITY') text = t('ASK_CITY', lang);
     else if (field === 'EYE_POWER') text = t('ASK_EYE_POWER', lang);
     else if (field === 'POWER_STABILITY') text = t('ASK_POWER_STABILITY', lang);
     else if (field === 'INSURANCE') text = t('ASK_INSURANCE', lang);
+    d.resumeAsked.push(field);
     session.data.lastAskedField = field;
     if (context === 'normal' && firstName && field !== 'NAME') { const g = { EN: `Got it, ${firstName} 👍\n\n`, HI: `समझ गया, ${firstName} 👍\n\n` }; text = (g[lang] || g.EN) + text; }
     if (context === 'resume') {
@@ -1308,14 +1341,13 @@ function enrichAgentReply(session, message, msgLow, reply) {
     if (!engaged) return reply;
 
     const rlow = reply.toLowerCase();
-    if (/city|शहर|eye power|glasses power|chashma|aankh.*power|power.*aankh|insurance|bima|medical cover/.test(rlow)) return reply;
+    if (/city|शहर|eye power|glasses power|chashma|aankh.*power|power.*aankh|insurance|bima|medical cover/.test(rlow)) {
+        markFieldsAskedInReply(reply, session);
+        return reply;
+    }
 
     const nextStep = getNextQuestion(session, 'resume');
     if (!nextStep.text || !nextStep.field) return reply;
-
-    d.resumeAsked = d.resumeAsked || [];
-    if (d.resumeAsked.includes(nextStep.field)) return reply;
-    d.resumeAsked.push(nextStep.field);
 
     return `${reply}\n\n${nextStep.text}`;
 }
@@ -1468,7 +1500,7 @@ function applyAgentExtract(session, ag) {
 async function handleIncomingMessage(reqBody, isTestChat = false) {
     let phone, message, msgId;
     let reply = null, replied = false, finalized = false;
-    const setReply = (text) => { if (!replied) { reply = text; replied = true; } };
+    const setReply = (text) => { if (!replied) { reply = text; replied = true; const s = botSessions[phone]; if (s) markFieldsAskedInReply(text, s); } };
     const finalize = (forceReturn = false) => {
         if (finalized) return reply;
         finalized = true;

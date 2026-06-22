@@ -1,4 +1,13 @@
 export const calculateParametersCompleted = (lead) => {
+    const eyePowerFromQuestions = (uq) => {
+        if (!uq) return null;
+        const m = String(uq).match(/Eye power:\s*([^|]+)/i);
+        return m ? m[1].trim() : null;
+    };
+    const effectiveLead = {
+        ...lead,
+        eye_power: lead.eye_power || eyePowerFromQuestions(lead.user_questions),
+    };
     // Count qualification parameters the bot captures.
     // contact_name removed from scoring — it's now always 'WhatsApp Lead' since name collection
     // was removed (leads get stuck at NAME). The 5 qualifying params are:
@@ -11,7 +20,7 @@ export const calculateParametersCompleted = (lead) => {
     ];
     // request_call counts as the 5th parameter — explicit callback = highest intent signal
     if (lead.request_call) return Math.min(5, fields.reduce((c, f) => {
-        const val = lead[f]; if (!val) return c;
+        const val = effectiveLead[f]; if (!val) return c;
         const str = String(val).trim();
         if (!str || str === 'WhatsApp Lead') return c;
         if (f === 'eye_power' && typeof val === 'object' && val.raw) return c + 1;
@@ -19,7 +28,7 @@ export const calculateParametersCompleted = (lead) => {
     }, 0) + 1); // +1 for request_call
     let count = 0;
     for (const field of fields) {
-        const val = lead[field];
+        const val = effectiveLead[field];
         if (!val) continue;
         const str = String(val).trim();
         if (!str || str === 'WhatsApp Lead') continue;
@@ -127,11 +136,15 @@ export const ingestLead = async (supabaseClient, leadData) => {
     try {
         const { data: _ex } = await supabaseClient
             .from('leads_surgery')
-            .select('city, insurance, timeline, eye_power, eye_power_numeric, contact_name, message_count, request_call, concern_power, interest_cost, interest_recovery, concern_pain, concern_safety, parameters_completed, intent_level, intent_score, first_message_at')
+            .select('city, insurance, timeline, user_questions, contact_name, message_count, request_call, concern_power, interest_cost, interest_recovery, concern_pain, concern_safety, parameters_completed, intent_level, intent_score, first_message_at')
             .eq('phone_number', phone_number)
             .maybeSingle();
         existing = _ex;
     } catch (_e) { /* non-fatal */ }
+
+    const existingEyePower = existing?.user_questions
+        ? (String(existing.user_questions).match(/Eye power:\s*([^|]+)/i)?.[1]?.trim() || null)
+        : null;
 
     const merged = {
         ...leadData,
@@ -139,10 +152,8 @@ export const ingestLead = async (supabaseClient, leadData) => {
         insurance: keepField(insurance, existing?.insurance),
         timeline: keepField(timeline, existing?.timeline),
         contact_name: keepField(contact_name, existing?.contact_name) || 'WhatsApp Lead',
-        eye_power: keepField(eye_power, existing?.eye_power),
-        eye_power_numeric: eye_power_numeric != null && eye_power_numeric !== ''
-            ? eye_power_numeric
-            : (existing?.eye_power_numeric ?? null),
+        eye_power: keepField(eye_power, existingEyePower),
+        eye_power_numeric: eye_power_numeric != null && eye_power_numeric !== '' ? eye_power_numeric : null,
         message_count: Math.max(message_count || 0, existing?.message_count || 0) || message_count,
         request_call: leadData.request_call || existing?.request_call || false,
         concern_power: !!leadData.concern_power || !!existing?.concern_power,
@@ -241,7 +252,19 @@ export const ingestLead = async (supabaseClient, leadData) => {
 
     let { data, error } = await doUpsert(payload);
 
-    if (error && /eye_power_numeric/.test(error.message || '')) {
+    if (error && /eye_power/.test(error.message || '')) {
+        console.warn('[DB] Retrying upsert without eye_power columns');
+        const eyeFallback = payload.eye_power;
+        const { eye_power: _ep, eye_power_numeric: _en, ...retryPayload } = payload;
+        if (eyeFallback) {
+            const uq = retryPayload.user_questions || '';
+            if (!/eye power:/i.test(uq)) {
+                retryPayload.user_questions = uq ? `${uq} | Eye power: ${eyeFallback}` : `Eye power: ${eyeFallback}`;
+            }
+        }
+        ({ data, error } = await doUpsert(retryPayload));
+        if (!error) payload.user_questions = retryPayload.user_questions;
+    } else if (error && /eye_power_numeric/.test(error.message || '')) {
         console.warn('[DB] Retrying upsert without eye_power_numeric');
         const { eye_power_numeric: _drop, ...retryPayload } = payload;
         ({ data, error } = await doUpsert(retryPayload));
