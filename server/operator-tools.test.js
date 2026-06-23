@@ -7,6 +7,8 @@ import {
     detectStatusFilter,
     classifyOperatorMessage,
     checkFounderRoute,
+    staticGeneralReply,
+    staticOperatorReply,
 } from './operator-tools.js';
 import { suggestToolsForMessage, getOperatorToolDeclarations } from './operator-playbooks.js';
 import { buildOperatorContext } from './operator-tools.js';
@@ -92,6 +94,18 @@ test('classifyOperatorMessage routes product feedback to feature', () => {
 test('general CRM questions are not data queries', () => {
     assert.equal(classifyOperatorMessage('what does this crm do ?'), 'general');
     assert.equal(checkFounderRoute('what does this crm do ?').needsFounder, false);
+});
+
+test('staticGeneralReply handles greetings without Gemini', () => {
+    const reply = staticGeneralReply('What can you help me with today?', buildOperatorContext('admin', ['analytics'], {}));
+    assert.ok(reply);
+    assert.match(reply, /live CRM/i);
+    assert.match(reply, /sent for admin approval/i);
+});
+
+test('staticOperatorReply uses sent-for-approval copy for features', () => {
+    const reply = staticOperatorReply('feature', { needsFounder: true, kind: 'feature' }, null);
+    assert.match(reply, /sent for approval/i);
 });
 
 test('suggestToolsForMessage hints crm_overview for generic asks', () => {

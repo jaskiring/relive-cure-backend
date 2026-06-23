@@ -1,7 +1,7 @@
 // CRM Operator â€” Gemini agent with function calling (tool playbooks).
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, ensureQuotaHydrated } from './agent-quota.js';
-import { OPERATOR_TEXT_MODELS, modelIds } from './gemini-channels.js';
+import { OPERATOR_TEXT_MODELS, WHATSAPP_MODELS, modelIds } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted } from './gemini-model-health.js';
 import { getOperatorToolDeclarations, executeOperatorTool, suggestToolsForMessage } from './operator-playbooks.js';
 import {
@@ -12,7 +12,11 @@ import {
     isGoogleDailyLimit,
     isGoogleTransientLimit,
 } from './operator-data.js';
-import { normalizeDataQuestion } from './operator-tools.js';
+import {
+    normalizeDataQuestion,
+    classifyOperatorMessage,
+    staticGeneralReply,
+} from './operator-tools.js';
 
 const TIMEOUT_MS = 18000;
 const MAX_TOOL_TURNS = 4;
@@ -110,8 +114,13 @@ Answer briefly in plain text. Do NOT invent lead counts or assignee statistics â
 
 async function tryModels(models, body, channel = 'operator') {
     let lastErr = null;
-    for (const model of models) {
-        if (isExhausted(model)) continue;
+    const available = models.filter((id) => !isExhausted(id));
+    if (!available.length) {
+        lastErr = 'all Google models exhausted for today (shared project quota)';
+        _lastGeminiError = lastErr;
+        return { ok: false, error: lastErr };
+    }
+    for (const model of available) {
         try {
             const { res, data, errText } = await generateContent(model, body);
             if (res.status === 429 && isDaily429(res.status, errText)) {
@@ -157,7 +166,9 @@ function failFromGeminiError(err, dataQuery) {
 
 async function runPlainFallback({ message, role, designation, ctx }) {
     const system = buildPlainSystemPrompt({ role, designation, ctx });
-    const models = modelIds(OPERATOR_TEXT_MODELS).filter((id) => !isExhausted(id));
+    const opModels = modelIds(OPERATOR_TEXT_MODELS).filter((id) => !isExhausted(id));
+    const waModels = modelIds(WHATSAPP_MODELS).filter((id) => !isExhausted(id) && !opModels.includes(id));
+    const models = [...opModels, ...waModels];
     const body = {
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: 'user', parts: [{ text: message }] }],
@@ -178,6 +189,20 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
 
     if (!apiKey()) return { ok: false, error: 'no_api_key', retryable: false };
     if (!isUnderQuota('operator')) return { ok: false, error: 'operator_quota_exhausted', retryable: false };
+
+    const msgKind = classifyOperatorMessage(queryText);
+    if (msgKind === 'general') {
+        const staticReply = staticGeneralReply(queryText, ctx);
+        if (staticReply) {
+            return {
+                ok: true,
+                reply: staticReply,
+                model: 'static',
+                toolsCalled: [],
+                static_only: true,
+            };
+        }
+    }
 
     const dataQuery = isDataQuestion(queryText);
     let playbook = null;

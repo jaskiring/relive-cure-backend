@@ -141,9 +141,34 @@ export function checkFounderRoute(message) {
     return { needsFounder: false, kind };
 }
 
+/** Greetings and onboarding — no Gemini required. */
+export function staticGeneralReply(message, ctx = {}) {
+    const t = String(message || '').trim().toLowerCase();
+    if (!t) return null;
+
+    const isGreeting = /^(hi|hello|hey|namaste|good\s+(morning|afternoon|evening))\b/.test(t)
+        || /\b(what can you help|how can you help|what do you do|what are you|who are you)\b/.test(t);
+
+    const isCrmExplain = /\b(what is|what does|how does|explain|tell me about)\b/.test(t)
+        && /\b(crm|dashboard|pulse|analytics|relive|operator|chatbot)\b/.test(t);
+
+    if (!isGreeting && !isCrmExplain) return null;
+
+    const lines = [
+        'I answer live CRM questions from real database counts — never guesses.',
+        'Try: "How many open leads for [name]?" or "leads in Delhi".',
+        'Bugs and feature ideas are sent for admin approval.',
+    ];
+    if (ctx.canAnalytics || ctx.isAdmin) {
+        lines.splice(2, 0, 'Refrens assignee, city, and status filters are supported.');
+    }
+    return lines.join(' ');
+}
+
 export function staticOperatorReply(kind, founderRoute, agentResult) {
     if (kind === 'bug' || kind === 'feature') {
-        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'}. Admin will see it in the Operator inbox (admin login only).`;
+        const label = kind === 'bug' ? 'bug report' : 'feature request';
+        return `Thanks — your ${label} has been sent for approval.`;
     }
     if (agentResult?.ok) return agentResult.reply;
     if (agentResult?.error === 'operator_quota_exhausted') {
@@ -162,6 +187,9 @@ export function staticOperatorReply(kind, founderRoute, agentResult) {
         }
         if (/API key|API_KEY|invalid/i.test(detail)) {
             return 'Operator AI: Gemini API key invalid or missing on Railway (GEMINI_API_KEY).';
+        }
+        if (/all google models exhausted|all models failed/i.test(detail)) {
+            return 'Google Gemini daily limit reached for this model (not your 4200 app cap). Resets UTC midnight — or link billing in AI Studio.';
         }
         return `Operator AI could not reach Gemini (${detail.slice(0, 100) || 'all models failed'}). Tap Retry.`;
     }
