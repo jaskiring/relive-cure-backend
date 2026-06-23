@@ -1,7 +1,5 @@
-/** Who can review founder inbox (bug/feature queue) vs submit only. */
+/** Founder inbox (bug/feature queue) — admin role only. */
 
-export function canReviewFounderInbox(session, tabs = []) {
-    if (!session) return false;
-    if (session.role === 'admin') return true;
-    return (tabs || []).includes('settings');
+export function canReviewFounderInbox(session) {
+    return !!session && session.role === 'admin';
 }

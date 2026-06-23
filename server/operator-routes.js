@@ -4,7 +4,7 @@ import { transcribeOperatorAudio, operatorGeminiStatus } from './operator-gemini
 import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
 import { quotaStatusAll, quotaDashboard, ensureQuotaHydrated, tickRequest } from './agent-quota.js';
-import { canReviewFounderInbox } from './operator-access.js';
+import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
 
 function hasExportPermission(tabs, role) {
     return role === 'admin' || (tabs || []).includes('export_leads');
@@ -31,8 +31,8 @@ async function saveInbox(supabase, row) {
 }
 
 async function inboxTableOk(supabase) {
-    const { error } = await supabase.from('operator_inbox').select('id').limit(1);
-    return !error;
+    const { ok } = await checkOperatorInboxTable(supabase);
+    return ok;
 }
 
 export function registerOperatorRoutes(app, deps) {
@@ -66,47 +66,37 @@ export function registerOperatorRoutes(app, deps) {
             .eq('username', user.username)
             .order('created_at', { ascending: false })
             .limit(limit);
-        if (error) return res.status(500).json({ success: false, error: error.message });
+        if (error) {
+            if (/operator_inbox|does not exist|schema cache/i.test(error.message || '')) {
+                return res.json({ success: true, messages: [], inbox_ready: false });
+            }
+            return res.status(500).json({ success: false, error: error.message });
+        }
         res.json({ success: true, messages: (data || []).reverse() });
     });
 
     app.get('/api/operator/inbox', async (req, res) => {
-        if (!(await requireCrmKey(req, res))) return;
-        const user = req.dashboardUser;
-        const tabs = await getAllowedTabsForUser(user);
+        if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
         const pendingOnly = req.query.pending === '1';
-        const mineOnly = req.query.mine === '1';
-
-        if (mineOnly) {
-            let q = supabaseAdmin
-                .from('operator_inbox')
-                .select('id, username, kind, status, message, transcript, reply, needs_founder, dev_status, created_at')
-                .eq('username', user.username)
-                .eq('needs_founder', true)
-                .order('created_at', { ascending: false })
-                .limit(40);
-            if (pendingOnly) q = q.in('status', ['queued', 'pending']);
-            const { data, error } = await q;
-            if (error) return res.status(500).json({ success: false, error: error.message });
-            return res.json({ success: true, items: data || [], scope: 'mine' });
-        }
-
-        if (!canReviewFounderInbox(user, tabs)) {
-            return res.status(403).json({
-                success: false,
-                error: 'Founder inbox requires admin role or Settings tab access.',
-            });
-        }
 
         let q = supabaseAdmin
             .from('operator_inbox')
             .select('id, username, role, designation, message, transcript, kind, status, reply, needs_founder, dev_status, created_at')
+            .eq('needs_founder', true)
             .order('created_at', { ascending: false })
             .limit(80);
-        if (pendingOnly) q = q.eq('needs_founder', true).in('status', ['queued', 'pending']);
+        if (pendingOnly) q = q.in('status', ['queued', 'pending']);
         const { data, error } = await q;
-        if (error) return res.status(500).json({ success: false, error: error.message });
-        res.json({ success: true, items: data || [], scope: 'founder' });
+        if (error) {
+            const missing = /operator_inbox|does not exist|schema cache/i.test(error.message || '');
+            return res.status(missing ? 503 : 500).json({
+                success: false,
+                error: error.message,
+                inbox_ready: false,
+                migration: missing ? OPERATOR_MIGRATION_SQL : null,
+            });
+        }
+        res.json({ success: true, items: data || [], scope: 'founder', inbox_ready: true });
     });
 
     app.post('/api/operator/transcribe', upload.single('audio'), async (req, res) => {
@@ -207,17 +197,14 @@ export function registerOperatorRoutes(app, deps) {
             quotas: quotaStatusAll(),
             model: agentResult?.model || null,
             tools_called: (agentResult?.toolsCalled || []).map((t) => t.name),
-            retryable: !!agentResult?.retryable || /tap retry|temporarily busy/i.test(reply || ''),
+            retryable: !!agentResult?.retryable
+                || /tap retry|temporarily busy|high demand|could not reach|try again/i.test(reply || ''),
             sql_only: !!agentResult?.sql_only,
         });
     });
 
     app.patch('/api/operator/inbox/:id', async (req, res) => {
-        if (!(await requireCrmKey(req, res))) return;
-        const tabs = await getAllowedTabsForUser(req.dashboardUser);
-        if (!canReviewFounderInbox(req.dashboardUser, tabs)) {
-            return res.status(403).json({ success: false, error: 'Admin or Settings tab required.' });
-        }
+        if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
         const id = parseInt(req.params.id, 10);
         if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'invalid id' });
         const { edited_prompt, dev_status, status } = req.body || {};
@@ -236,11 +223,7 @@ export function registerOperatorRoutes(app, deps) {
     });
 
     app.post('/api/operator/inbox/:id/approve-dev', async (req, res) => {
-        if (!(await requireCrmKey(req, res))) return;
-        const tabs = await getAllowedTabsForUser(req.dashboardUser);
-        if (!canReviewFounderInbox(req.dashboardUser, tabs)) {
-            return res.status(403).json({ success: false, error: 'Admin or Settings tab required.' });
-        }
+        if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
         const id = parseInt(req.params.id, 10);
         if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'invalid id' });
         const edited = String(req.body?.edited_prompt || '').trim();
@@ -272,11 +255,7 @@ export function registerOperatorRoutes(app, deps) {
     });
 
     app.post('/api/operator/inbox/:id/reject', async (req, res) => {
-        if (!(await requireCrmKey(req, res))) return;
-        const tabs = await getAllowedTabsForUser(req.dashboardUser);
-        if (!canReviewFounderInbox(req.dashboardUser, tabs)) {
-            return res.status(403).json({ success: false, error: 'Admin or Settings tab required.' });
-        }
+        if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
         const id = parseInt(req.params.id, 10);
         if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'invalid id' });
         const note = String(req.body?.note || '').trim();
@@ -312,4 +291,5 @@ export function registerOperatorRoutes(app, deps) {
     });
 
     console.log('[OPERATOR] routes registered (/api/operator/*)');
+    warnIfOperatorInboxMissing(supabaseAdmin).catch(() => {});
 }
