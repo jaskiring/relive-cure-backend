@@ -2141,7 +2141,7 @@ app.post('/chat', async (req, res) => {
 });
 
 registerBotLabRoutes(app, {
-    CRM_API_KEY,
+    requireCrmKey,
     handleIncomingMessage,
     getBotSessions: () => botSessions,
     schedulePersist,

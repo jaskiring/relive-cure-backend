@@ -183,10 +183,10 @@ export async function deleteLabSession(phone, { botSessions, schedulePersist, su
 }
 
 export function registerBotLabRoutes(app, deps) {
-    const { CRM_API_KEY, handleIncomingMessage, getBotSessions, schedulePersist, supabaseAdmin, sendToAPI } = deps;
+    const { requireCrmKey, handleIncomingMessage, getBotSessions, schedulePersist, supabaseAdmin, sendToAPI } = deps;
 
-    const auth = (req, res, next) => {
-        if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const auth = async (req, res, next) => {
+        if (!(await requireCrmKey(req, res, { tab: 'botlab' }))) return;
         next();
     };
 
