@@ -18,6 +18,11 @@ const NAME_BLACKLIST = new Set([
     'skip', 'next', 'continue', 'hello', 'hi', 'hey', 'theek', 'accha', 'achha', 'thik', 'lasik', 'surgery', 'good', 'fine',
     'kya', 'kaise', 'kab', 'kahan', 'kyu', 'kyon', 'kyun', 'kahaan', 'kab tak', 'kaisa',
     'what', 'how', 'where', 'when', 'why', 'who', 'which',
+    'now', 'kal', 'aaj', 'parso',
+    'not', 'in', 'koi', 'kuch', 'dost', 'yaar', 'kuchbhi',
+    'mujhe', 'shyad', 'shayad', 'lagta', 'lagti', 'soch', 'think',
+    'paisa', 'paise', 'rupay', 'rupee', 'rupees', 'rs', 'kharcha', 'kimat', 'keemat', 'daam', 'dam',
+    'kitna', 'kitne', 'lagega', 'lgega', 'book', 'krdo', 'kardo',
 ]);
 const MEDICAL_BLACKLIST = new Set([
     'lipoma', 'cancer', 'motiyabind', 'cataract', 'tumor', 'tumour',
@@ -32,6 +37,7 @@ const COMMON_WORD_BLACKLIST = new Set([
     'mr', 'mrs', 'miss', 'sir', 'madam', 'dear', 'bhai', 'bhaiya',
     'didi', 'ji', 'sahab', 'sahib', 'love', 'thanks', 'thank',
     'please', 'location', 'rate', 'price', 'cost', 'address',
+    'paisa', 'paise', 'rupay', 'rupee', 'rupees', 'kharcha', 'kimat', 'keemat', 'daam',
     'number', 'glass', 'glasses', 'lens', 'lenses', 'specs',
     'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
     'specs removal', 'option', 'options', 'checking',
@@ -178,6 +184,8 @@ test('A', '"Location" (common word)', isValidName('Location'), false);
 test('A', '"Rate" (common word)', isValidName('Rate'), false);
 test('A', '"Glass" (common word)', isValidName('Glass'), false);
 test('A', '"Cost" (common word)', isValidName('Cost'), false);
+test('A', '"Paisa" (Hindi money word, not a name)', isValidName('Paisa'), false);
+test('A', '"Paise" (Hindi money word)', isValidName('Paise'), false);
 test('A', '"Lasik" (intent word)', isValidName('Lasik'), false);
 test('A', '"Cataract" (medical term)', isValidName('Cataract'), false);
 test('A', '"Hernia" (medical term)', isValidName('Hernia'), false);

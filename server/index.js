@@ -863,6 +863,9 @@ const NAME_BLACKLIST = new Set([
     // Hinglish fillers found as names in real data
     'not', 'in', 'koi', 'kuch', 'dost', 'yaar', 'kuchbhi',
     'mujhe', 'shyad', 'shayad', 'lagta', 'lagti', 'soch', 'think',
+    // Hindi money/cost words — mis-extracted as names ("paisa kitna lgega")
+    'paisa', 'paise', 'rupay', 'rupee', 'rupees', 'rs', 'kharcha', 'kimat', 'keemat', 'daam', 'dam',
+    'kitna', 'kitne', 'lagega', 'lgega', 'book', 'krdo', 'kardo',
 ]);
 
 // ─── SAFETY NET: Medical + common word blacklists ────────────────────────────
@@ -879,6 +882,7 @@ const COMMON_WORD_BLACKLIST = new Set([
     'mr', 'mrs', 'miss', 'sir', 'madam', 'dear', 'bhai', 'bhaiya',
     'didi', 'ji', 'sahab', 'sahib', 'love', 'thanks', 'thank',
     'please', 'location', 'rate', 'price', 'cost', 'address',
+    'paisa', 'paise', 'rupay', 'rupee', 'rupees', 'kharcha', 'kimat', 'keemat', 'daam',
     'number', 'glass', 'glasses', 'lens', 'lenses', 'specs',
     'but', 'and', 'or', 'the', 'was', 'is', 'are', 'it', 'its',
     'from', 'to', 'with', 'for', 'about', 'into', 'on', 'at', 'by',
@@ -1013,6 +1017,9 @@ function sanitizeSessionFields(session) {
         d.city = null;
         d.resumeAsked = (d.resumeAsked || []).filter(f => f !== 'CITY');
         if (d.lastAskedField === 'CITY') d.lastAskedField = null;
+    }
+    if (d.contactName && d.contactName !== 'WhatsApp Lead' && !isValidName(d.contactName)) {
+        d.contactName = 'WhatsApp Lead';
     }
 }
 
@@ -1679,7 +1686,8 @@ async function sendWhatsAppReply(phone, reply) {
 // the rule-based machine.
 function applyAgentExtract(session, ag) {
     const d = session.data;
-    if (ag.name && typeof ag.name === 'string') {
+    const costIntent = ag.asks_cost || ag.asks_recovery || ag.asks_pain || ag.asks_safety;
+    if (ag.name && typeof ag.name === 'string' && !costIntent) {
         const nm = ag.name.trim();
         if (isIndianCity(nm)) {
             if (!d.city) d.city = titleCaseCity(nm.split(/[,\s]+/)[0]);
