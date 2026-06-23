@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractAssigneeName, detectStatusFilter, classifyOperatorMessage } from './operator-tools.js';
+import {
+    extractAssigneeName,
+    detectStatusFilter,
+    classifyOperatorMessage,
+    checkFounderRoute,
+} from './operator-tools.js';
+import { suggestToolsForMessage, getOperatorToolDeclarations } from './operator-playbooks.js';
+import { buildOperatorContext } from './operator-tools.js';
 
 test('extractAssigneeName from assigned-to phrasing', () => {
     assert.equal(
@@ -30,4 +37,22 @@ test('classifyOperatorMessage routes product feedback to feature', () => {
     assert.equal(classifyOperatorMessage(msg), 'feature');
     assert.equal(classifyOperatorMessage('how many leads assigned to khushi are there?'), 'data');
     assert.equal(classifyOperatorMessage('the bot said wrong power for a customer'), 'bug');
+});
+
+test('general CRM questions are not data queries', () => {
+    assert.equal(classifyOperatorMessage('what does this crm do ?'), 'general');
+    assert.equal(checkFounderRoute('what does this crm do ?').needsFounder, false);
+});
+
+test('suggestToolsForMessage hints crm_overview for generic asks', () => {
+    const hints = suggestToolsForMessage('what does this crm do?');
+    assert.ok(hints.includes('crm_overview'));
+});
+
+test('tool declarations respect analytics RBAC', () => {
+    const admin = buildOperatorContext('admin', ['analytics', 'chatbot'], {});
+    const limited = buildOperatorContext('limited', ['chatbot'], {});
+    assert.ok(getOperatorToolDeclarations(admin).some((t) => t.name === 'count_refrens_by_assignee'));
+    assert.ok(!getOperatorToolDeclarations(limited).some((t) => t.name === 'count_refrens_by_assignee'));
+    assert.ok(getOperatorToolDeclarations(limited).some((t) => t.name === 'crm_overview'));
 });

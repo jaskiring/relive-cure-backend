@@ -74,17 +74,17 @@ export const WHATSAPP_MODELS = [
     },
 ];
 
-/** @type {GeminiModelSpec[]} CRM Operator text — operator-gemini.js (no flash-lite/flash) */
+/** @type {GeminiModelSpec[]} CRM Operator text — operator-agent.js (function calling) */
 export const OPERATOR_TEXT_MODELS = [
     {
-        id: 'gemini-2.0-flash',
-        label: 'Flash 2.0',
+        id: 'gemini-2.5-flash',
+        label: 'Flash 2.5',
         provider: 'gemini',
         api: 'generateContent',
         generate_rpd: 1500,
         rpm: 15,
         tpm_in: 1_000_000,
-        notes: 'Operator primary. DEPRECATED model — plan migration to 2.5-flash or 3.x.',
+        notes: 'Operator primary — function calling. Same Google project as WA; separate app quota counter.',
     },
     {
         id: 'gemini-2.0-flash-lite',
@@ -104,7 +104,7 @@ export const OPERATOR_TEXT_MODELS = [
         generate_rpd: 1500,
         rpm: 15,
         tpm_in: 1_000_000,
-        notes: 'Shared with WA last resort — only if Google pool not exhausted.',
+        notes: 'Last resort — may not support tools; plain text only.',
     },
 ];
 

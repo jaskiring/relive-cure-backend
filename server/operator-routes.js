@@ -1,7 +1,8 @@
 // CRM Operator API — staff chat, voice transcribe, founder inbox (separate Gemini quotas).
 
-import { transcribeOperatorAudio, runOperatorChat, operatorGeminiStatus } from './operator-gemini.js';
-import { runOperatorTools, staticOperatorReply, classifyOperatorMessage, buildOperatorContext } from './operator-tools.js';
+import { transcribeOperatorAudio, operatorGeminiStatus } from './operator-gemini.js';
+import { runOperatorAgent } from './operator-agent.js';
+import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
 import { quotaStatusAll, quotaDashboard } from './agent-quota.js';
 
 function hasExportPermission(tabs, role) {
@@ -101,24 +102,28 @@ export function registerOperatorRoutes(app, deps) {
             canExport: hasExportPermission(tabs, user.role),
         });
 
-        const toolResult = await runOperatorTools(text, ctx, supabaseAdmin, {
-            username: user.username,
-            designation: designation || user.designation || null,
-        });
+        const founderRoute = checkFounderRoute(text);
 
-        const kind = toolResult.needsFounder ? toolResult.kind : classifyOperatorMessage(text);
-        let llmResult = null;
-        if (!toolResult.needsFounder) {
-            llmResult = await runOperatorChat({
+        let agentResult = null;
+        if (!founderRoute.needsFounder) {
+            agentResult = await runOperatorAgent({
                 message: text,
-                toolContext: toolResult.toolContext,
                 role: user.role,
-                designation,
+                designation: designation || user.designation || null,
+                ctx,
+                supabase: supabaseAdmin,
+                user: {
+                    username: user.username,
+                    designation: designation || user.designation || null,
+                },
             });
         }
 
-        const reply = staticOperatorReply(kind, toolResult, llmResult);
-        const status = toolResult.needsFounder ? 'queued' : (llmResult?.ok || toolResult.data?.length ? 'answered' : 'limited');
+        const kind = founderRoute.kind;
+        const reply = staticOperatorReply(kind, founderRoute, agentResult);
+        const status = founderRoute.needsFounder
+            ? 'queued'
+            : (agentResult?.ok ? 'answered' : 'limited');
 
         const saved = await saveInbox(supabaseAdmin, {
             username: user.username,
@@ -129,12 +134,16 @@ export function registerOperatorRoutes(app, deps) {
             kind,
             status,
             reply,
-            tool_data: { toolContext: toolResult.toolContext, model: llmResult?.model || null },
-            model_used: llmResult?.model || null,
-            needs_founder: toolResult.needsFounder,
+            tool_data: {
+                tools_called: agentResult?.toolsCalled || [],
+                model: agentResult?.model || null,
+                agent_error: agentResult?.error || null,
+            },
+            model_used: agentResult?.model || null,
+            needs_founder: founderRoute.needsFounder,
         });
 
-        if (toolResult.needsFounder && isPushConfigured?.()) {
+        if (founderRoute.needsFounder && isPushConfigured?.()) {
             fanout(supabaseAdmin, {
                 title: kind === 'bug' ? '🐛 Operator bug report' : '💡 Operator feature request',
                 body: `${user.username}: ${text.slice(0, 80)}`,
@@ -148,8 +157,10 @@ export function registerOperatorRoutes(app, deps) {
             reply,
             inbox_id: saved.id,
             kind,
-            needs_founder: toolResult.needsFounder,
+            needs_founder: founderRoute.needsFounder,
             quotas: quotaStatusAll(),
+            model: agentResult?.model || null,
+            tools_called: (agentResult?.toolsCalled || []).map((t) => t.name),
         });
     });
 
