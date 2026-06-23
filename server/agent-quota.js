@@ -32,7 +32,7 @@ function emptyBucket() {
 
 let _mem = { date: null, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
 let _writeTimer = null;
-let _bootHydrated = false;
+let _hydrateOk = false;
 let _testCap = null;
 let _testCapByChannel = null;
 let _supabase = null;
@@ -83,27 +83,18 @@ function _setCapForChannelTest(channel, n) {
 function resetForTest() {
     _mem = { date: _today(), whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
     _writeTimer = null;
-    _bootHydrated = true;
+    _hydrateOk = true;
     _dailyExhausted.clear();
 }
 
-function _bucket(channel) {
-    const ch = _normChannel(channel);
-    if (!_mem[ch]) _mem[ch] = emptyBucket();
-    return _mem[ch];
-}
-
-function _rollDateIfNeeded() {
-    const d = _today();
-    if (_mem.date !== d) {
-        _mem = { date: d, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
-        _dailyExhausted.clear();
-    }
+/** Load today's counters from Supabase (retries until first success). */
+export async function ensureQuotaHydrated() {
+    if (_hydrateOk) return;
+    await hydrateQuota();
 }
 
 export async function hydrateQuota() {
-    if (_bootHydrated) return;
-    _bootHydrated = true;
+    if (_hydrateOk) return;
     try {
         const today = _today();
         const db = await _db();
@@ -113,7 +104,7 @@ export async function hydrateQuota() {
             .eq('date', today)
             .maybeSingle();
         if (error) {
-            console.warn('[AGENT-QUOTA] hydrate failed:', error.message);
+            console.warn('[AGENT-QUOTA] hydrate failed:', error.message, '— run migrations/alter_agent_quota_channels.sql if columns missing');
             return;
         }
         if (data) {
@@ -144,12 +135,28 @@ export async function hydrateQuota() {
                     tokens_total: data.transcribe_tokens_total || 0,
                 },
             };
-            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → WA ${_mem.whatsapp.count}/${_cap('whatsapp')} · OP ${_mem.operator.count}/${_cap('operator')} · TX ${_mem.operator_transcribe.count}/${_cap('operator_transcribe')}`);
+            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → WA ${_mem.whatsapp.count}/${_cap('whatsapp')} · OP ${_mem.operator.count}/${_cap('operator')} · TX ${_mem.operator_transcribe.count}`);
         } else {
             _mem = { date: today, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
         }
+        _hydrateOk = true;
     } catch (e) {
         console.warn('[AGENT-QUOTA] hydrate error:', e.message);
+    }
+}
+
+function _bucket(channel) {
+    const ch = _normChannel(channel);
+    if (!_mem[ch]) _mem[ch] = emptyBucket();
+    return _mem[ch];
+}
+
+function _rollDateIfNeeded() {
+    const d = _today();
+    if (_mem.date !== d) {
+        _mem = { date: d, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
+        _dailyExhausted.clear();
+        _hydrateOk = false;
     }
 }
 

@@ -25,7 +25,7 @@ import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { registerOperatorRoutes } from './operator-routes.js';
 import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
-import { hydrateQuota, isUnderQuota, quotaStatus, quotaStatusAll, quotaDashboard } from './agent-quota.js';
+import { hydrateQuota, ensureQuotaHydrated, isUnderQuota, quotaStatus, quotaStatusAll, quotaDashboard } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
@@ -82,7 +82,7 @@ app.post('/api/agent/mode', async (req, res) => {
 // Persisted Gemini credit counter (Supabase agent_quota) — source of truth for the dashboard.
 app.get('/api/agent/quota', async (req, res) => {
     try {
-        await hydrateQuota();
+        await ensureQuotaHydrated();
         const status = agentStatus();
         const dashboard = quotaDashboard();
         const q = dashboard.channels.whatsapp;

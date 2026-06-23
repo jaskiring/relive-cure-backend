@@ -1,9 +1,9 @@
 // CRM Operator API — staff chat, voice transcribe, founder inbox (separate Gemini quotas).
 
 import { transcribeOperatorAudio, operatorGeminiStatus } from './operator-gemini.js';
-import { runOperatorAgent } from './operator-agent.js';
+import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
-import { quotaStatusAll, quotaDashboard } from './agent-quota.js';
+import { quotaStatusAll, quotaDashboard, ensureQuotaHydrated } from './agent-quota.js';
 
 function hasExportPermission(tabs, role) {
     return role === 'admin' || (tabs || []).includes('export_leads');
@@ -37,6 +37,7 @@ export function registerOperatorRoutes(app, deps) {
 
     app.get('/api/operator/quota', async (req, res) => {
         if (!(await requireCrmKey(req, res))) return;
+        await ensureQuotaHydrated();
         res.json({
             success: true,
             quotas: quotaStatusAll(),
@@ -243,6 +244,7 @@ export function registerOperatorRoutes(app, deps) {
             worker_online: process.env.OPERATOR_WORKER_ONLINE === '1',
             docs: 'docs/OPERATOR_DEV.md',
             quota: quotaDashboard(),
+            last_gemini_error: operatorLastGeminiError(),
         });
     });
 

@@ -91,7 +91,14 @@ export function staticOperatorReply(kind, founderRoute, agentResult) {
         return 'Operator AI is not configured on the server (GEMINI_API_KEY missing).';
     }
     if (agentResult?.error === 'operator_llm_failed') {
-        return 'Operator AI could not reach Gemini right now — all models busy or rate-limited. Try again in a minute.';
+        const detail = agentResult.detail || '';
+        if (/429|rate|quota|RESOURCE_EXHAUSTED|exhausted/i.test(detail)) {
+            return 'Google Gemini daily rate limit hit for operator models. Resets at UTC midnight — or link billing in AI Studio.';
+        }
+        if (/API key|API_KEY|invalid/i.test(detail)) {
+            return 'Operator AI: Gemini API key invalid or missing on Railway (GEMINI_API_KEY).';
+        }
+        return `Operator AI could not reach Gemini (${detail.slice(0, 100) || 'all models failed'}). Try again in a minute.`;
     }
     return 'I could not generate a reply right now. Try again or rephrase your question.';
 }
