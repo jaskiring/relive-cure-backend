@@ -1,14 +1,22 @@
 // Role-aware data tools for CRM Operator (no LLM).
 
-const BUG_PATTERNS = /\b(bug|broken|wrong|galat|not working|fix|issue|error|bot said|chatbot|mirror)\b/i;
-const FEATURE_PATTERNS = /\b(feature|add|new tab|can we have|request|improvement|suggestion)\b/i;
+const BUG_PATTERNS = /\b(bug|broken|wrong|galat|not working|doesn'?t work|fix|issue|error|bot said|chatbot|mirror|crash|stuck)\b/i;
+const FEATURE_PATTERNS = /\b(feature|add|new tab|can we have|request|improvement|suggestion|enhancement|build|ship)\b/i;
+const FEEDBACK_PATTERNS = /\b(should have|should be|there should|need more|needs more|want more|would be better|please add|we need|more detail|more analysis|more recommend|improve the|upgrade the|better if|missing in)\b/i;
+const CRM_TAB_WORDS = /\b(marketing|analytics|pulse|chatbot|bot\s*lab|whatsapp|inbox|settings|dashboard|crm|operator|organic)\b/i;
+const DATA_QUERY_PATTERNS = /\b(how many|count|kitne|total|number of|find|lookup|search|show me|list|which|who has|assigned to)\b/i;
 
 export function classifyOperatorMessage(text) {
     const t = String(text || '').trim();
     if (BUG_PATTERNS.test(t)) return 'bug';
     if (FEATURE_PATTERNS.test(t)) return 'feature';
-    if (/\b(how many|count|kitne|total|hot lead|today)\b/i.test(t)) return 'data';
-    if (/\b(lead|phone|\+91|thread|whatsapp|inbox|assignee|assigned)\b/i.test(t)) return 'data';
+    if (FEEDBACK_PATTERNS.test(t)) return 'feature';
+    if (CRM_TAB_WORDS.test(t) && /\b(more|better|improve|detail|analysis|recommend|change|update)\b/i.test(t)) return 'feature';
+    if (DATA_QUERY_PATTERNS.test(t)) return 'data';
+    if (/\b(hot lead|today)\b/i.test(t) && /\b(how many|count|kitne)\b/i.test(t)) return 'data';
+    if (/\b(assignee|assigned)\b/i.test(t)) return 'data';
+    if (/\b(\+91|\d{10})\b/.test(t)) return 'data';
+    if (/\b(lead|phone|thread|whatsapp|inbox)\b/i.test(t) && /\?/.test(t)) return 'data';
     return 'general';
 }
 
@@ -222,7 +230,7 @@ export async function runOperatorTools(message, ctx, supabase, user = {}) {
 
 export function staticOperatorReply(kind, toolResult, llmResult) {
     if (kind === 'bug' || kind === 'feature') {
-        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} for Jas. You'll be updated after review.`;
+        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} for Jas (Founder inbox). You'll be updated after review.`;
     }
     if (llmResult?.ok) return llmResult.reply;
     if (toolResult?.data?.length) return toolResult.data.join('\n');

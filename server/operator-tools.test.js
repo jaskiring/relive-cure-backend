@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractAssigneeName, detectStatusFilter } from './operator-tools.js';
+import { extractAssigneeName, detectStatusFilter, classifyOperatorMessage } from './operator-tools.js';
 
 test('extractAssigneeName from assigned-to phrasing', () => {
     assert.equal(
@@ -23,4 +23,11 @@ test('detectStatusFilter', () => {
     assert.equal(detectStatusFilter('lost leads for rahul'), 'lost');
     assert.equal(detectStatusFilter('converted deals'), 'converted');
     assert.equal(detectStatusFilter('how many total'), null);
+});
+
+test('classifyOperatorMessage routes product feedback to feature', () => {
+    const msg = 'In the marketing leads there should be more detail, more analysis and more recommendations.';
+    assert.equal(classifyOperatorMessage(msg), 'feature');
+    assert.equal(classifyOperatorMessage('how many leads assigned to khushi are there?'), 'data');
+    assert.equal(classifyOperatorMessage('the bot said wrong power for a customer'), 'bug');
 });
