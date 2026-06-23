@@ -344,4 +344,4 @@ async function _flush() {
     }
 }
 
-export { _setCapForTest, _setCapForChannelTest, resetForTest };
+export { _setCapForTest, _setCapForChannelTest, resetForTest, flushQuota };

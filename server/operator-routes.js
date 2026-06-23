@@ -3,7 +3,7 @@
 import { transcribeOperatorAudio, operatorGeminiStatus } from './operator-gemini.js';
 import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
-import { quotaStatusAll, quotaDashboard, ensureQuotaHydrated, tickRequest } from './agent-quota.js';
+import { quotaStatusAll, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
 import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
 
 function hasExportPermission(tabs, role) {
@@ -109,7 +109,13 @@ export function registerOperatorRoutes(app, deps) {
         if (!result.ok) {
             return res.status(503).json({ success: false, error: result.error });
         }
-        res.json({ success: true, transcript: result.transcript, model: result.model });
+        await flushQuota();
+        res.json({
+            success: true,
+            transcript: result.transcript,
+            model: result.model,
+            quotas: quotaStatusAll(),
+        });
     });
 
     app.post('/api/operator/chat', async (req, res) => {
@@ -176,6 +182,7 @@ export function registerOperatorRoutes(app, deps) {
         // Count every operator chat (SQL playbook + Gemini + founder queue) toward operator quota.
         await ensureQuotaHydrated();
         tickRequest('operator');
+        await flushQuota();
 
         if (founderRoute.needsFounder && isPushConfigured?.()) {
             fanout(supabaseAdmin, {
