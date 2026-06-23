@@ -68,6 +68,26 @@ function isValidName(str) {
     return trimmed.split(/\s+/).some(w => w.length >= 2);
 }
 
+function parseEyePower(message) {
+    if (!message || typeof message !== 'string') return { raw: message, parsed: null, numeric: null, confidence: 'low' };
+    const m = message.trim();
+    function pairResult(raw, right, left) {
+        if (right > 0 && !String(right).includes('+')) right = -right;
+        if (left > 0 && !String(left).includes('+')) left = -left;
+        const avg = (Math.abs(right) + Math.abs(left)) / 2;
+        return { raw, parsed: `R:${right} L:${left}`, numeric: -avg, confidence: 'high', right, left };
+    }
+    const numLeftRightMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+left\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+right\b/i);
+    if (numLeftRightMatch) return pairResult(m, parseFloat(numLeftRightMatch[2]), parseFloat(numLeftRightMatch[1]));
+    const numRightLeftMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+right\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+left\b/i);
+    if (numRightLeftMatch) return pairResult(m, parseFloat(numRightLeftMatch[1]), parseFloat(numRightLeftMatch[2]));
+    const match = m.match(/[-+]?\d+(\.\d+)?/);
+    if (!match) return { raw: m, parsed: null, numeric: null, confidence: 'low' };
+    let n = parseFloat(match[0]);
+    if (n > 0 && !m.includes('+')) n = -n;
+    return { raw: m, parsed: match[0], numeric: n, confidence: 'medium', single: n };
+}
+
 const DISENGAGE_TRIGGERS = [
     'bye', 'bye bye', 'good bye', 'goodbye', 'block', 'i block you',
     'stop', 'bakwas band', 'bar bar', 'good night', 'so jao', 'ruko',
@@ -462,6 +482,20 @@ test('M', '"Lasik surgery main konsa insurance lagta hai" NOT off-topic', isOffT
 test('M', '"Location send me" NOT disengagement', isDisengaged('Location send me'), false);
 test('M', '"You call me" NOT disengagement', isDisengaged('You call me'), false);
 test('M', '"Ap k Name kya h" NOT disengagement', isDisengaged('Ap k Name kya h'), false);
+
+// ─── SUITE N: Eye power parsing ─────────────────────────────────────────────
+console.log('\n━━━ SUITE N: Eye Power Parsing ━━━');
+
+const jasPower = parseEyePower('i am jas and power is -5 left and -7 right');
+test('N', 'jas message → R:-7 L:-5', jasPower.parsed, 'R:-7 L:-5');
+test('N', 'jas message → left -5', jasPower.left, -5);
+test('N', 'jas message → right -7', jasPower.right, -7);
+
+const revPower = parseEyePower('-7 right and -5 left');
+test('N', 'reverse order → R:-7 L:-5', revPower.parsed, 'R:-7 L:-5');
+
+const singlePower = parseEyePower('power is -4.5');
+test('N', 'single eye still works', singlePower.numeric, -4.5);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 4. FINAL REPORT

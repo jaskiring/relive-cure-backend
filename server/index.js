@@ -682,6 +682,20 @@ function parseEyePower(message) {
     if (!message || typeof message !== 'string') return { raw: message, parsed: null, numeric: null, confidence: 'low' };
     const m = message.trim();
 
+    function pairResult(raw, right, left) {
+        if (right > 0 && !String(right).includes('+')) right = -right;
+        if (left > 0 && !String(left).includes('+')) left = -left;
+        const avg = (Math.abs(right) + Math.abs(left)) / 2;
+        return {
+            raw,
+            parsed: `R:${right} L:${left}`,
+            numeric: -avg,
+            confidence: 'high',
+            right,
+            left,
+        };
+    }
+
     // Handle structured format from agent: "R:-4 L:-5" or "L:-5 R:-6"
     const structMatch = m.match(/[Rr]\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
     if (structMatch) {
@@ -731,16 +745,22 @@ function parseEyePower(message) {
         return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
     }
 
-    // Handle "left -5 right -6" or "left eye 5 right eye 6"
-    const lrMatch = m.match(/left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*[,\s]+right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
+    // Handle "left -5 right -6" or "left eye 5 right eye 6" (optional "and")
+    const lrMatch = m.match(/left\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)\s*(?:,\s*|\s+and\s+|\s+)right\s*(?:eye\s*)?([+-]?\d+(?:\.\d+)?)/i);
     if (lrMatch) {
-        let l = parseFloat(lrMatch[1]);
-        let r = parseFloat(lrMatch[2]);
-        if (r > 0) r = -r;
-        if (l > 0) l = -l;
-        const avg = (Math.abs(r) + Math.abs(l)) / 2;
-        const numeric = -avg;
-        return { raw: m, parsed: `R:${r} L:${l}`, numeric, confidence: 'high', right: r, left: l };
+        return pairResult(m, parseFloat(lrMatch[2]), parseFloat(lrMatch[1]));
+    }
+
+    // Handle "-5 left and -7 right" / "power is -5 left and -7 right"
+    const numLeftRightMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+left\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+right\b/i);
+    if (numLeftRightMatch) {
+        return pairResult(m, parseFloat(numLeftRightMatch[2]), parseFloat(numLeftRightMatch[1]));
+    }
+
+    // Handle "-7 right and -5 left"
+    const numRightLeftMatch = m.match(/([+-]?\d+(?:\.\d+)?)\s+right\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+left\b/i);
+    if (numRightLeftMatch) {
+        return pairResult(m, parseFloat(numRightLeftMatch[1]), parseFloat(numRightLeftMatch[2]));
     }
 
     // Handle "both eyes same" or just a single number
@@ -1162,10 +1182,6 @@ function composeAgentReply(session, message, msgLow) {
         if (kbDone) return kbDone;
         const ack = getAcknowledgement(message, lang);
         return ack ? `${ack}\n\n${getRandomCompleteReply(lang)}` : getRandomCompleteReply(lang);
-    }
-
-    if (!session.data.powerStability && getEyePowerNumeric(session.data.eyePower) !== null && getEyePowerNumeric(session.data.eyePower) <= -5) {
-        session.data.powerStability = message;
     }
 
     if (shouldOfferCallback(session) && fieldCollected(session, 'INSURANCE')) {
@@ -2084,7 +2100,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         }
 
         else if (state === 'CORE_CONSULT') {
-            if (!session.data.powerStability && getEyePowerNumeric(session.data.eyePower) !== null && getEyePowerNumeric(session.data.eyePower) <= -5) session.data.powerStability = message;
+            if (!session.data.powerStability && session.data.lastAskedField === 'POWER_STABILITY') {
+                const stab = message.trim();
+                if (stab.length >= 1 && stab.length <= 80) session.data.powerStability = stab;
+            }
 
             // ─── SAFETY: Handle "no lens" clarification ───
             if (session.data._noLensStated && session.data.lastAskedField === 'EYE_POWER') {

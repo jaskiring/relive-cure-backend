@@ -44,16 +44,27 @@ function normalizeCityAlias(s) {
 
 function parseEyePower(message) {
     const m = String(message || '').trim();
+    function pairResult(raw, right, left) {
+        if (right > 0 && !String(right).includes('+')) right = -right;
+        if (left > 0 && !String(left).includes('+')) left = -left;
+        return { parsed: `R:${right} L:${left}`, numeric: -((Math.abs(right) + Math.abs(left)) / 2), right, left };
+    }
     const structMatch = m.match(/[Rr]\s*:\s*([+-]?\d+(?:\.\d+)?)\s+[Ll]\s*:\s*([+-]?\d+(?:\.\d+)?)/);
     if (structMatch) {
         const r = parseFloat(structMatch[1]); const l = parseFloat(structMatch[2]);
-        return { parsed: m, numeric: -((Math.abs(r) + Math.abs(l)) / 2), right: r, left: l };
+        return pairResult(m, r, l);
     }
     const numRl = m.match(/([+-]?\d+(?:\.\d+)?)\s+right\b.*?([+-]?\d+(?:\.\d+)?)\s+left\b/i);
     if (numRl) {
-        let r = parseFloat(numRl[1]); let l = parseFloat(numRl[2]);
-        if (r > 0) r = -r; if (l > 0) l = -l;
-        return { parsed: `R:${r} L:${l}`, numeric: -((Math.abs(r) + Math.abs(l)) / 2), right: r, left: l };
+        return pairResult(m, parseFloat(numRl[1]), parseFloat(numRl[2]));
+    }
+    const numLeftRight = m.match(/([+-]?\d+(?:\.\d+)?)\s+left\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+right\b/i);
+    if (numLeftRight) {
+        return pairResult(m, parseFloat(numLeftRight[2]), parseFloat(numLeftRight[1]));
+    }
+    const numRightLeft = m.match(/([+-]?\d+(?:\.\d+)?)\s+right\b(?:\s+and)?\s*([+-]?\d+(?:\.\d+)?)\s+left\b/i);
+    if (numRightLeft) {
+        return pairResult(m, parseFloat(numRightLeft[1]), parseFloat(numRightLeft[2]));
     }
     const match = m.match(/[-+]?\d+(\.\d+)?/);
     if (!match) return null;
