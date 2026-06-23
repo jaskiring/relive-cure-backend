@@ -162,6 +162,8 @@ export function registerOperatorRoutes(app, deps) {
             quotas: quotaStatusAll(),
             model: agentResult?.model || null,
             tools_called: (agentResult?.toolsCalled || []).map((t) => t.name),
+            retryable: !!agentResult?.retryable || /tap retry|temporarily busy/i.test(reply || ''),
+            sql_only: !!agentResult?.sql_only,
         });
     });
 

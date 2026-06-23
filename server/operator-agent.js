@@ -4,11 +4,18 @@ import { isUnderQuota, tickRequest, tickFallback, tickTokens, ensureQuotaHydrate
 import { OPERATOR_TEXT_MODELS, modelIds } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted } from './gemini-model-health.js';
 import { getOperatorToolDeclarations, executeOperatorTool, suggestToolsForMessage } from './operator-playbooks.js';
+import {
+    isDataQuestion,
+    runDataPlaybook,
+    formatDataPlaybookReply,
+    playbookHasUsableData,
+    isGoogleDailyLimit,
+    isGoogleTransientLimit,
+} from './operator-data.js';
 
 const TIMEOUT_MS = 18000;
 const MAX_TOOL_TURNS = 4;
 
-/** Last Gemini API error (for /api/operator/status debugging). */
 let _lastGeminiError = null;
 
 export function operatorLastGeminiError() {
@@ -76,29 +83,27 @@ function extractFunctionCalls(data) {
 }
 
 function buildSystemPrompt({ role, designation, ctx, toolNames }) {
-    return `You are Relive Cure CRM Operator — internal AI assistant for LASIK clinic staff.
+    return `You are Relive Cure CRM Operator — internal assistant for LASIK clinic staff.
 
 Staff role: ${role}${designation ? ` (${designation})` : ''}.
 Allowed tabs: ${(ctx.tabs || []).join(', ') || 'limited'}.
 
 You have tools to fetch live CRM data. ALWAYS use tools for counts, lookups, and pipeline questions — never guess numbers.
 For general questions ("what does this CRM do", "what is Pulse", onboarding), call crm_overview or user_access_summary, then answer in plain language.
-For unclear asks, call crm_overview first or ask one short clarifying question — do not dump a raw tab list.
 
 Available tools: ${toolNames.join(', ') || 'none (permissions limited)'}.
 
 Rules:
 - Plain text, no markdown, max 5 short sentences unless listing lead details.
-- Quote exact counts from tool results.
-- Prefer refrens_leads (Analytics) for assignee/pipeline questions; leads_surgery for WhatsApp bot.
-- Never invent phone numbers, lead counts, or data the user's role cannot access.`;
+- Quote exact counts from tool results only.
+- Prefer refrens_leads (Analytics) for assignee/pipeline questions.
+- Never invent lead counts.`;
 }
 
 function buildPlainSystemPrompt({ role, designation, ctx }) {
     return `You are Relive Cure CRM Operator for Relive Cure LASIK clinic staff.
 Role: ${role}${designation ? ` (${designation})` : ''}. Tabs: ${(ctx.tabs || []).join(', ') || 'limited'}.
-Answer helpfully in plain text (no markdown). For CRM overview: Pulse=today flow, Chatbot=WA leads, Analytics=Refrens pipeline, Marketing=Meta ads, Bot Lab=sandbox.
-You can chat briefly; for live lead counts ask them to phrase a data question.`;
+Answer briefly in plain text. Do NOT invent lead counts or assignee statistics — say you need a data tool for those.`;
 }
 
 async function tryModels(models, body, channel = 'operator') {
@@ -109,6 +114,11 @@ async function tryModels(models, body, channel = 'operator') {
             const { res, data, errText } = await generateContent(model, body);
             if (res.status === 429 && isDaily429(res.status, errText)) {
                 markExhausted(model);
+                tickFallback(channel);
+                lastErr = parseApiError(data, errText, res.status);
+                continue;
+            }
+            if (res.status === 429) {
                 tickFallback(channel);
                 lastErr = parseApiError(data, errText, res.status);
                 continue;
@@ -130,6 +140,19 @@ async function tryModels(models, body, channel = 'operator') {
     return { ok: false, error: lastErr };
 }
 
+function failFromGeminiError(err, dataQuery) {
+    if (isGoogleDailyLimit(err)) {
+        return { ok: false, error: 'operator_llm_failed', detail: err, retryable: true };
+    }
+    if (isGoogleTransientLimit(err)) {
+        return { ok: false, error: 'rate_limit_retry', detail: err, retryable: true };
+    }
+    if (dataQuery) {
+        return { ok: false, error: 'operator_llm_failed', detail: err, retryable: true };
+    }
+    return { ok: false, error: 'operator_llm_failed', detail: err, retryable: true };
+}
+
 async function runPlainFallback({ message, role, designation, ctx }) {
     const system = buildPlainSystemPrompt({ role, designation, ctx });
     const models = modelIds(OPERATOR_TEXT_MODELS).filter((id) => !isExhausted(id));
@@ -139,35 +162,56 @@ async function runPlainFallback({ message, role, designation, ctx }) {
         generationConfig: { temperature: 0.4, maxOutputTokens: 400 },
     };
     const result = await tryModels(models, body, 'operator');
-    if (!result.ok) return { ok: false, error: 'operator_llm_failed', detail: result.error };
+    if (!result.ok) return failFromGeminiError(result.error, false);
     const reply = extractText(result.data);
-    if (!reply) return { ok: false, error: 'empty_reply', detail: 'no text in response' };
+    if (!reply) return { ok: false, error: 'empty_reply', detail: 'no text in response', retryable: true };
     tickRequest('operator');
     if (result.data?.usageMetadata) tickTokens(result.data.usageMetadata, 'operator');
     return { ok: true, reply, model: result.model, toolsCalled: [], plain_fallback: true };
 }
 
-/**
- * Run Gemini operator agent: model picks tools → we execute → model answers.
- */
 export async function runOperatorAgent({ message, role, designation, ctx, supabase, user }) {
     await ensureQuotaHydrated();
 
-    if (!apiKey()) return { ok: false, error: 'no_api_key' };
-    if (!isUnderQuota('operator')) return { ok: false, error: 'operator_quota_exhausted' };
+    if (!apiKey()) return { ok: false, error: 'no_api_key', retryable: false };
+    if (!isUnderQuota('operator')) return { ok: false, error: 'operator_quota_exhausted', retryable: false };
+
+    const dataQuery = isDataQuestion(message);
+    let playbook = null;
+    let toolsCalled = [];
+
+    if (dataQuery) {
+        playbook = await runDataPlaybook(message, ctx, supabase, user);
+        toolsCalled = (playbook.results || []).map((r) => ({
+            name: r.tool,
+            args: { assignee_name: playbook.assignee, status_filter: playbook.status },
+            result: r,
+        }));
+        const sqlReply = formatDataPlaybookReply(playbook);
+        if (sqlReply && playbookHasUsableData(playbook)) {
+            return {
+                ok: true,
+                reply: sqlReply,
+                model: 'sql_playbook',
+                toolsCalled,
+                sql_only: true,
+            };
+        }
+    }
 
     const declarations = getOperatorToolDeclarations(ctx);
     const toolNames = declarations.map((d) => d.name);
     const hints = suggestToolsForMessage(message);
-    const system = buildSystemPrompt({ role, designation, ctx, toolNames });
+    let system = buildSystemPrompt({ role, designation, ctx, toolNames });
 
-    const userIntro = hints.length
+    let userIntro = hints.length
         ? `${message}\n\n(Hint: relevant tools may include ${hints.join(', ')})`
         : message;
+    if (playbook?.results?.length) {
+        userIntro += `\n\n(PRELOADED TOOL DATA — quote exactly, do not invent:\n${JSON.stringify(playbook.results)}\n)`;
+    }
 
     const contents = [{ role: 'user', parts: [{ text: userIntro }] }];
-    const toolsCalled = [];
-    // Gemma often rejects tool schemas — Gemini models only for function calling.
     const toolModels = modelIds(OPERATOR_TEXT_MODELS).filter(
         (id) => !isExhausted(id) && !id.includes('gemma'),
     );
@@ -185,9 +229,17 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
 
         const result = await tryModels(toolModels, body, 'operator');
         if (!result.ok) {
-            console.warn('[OPERATOR] tool-calling chain failed, trying plain fallback');
-            const plain = await runPlainFallback({ message, role, designation, ctx });
-            return { ...plain, toolsCalled, detail: result.error };
+            if (dataQuery && playbook && formatDataPlaybookReply(playbook)) {
+                return {
+                    ok: true,
+                    reply: formatDataPlaybookReply(playbook),
+                    model: 'sql_playbook',
+                    toolsCalled,
+                    sql_only: true,
+                    gemini_skipped: result.error,
+                };
+            }
+            return { ...failFromGeminiError(result.error, dataQuery), toolsCalled };
         }
 
         const geminiData = result.data;
@@ -198,8 +250,13 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
         if (!calls.length) {
             const reply = extractText(geminiData);
             if (!reply) {
+                if (dataQuery) return failFromGeminiError('empty tool response', true);
                 const plain = await runPlainFallback({ message, role, designation, ctx });
-                return { ...plain, toolsCalled, detail: 'empty tool response' };
+                return { ...plain, toolsCalled };
+            }
+            if (dataQuery && /\b\d+\s+(open\s+)?leads?\b/i.test(reply) && !toolsCalled.length) {
+                const sqlReply = formatDataPlaybookReply(playbook);
+                if (sqlReply) return { ok: true, reply: sqlReply, model: 'sql_playbook', toolsCalled, sql_only: true };
             }
             tickRequest('operator');
             if (geminiData?.usageMetadata) tickTokens(geminiData.usageMetadata, 'operator');
@@ -227,6 +284,20 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
         contents.push({ role: 'user', parts: responseParts });
     }
 
+    if (dataQuery && playbook && formatDataPlaybookReply(playbook)) {
+        return {
+            ok: true,
+            reply: formatDataPlaybookReply(playbook),
+            model: 'sql_playbook',
+            toolsCalled,
+            sql_only: true,
+        };
+    }
+
+    if (dataQuery) {
+        return { ok: false, error: 'operator_llm_failed', detail: 'max_tool_turns', retryable: true, toolsCalled };
+    }
+
     const plain = await runPlainFallback({ message, role, designation, ctx });
-    return { ...plain, toolsCalled, detail: 'max_tool_turns' };
+    return { ...plain, toolsCalled };
 }

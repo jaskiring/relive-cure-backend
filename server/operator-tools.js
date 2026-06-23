@@ -1,10 +1,12 @@
 // Operator message classification + reply helpers (data via operator-playbooks + operator-agent).
 
+import { isGoogleDailyLimit, isGoogleTransientLimit } from './operator-data.js';
+
 const BUG_PATTERNS = /\b(bug|broken|wrong|galat|not working|doesn'?t work|fix|issue|error|bot said|chatbot|mirror|crash|stuck)\b/i;
 const FEATURE_PATTERNS = /\b(feature|add|new tab|can we have|request|improvement|suggestion|enhancement|build|ship)\b/i;
 const FEEDBACK_PATTERNS = /\b(should have|should be|there should|need more|needs more|want more|would be better|please add|we need|more detail|more analysis|more recommend|improve the|upgrade the|better if|missing in)\b/i;
 const CRM_TAB_WORDS = /\b(marketing|analytics|pulse|chatbot|bot\s*lab|whatsapp|inbox|settings|dashboard|crm|operator|organic)\b/i;
-const DATA_QUERY_PATTERNS = /\b(how many|count|kitne|total|number of|find|lookup|search|show me|list|which|who has|assigned to)\b/i;
+const DATA_QUERY_PATTERNS = /\b(how many|count|kitne|total|number of|find|lookup|search|show me|list|which|who has|assigned to|tell me)\b/i;
 
 export function classifyOperatorMessage(text) {
     const t = String(text || '').trim();
@@ -39,21 +41,33 @@ export function extractAssigneeName(message) {
     const raw = String(message || '').trim();
     if (!raw) return null;
 
+    const stopWord = /^(the|all|any|my|our|their|open|lost|total|how|many|there|tell|me)$/i;
+
     const patterns = [
-        /\bassign(?:ed|ee)?\s+(?:to\s+)?([a-z][a-z\s.'-]{1,48}?)(?:\s+(?:that|who|which|are|is|have|has|with|ke|ki|ko|open|lost|total|count|there|today)\b|[?.!,]|$)/i,
-        /\b(?:for|of)\s+([a-z][a-z\s.'-]{1,48}?)(?:\s+(?:leads?|open|assigned|total|count)\b|[?.!,]|$)/i,
-        /\b([a-z][a-z\s.'-]{1,48}?)(?:'s| ke| ki)\s+leads?\b/i,
+        /\bassigned\s+to\s+([a-z][\w.'\s-]{2,50})/i,
+        /\b(?:open\s+)?leads?\s+for\s+([a-z][\w.'\s-]{2,50})/i,
+        /\bfor\s+([a-z][\w.'\s-]{2,50})/i,
+        /\bassign(?:ed|ee)?\s+(?:to\s+)?([a-z][\w.'\s-]{2,50})/i,
+        /\b([a-z][\w.'\s-]{2,50}?)(?:'s| ke| ki)\s+leads?\b/i,
     ];
 
     for (const re of patterns) {
         const m = raw.match(re);
         if (!m?.[1]) continue;
-        const name = m[1].replace(/\s+/g, ' ').trim();
-        if (name.length >= 2 && !/^(the|all|any|my|our|their|open|lost|total|how|many)$/i.test(name)) {
+        const name = cleanAssigneeName(m[1]);
+        if (name.length >= 2 && !stopWord.test(name)) {
             return name;
         }
     }
     return null;
+}
+
+function cleanAssigneeName(name) {
+    let n = String(name || '').replace(/\s+/g, ' ').trim();
+    const tailStop = /\s+(?:that|who|which|are|is|was|with|not|open|lost|or|any|anything)\b/i;
+    const idx = n.search(tailStop);
+    if (idx > 0) n = n.slice(0, idx).trim();
+    return n.replace(/[?.!,]+$/, '').trim();
 }
 
 /** open | not_lost | lost | converted | null (all) */
@@ -92,13 +106,19 @@ export function staticOperatorReply(kind, founderRoute, agentResult) {
     }
     if (agentResult?.error === 'operator_llm_failed') {
         const detail = agentResult.detail || '';
-        if (/429|rate|quota|RESOURCE_EXHAUSTED|exhausted/i.test(detail)) {
-            return 'Google Gemini daily rate limit hit for operator models. Resets at UTC midnight — or link billing in AI Studio.';
+        if (isGoogleDailyLimit(detail)) {
+            return 'Google Gemini daily limit reached for this model (not your 4200 app cap). Resets UTC midnight — or link billing in AI Studio.';
+        }
+        if (isGoogleTransientLimit(detail)) {
+            return 'Gemini is temporarily busy (requests/minute). Tap Retry in a few seconds.';
         }
         if (/API key|API_KEY|invalid/i.test(detail)) {
             return 'Operator AI: Gemini API key invalid or missing on Railway (GEMINI_API_KEY).';
         }
-        return `Operator AI could not reach Gemini (${detail.slice(0, 100) || 'all models failed'}). Try again in a minute.`;
+        return `Operator AI could not reach Gemini (${detail.slice(0, 100) || 'all models failed'}). Tap Retry.`;
+    }
+    if (agentResult?.error === 'rate_limit_retry') {
+        return agentResult.detail || 'Gemini busy — tap Retry in a few seconds.';
     }
     return 'I could not generate a reply right now. Try again or rephrase your question.';
 }

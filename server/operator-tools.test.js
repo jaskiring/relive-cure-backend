@@ -32,6 +32,22 @@ test('detectStatusFilter', () => {
     assert.equal(detectStatusFilter('how many total'), null);
 });
 
+test('extractAssigneeName for NISHANT phrasing', () => {
+    assert.equal(
+        extractAssigneeName('TELL ME HOW MANY OPEN LEADS ARE THERE FOR NISHANT'),
+        'NISHANT',
+    );
+    assert.equal(
+        extractAssigneeName('how many open leads for nishant that are not lost'),
+        'nishant',
+    );
+});
+
+test('classifyOperatorMessage treats tell-me lead counts as data', () => {
+    const msg = 'TELL ME HOW MANY OPEN LEADS ARE THERE FOR NISHANT';
+    assert.equal(classifyOperatorMessage(msg), 'data');
+});
+
 test('classifyOperatorMessage routes product feedback to feature', () => {
     const msg = 'In the marketing leads there should be more detail, more analysis and more recommendations.';
     assert.equal(classifyOperatorMessage(msg), 'feature');

@@ -54,7 +54,11 @@ function namesLooselyMatch(a, b) {
     if (x === y || x.includes(y) || y.includes(x)) return true;
     const xFirst = x.split(' ')[0];
     const yFirst = y.split(' ')[0];
-    return xFirst.length >= 3 && xFirst === yFirst;
+    if (xFirst.length >= 3 && xFirst === yFirst) return true;
+    const prefixLen = 4;
+    if (xFirst.length >= prefixLen && yFirst.length >= prefixLen
+        && xFirst.slice(0, prefixLen) === yFirst.slice(0, prefixLen)) return true;
+    return false;
 }
 
 function canQueryAssignee(ctx, assigneeName, user = {}) {
@@ -156,16 +160,59 @@ export function getOperatorToolDeclarations(ctx) {
     return decls;
 }
 
+async function findMatchingAssignees(supabase, needle) {
+    const term = needle.trim();
+    const first = term.split(/\s+/)[0];
+    const terms = [...new Set([term, first].filter((t) => t.length >= 3))];
+    const names = new Set();
+    for (const t of terms) {
+        const { data } = await supabase
+            .from('refrens_leads')
+            .select('assignee, last_comment_by')
+            .or(`assignee.ilike.%${t}%,last_comment_by.ilike.%${t}%`)
+            .limit(400);
+        for (const row of data || []) {
+            for (const field of [row.assignee, row.last_comment_by]) {
+                if (!field || String(field).trim() === '-' || String(field).trim() === '') continue;
+                const f = String(field).trim();
+                if (namesLooselyMatch(f, term) || f.toLowerCase().includes(term.toLowerCase().slice(0, 4))) {
+                    names.add(f);
+                }
+            }
+        }
+    }
+    return [...names].slice(0, 10);
+}
+
 async function countRefrensByAssignee(supabase, assigneeName, statusFilter) {
     const needle = assigneeName.trim();
-    let q = supabase
-        .from('refrens_leads')
-        .select('id', { count: 'exact', head: true })
-        .or(`assignee.ilike.%${needle}%,last_comment_by.ilike.%${needle}%`);
+    const matched = await findMatchingAssignees(supabase, needle);
+
+    let q;
+    if (matched.length) {
+        q = supabase
+            .from('refrens_leads')
+            .select('id', { count: 'exact', head: true })
+            .in('assignee', matched);
+    } else {
+        const firstToken = needle.split(/\s+/)[0];
+        const clauses = new Set([
+            `assignee.ilike.%${needle}%`,
+            `last_comment_by.ilike.%${needle}%`,
+        ]);
+        if (firstToken.length >= 4) {
+            clauses.add(`assignee.ilike.%${firstToken}%`);
+            clauses.add(`last_comment_by.ilike.%${firstToken}%`);
+        }
+        q = supabase
+            .from('refrens_leads')
+            .select('id', { count: 'exact', head: true })
+            .or([...clauses].join(','));
+    }
     q = applyRefrensStatusFilter(q, statusFilter === 'all' ? null : statusFilter);
     const { count, error } = await q;
     if (error) throw new Error(error.message);
-    return count ?? 0;
+    return { count: count ?? 0, matched_assignees: matched, query_name: needle };
 }
 
 async function countRefrensPipeline(supabase, statusFilter) {
@@ -226,13 +273,15 @@ export async function executeOperatorTool(name, args, { ctx, supabase, user }) {
                 return { error: 'permission_denied', message: 'You can only query your own assignee stats.' };
             }
             const statusFilter = a.status_filter || 'all';
-            const count = await countRefrensByAssignee(supabase, assignee, statusFilter);
+            const { count, matched_assignees, query_name } = await countRefrensByAssignee(supabase, assignee, statusFilter);
             return {
                 source: 'refrens_leads',
                 assignee_name: assignee,
+                query_name,
                 status_filter: statusFilter,
                 status_label: statusLabel(statusFilter === 'all' ? null : statusFilter),
                 count,
+                matched_assignees,
             };
         }
 
@@ -323,7 +372,7 @@ export function suggestToolsForMessage(message) {
     const m = String(message || '').toLowerCase();
     const hints = [];
     if (/\b(what is|what does|how does|explain|overview|purpose)\b/.test(m)) hints.push('crm_overview');
-    if (extractAssigneeName(message) && /\b(how many|count|total)\b/.test(m)) {
+    if (extractAssigneeName(message) && /\b(how many|count|total|tell me|leads?)\b/i.test(m)) {
         hints.push('count_refrens_by_assignee', 'count_chatbot_by_assignee');
     }
     if (detectStatusFilter(message)) hints.push('count_refrens_pipeline');
