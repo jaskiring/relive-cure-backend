@@ -5,6 +5,7 @@ import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
 import { quotaStatusAll, quotaStatusForClient, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
 import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
+import { recordWorkerHeartbeat, isOperatorWorkerOnline, workerLastSeen, workerMeta } from './operator-worker-state.js';
 
 function hasExportPermission(tabs, role) {
     return role === 'admin' || (tabs || []).includes('export_leads');
@@ -257,7 +258,9 @@ export function registerOperatorRoutes(app, deps) {
         res.json({
             success: true,
             item: data,
-            message: 'Dev task queued. M4 worker or Cursor agent picks up when worker is online (phase 2).',
+            message: isOperatorWorkerOnline()
+                ? 'Approved — M4 worker will pick this up shortly.'
+                : 'Approved and queued. Start the worker on your Mac: npm run operator-worker (see docs/OPERATOR_DEV.md).',
         });
     });
 
@@ -281,6 +284,15 @@ export function registerOperatorRoutes(app, deps) {
         res.json({ success: true, item: data });
     });
 
+    app.post('/api/operator/worker/heartbeat', async (req, res) => {
+        const secret = process.env.OPERATOR_WORKER_SECRET || '';
+        if (!secret || req.headers['x-worker-secret'] !== secret) {
+            return res.status(401).json({ success: false, error: 'unauthorized' });
+        }
+        recordWorkerHeartbeat(req.body || {});
+        res.json({ success: true, online: true });
+    });
+
     app.get('/api/operator/status', async (req, res) => {
         if (!(await requireCrmKey(req, res))) return;
         await ensureQuotaHydrated();
@@ -289,7 +301,9 @@ export function registerOperatorRoutes(app, deps) {
             success: true,
             enabled: true,
             inbox_ready: inboxReady,
-            worker_online: process.env.OPERATOR_WORKER_ONLINE === '1',
+            worker_online: isOperatorWorkerOnline(),
+            worker_last_seen: workerLastSeen() ? new Date(workerLastSeen()).toISOString() : null,
+            worker_meta: workerMeta(),
             docs: 'docs/OPERATOR_DEV.md',
             migration: inboxReady ? null : 'server/migrations/alter_agent_quota_channels.sql',
             quota: quotaDashboard(),
