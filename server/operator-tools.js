@@ -81,11 +81,11 @@ export function checkFounderRoute(message) {
 
 export function staticOperatorReply(kind, founderRoute, agentResult) {
     if (kind === 'bug' || kind === 'feature') {
-        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} for Jas (Founder inbox). You'll be updated after review.`;
+        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} in the Founder inbox (admin only). Open the Operator orb → inbox icon at top right to review, approve dev, or reject.`;
     }
     if (agentResult?.ok) return agentResult.reply;
     if (agentResult?.error === 'operator_quota_exhausted') {
-        return 'Internal AI limit reached for today. Try again after UTC midnight or ask Jas.';
+        return 'Internal AI limit reached for today. Try again after UTC midnight.';
     }
     if (agentResult?.error === 'no_api_key') {
         return 'Operator AI is not configured on the server (GEMINI_API_KEY missing).';
