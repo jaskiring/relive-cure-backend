@@ -101,7 +101,10 @@ export function registerOperatorRoutes(app, deps) {
             canExport: hasExportPermission(tabs, user.role),
         });
 
-        const toolResult = await runOperatorTools(text, ctx, supabaseAdmin);
+        const toolResult = await runOperatorTools(text, ctx, supabaseAdmin, {
+            username: user.username,
+            designation: designation || user.designation || null,
+        });
 
         const kind = toolResult.needsFounder ? toolResult.kind : classifyOperatorMessage(text);
         let llmResult = null;
