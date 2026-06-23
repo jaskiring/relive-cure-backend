@@ -30,83 +30,55 @@ export const QUOTA_BUFFER_PER_MODEL = 100;
  * @property {string} [notes]
  */
 
-/** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js */
-export const WHATSAPP_MODELS = [
-    {
-        id: 'gemini-2.5-flash-lite',
-        label: 'Flash-Lite',
-        provider: 'gemini',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'Primary WA extractor. Free input/output tokens; cap is requests not tokens.',
-    },
-    {
-        id: 'gemini-2.5-flash',
-        label: 'Flash',
-        provider: 'gemini',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'WA fallback 1.',
-    },
-    {
-        id: 'gemini-2.0-flash',
-        label: 'Flash 2.0',
-        provider: 'gemini',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'DEPRECATED — Google shut down 2.0 Flash ~2026-06-01. Migrate off; kept as fallback until removed.',
-    },
-    {
-        id: 'gemma-4-26b-a4b-it',
-        label: 'Gemma 4 26B',
-        provider: 'gemma',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'WA last-resort fallback.',
-    },
+/** Ordered LLM fallback: fast Gemini → Gemma → full Gemini → (caller: rule-based). No billing required. */
+export const LLM_FALLBACK_ORDER = [
+    'gemini-2.5-flash-lite',
+    'gemma-4-26b-a4b-it',
+    'gemini-2.5-flash',
 ];
 
-/** @type {GeminiModelSpec[]} CRM Operator text — operator-agent.js (function calling) */
-export const OPERATOR_TEXT_MODELS = [
-    {
-        id: 'gemini-2.5-flash',
-        label: 'Flash 2.5',
-        provider: 'gemini',
+/** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js */
+export const WHATSAPP_MODELS = LLM_FALLBACK_ORDER.map((id) => {
+    const specs = {
+        'gemini-2.5-flash-lite': {
+            label: 'Flash-Lite',
+            provider: 'gemini',
+            notes: 'Primary — fastest Gemini. Free tier ~1.5k RPD per model.',
+        },
+        'gemma-4-26b-a4b-it': {
+            label: 'Gemma 4 26B',
+            provider: 'gemma',
+            notes: 'Fast fallback before full Flash — separate free-tier pool.',
+        },
+        'gemini-2.5-flash': {
+            label: 'Flash',
+            provider: 'gemini',
+            notes: 'Full Gemini fallback before rule-based bot.',
+        },
+    };
+    const s = specs[id] || { label: id, provider: 'gemini' };
+    return {
+        id,
+        label: s.label,
+        provider: s.provider,
         api: 'generateContent',
         generate_rpd: 1500,
         rpm: 15,
         tpm_in: 1_000_000,
-        notes: 'Operator primary — function calling. Same Google project as WA; separate app quota counter.',
-    },
-    {
-        id: 'gemini-2.0-flash-lite',
-        label: 'Flash 2.0 Lite',
-        provider: 'gemini',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'Operator fallback.',
-    },
-    {
-        id: 'gemma-4-26b-a4b-it',
-        label: 'Gemma 4 26B',
-        provider: 'gemma',
-        api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
-        tpm_in: 1_000_000,
-        notes: 'Last resort — may not support tools; plain text only.',
-    },
-];
+        notes: s.notes,
+    };
+});
+
+/** @type {GeminiModelSpec[]} CRM Operator text — same fallback order as WhatsApp */
+export const OPERATOR_TEXT_MODELS = LLM_FALLBACK_ORDER.map((id) => {
+    const wa = WHATSAPP_MODELS.find((m) => m.id === id);
+    return {
+        ...wa,
+        notes: id.includes('gemma')
+            ? 'Last LLM resort — plain text only (no tools).'
+            : 'Operator — function calling when supported.',
+    };
+});
 
 /** @type {GeminiModelSpec[]} Voice → text via generateContent + inline audio */
 export const OPERATOR_TRANSCRIBE_MODELS = [
@@ -202,6 +174,28 @@ export const CHANNEL_BUDGETS = {
 
 export function modelIds(list) {
     return list.map((m) => m.id);
+}
+
+/** Shared fallback chain — fast → Gemma → full Gemini. */
+export function llmFallbackChain(channel = 'whatsapp') {
+    if (channel === 'operator') return modelIds(OPERATOR_TEXT_MODELS);
+    return modelIds(WHATSAPP_MODELS);
+}
+
+/** Deduped model specs for usage dashboard. */
+export function allTrackedModels() {
+    const seen = new Set();
+    const out = [];
+    for (const m of [...WHATSAPP_MODELS, ...OPERATOR_TEXT_MODELS]) {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        out.push(m);
+    }
+    return out;
+}
+
+export function modelSpecById(id) {
+    return allTrackedModels().find((m) => m.id === id) || null;
 }
 
 export function googleRpdSum(models) {

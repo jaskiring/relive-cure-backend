@@ -6,7 +6,8 @@ alter table public.agent_quota
   add column if not exists operator_fallback_count integer not null default 0,
   add column if not exists operator_tokens_total integer not null default 0,
   add column if not exists transcribe_request_count integer not null default 0,
-  add column if not exists transcribe_tokens_total integer not null default 0;
+  add column if not exists transcribe_tokens_total integer not null default 0,
+  add column if not exists model_usage_json jsonb not null default '{}'::jsonb;
 
 create table if not exists operator_inbox (
   id              bigserial primary key,

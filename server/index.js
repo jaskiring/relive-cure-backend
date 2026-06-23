@@ -25,7 +25,8 @@ import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { registerOperatorRoutes } from './operator-routes.js';
 import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
-import { hydrateQuota, ensureQuotaHydrated, isUnderQuota, quotaStatus, quotaStatusAll, quotaDashboard } from './agent-quota.js';
+import { hydrateQuota, ensureQuotaHydrated, isUnderQuota, quotaStatus, quotaStatusAll, quotaStatusForClient, quotaDashboard } from './agent-quota.js';
+import { setChannelMode } from './gemini-model-tracker.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
@@ -95,7 +96,7 @@ app.get('/api/agent/quota', async (req, res) => {
             success: true,
             ...status,
             quota: { ...q, remaining },
-            quotas: quotaStatusAll(),
+            quotas: quotaStatusForClient(),
             quota_dashboard: dashboard,
             operator_quota: dashboard.channels.operator,
             operator_transcribe_quota: dashboard.channels.operator_transcribe,
@@ -1332,6 +1333,10 @@ function passiveExtract(message, session) {
             d.eyePower = parsedPower;
             d.concern_power = true;
             d.lastAskedField = null;
+        } else if (justAskedPower && message.trim().length >= 1 && message.trim().length <= 60) {
+            // Unparseable reply after eye-power ask — accept and move on (avoid rule-based loop).
+            d.eyePower = { raw: message.trim(), parsed: message.trim(), numeric: null, confidence: 'user_stated' };
+            d.lastAskedField = null;
         }
     } else if (justAskedPower) {
         d.lastAskedField = null;
@@ -2150,6 +2155,10 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
 
 function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = false) {
     session._lastTrigger = trigger;
+    if (trigger !== 'agent') {
+        const detail = session._lastAgentFail || trigger;
+        setChannelMode('whatsapp', 'rule-based', detail);
+    }
     const runIngest = async () => {
         try {
             await sendToAPI(phone, session, trigger);

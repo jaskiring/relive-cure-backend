@@ -101,6 +101,8 @@ test('staticGeneralReply handles greetings without Gemini', () => {
     assert.ok(reply);
     assert.match(reply, /live CRM/i);
     assert.match(reply, /sent for admin approval/i);
+    const how = staticGeneralReply('how are you', buildOperatorContext('admin', ['analytics'], {}));
+    assert.ok(how);
 });
 
 test('staticOperatorReply uses sent-for-approval copy for features', () => {

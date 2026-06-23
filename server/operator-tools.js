@@ -1,6 +1,7 @@
 // Operator message classification + reply helpers (data via operator-playbooks + operator-agent).
 
 import { isGoogleDailyLimit, isGoogleTransientLimit } from './operator-data.js';
+import { googleExhaustedModels } from './gemini-model-health.js';
 import { INDIAN_CITIES, titleCaseCity } from './bot-guard.js';
 
 const BUG_PATTERNS = /\b(bug|broken|wrong|galat|not working|doesn'?t work|fix|issue|error|bot said|chatbot|mirror|crash|stuck)\b/i;
@@ -147,6 +148,8 @@ export function staticGeneralReply(message, ctx = {}) {
     if (!t) return null;
 
     const isGreeting = /^(hi|hello|hey|namaste|good\s+(morning|afternoon|evening))\b/.test(t)
+        || /^how are you\b/.test(t)
+        || /^how r u\b/.test(t)
         || /\b(what can you help|how can you help|what do you do|what are you|who are you)\b/.test(t);
 
     const isCrmExplain = /\b(what is|what does|how does|explain|tell me about)\b/.test(t)
@@ -180,7 +183,7 @@ export function staticOperatorReply(kind, founderRoute, agentResult) {
     if (agentResult?.error === 'operator_llm_failed') {
         const detail = agentResult.detail || '';
         if (isGoogleDailyLimit(detail)) {
-            return 'Google Gemini daily limit reached for this model (not your 4200 app cap). Resets UTC midnight — or link billing in AI Studio.';
+            return 'Google daily limit reached for this model (not your 4200 app cap). Resets around midnight Pacific — other models in the chain are tried automatically.';
         }
         if (isGoogleTransientLimit(detail)) {
             return 'Gemini is temporarily busy (requests/minute). Tap Retry in a few seconds.';
@@ -189,7 +192,9 @@ export function staticOperatorReply(kind, founderRoute, agentResult) {
             return 'Operator AI: Gemini API key invalid or missing on Railway (GEMINI_API_KEY).';
         }
         if (/all google models exhausted|all models failed/i.test(detail)) {
-            return 'Google Gemini daily limit reached for this model (not your 4200 app cap). Resets UTC midnight — or link billing in AI Studio.';
+            const dead = googleExhaustedModels();
+            const list = dead.length ? dead.join(', ') : 'all models in chain';
+            return `Google free-tier daily limit hit for: ${list}. Separate from our Operator app counter (4200/day). Waits for reset ~midnight Pacific — fallback chain tries the next model until all are exhausted, then rule-based.`;
         }
         return `Operator AI could not reach Gemini (${detail.slice(0, 100) || 'all models failed'}). Tap Retry.`;
     }

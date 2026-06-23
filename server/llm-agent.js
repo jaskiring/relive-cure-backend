@@ -16,8 +16,9 @@
 // LLM only extracts fields — WhatsApp replies are composed rule-based in index.js.
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus, quotaStatusAll } from './agent-quota.js';
-import { WHATSAPP_MODELS } from './gemini-channels.js';
+import { WHATSAPP_MODELS, llmFallbackChain } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted, googleExhaustedModels } from './gemini-model-health.js';
+import { tickModelRequest, setChannelMode, modelStatusForClient } from './gemini-model-tracker.js';
 
 /** @deprecated use WHATSAPP_MODELS from gemini-channels.js */
 export const FREE_TIER_MODELS = WHATSAPP_MODELS;
@@ -25,8 +26,8 @@ export const FREE_TIER_MODELS = WHATSAPP_MODELS;
 const PRIMARY_MODEL = FREE_TIER_MODELS[0].id;
 const DEFAULT_MODEL = PRIMARY_MODEL;
 const FREE_TIER_RPD_PER_MODEL = 1500;
-const GEMINI_TIMEOUT_MS = 8000;
-const GEMMA_TIMEOUT_MS = 12000;
+const GEMINI_TIMEOUT_MS = 10000;
+const GEMMA_TIMEOUT_MS = 22000;
 const RATE_LIMIT_RETRY_MS = 1500;
 const RATE_LIMIT_BACKOFF_MS = 5000;
 
@@ -51,7 +52,7 @@ export function modelChain() {
     const primary = process.env.GEMINI_MODEL || DEFAULT_MODEL;
     if (process.env.AGENT_NO_FALLBACK === '1') return [primary];
     const chain = [primary];
-    for (const { id } of FREE_TIER_MODELS) {
+    for (const id of llmFallbackChain('whatsapp')) {
         if (!chain.includes(id)) chain.push(id);
     }
     return chain;
@@ -96,6 +97,7 @@ export function getLastAgentModel() {
 
 function _fail(reason) {
     _lastFailReason = reason;
+    setChannelMode('whatsapp', 'rule-based', reason);
     return null;
 }
 
@@ -143,6 +145,8 @@ export function agentStatus() {
         exhausted_models: googleExhaustedModels(),
         whatsapp_models: modelChain(),
         last_model: _lastModelUsed,
+        active_models: modelStatusForClient().active_models,
+        model_usage: modelStatusForClient().model_usage,
         quota: quotaStatus('whatsapp'),
     };
 }
@@ -301,18 +305,22 @@ function buildRequestBody(model, contents) {
     const gemma = isGemmaModel(model);
     const generationConfig = {
         temperature: 0.2,
-        maxOutputTokens: gemma ? 160 : 128,
-        responseMimeType: 'application/json',
-        responseSchema: EXTRACT_SCHEMA,
+        maxOutputTokens: gemma ? 220 : 128,
     };
+    const prompt = gemma
+        ? EXTRACT_PROMPT + GEMMA_JSON_SUFFIX
+        : EXTRACT_PROMPT;
     if (gemma) {
-        generationConfig.thinkingConfig = { thinkingLevel: 'MINIMAL' };
+        // Gemma: plain JSON in text — structured output schema often times out.
+        generationConfig.responseMimeType = 'text/plain';
     } else {
+        generationConfig.responseMimeType = 'application/json';
+        generationConfig.responseSchema = EXTRACT_SCHEMA;
         generationConfig.thinkingConfig = { thinkingBudget: 0 };
     }
     return {
         systemInstruction: {
-            parts: [{ text: EXTRACT_PROMPT }],
+            parts: [{ text: prompt }],
         },
         contents,
         generationConfig,
@@ -402,8 +410,15 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 clearTimeout(timer);
                 tickFallback('whatsapp');
                 const reason = e.name === 'AbortError' ? `${prefix}_timeout` : `${prefix}_network_error`;
-                console.error(`[AGENT:${model}] ${reason} → fallback:`, e.message);
-                if (mi < chain.length - 1) break;
+                console.error(`[AGENT:${model}] ${reason} →`, e.message);
+                if (mi < chain.length - 1) {
+                    console.warn(`[AGENT:${model}] trying next model ${chain[mi + 1]}`);
+                    break;
+                }
+                if (reason.endsWith('_timeout') && attempt < 2) {
+                    console.warn(`[AGENT:${model}] timeout — retry once`);
+                    continue;
+                }
                 return _fail(reason);
             }
             clearTimeout(timer);
@@ -478,6 +493,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             }
 
             tickRequest('whatsapp');
+            tickModelRequest(model, 'whatsapp');
             _lastModelUsed = model;
             if (data?.usageMetadata) {
                 tickTokens(data.usageMetadata, 'whatsapp');

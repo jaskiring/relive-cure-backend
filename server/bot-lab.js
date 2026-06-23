@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { agentStatus, getLastAgentModel } from './llm-agent.js';
+import { quotaStatusForClient } from './agent-quota.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LAB_FILE = path.join(__dirname, 'bot-lab-sessions.json');
@@ -288,6 +289,7 @@ export function registerBotLabRoutes(app, deps) {
                 lead,
                 ingest_error: ingestError,
                 agent: agentStatus(),
+                quotas: quotaStatusForClient(),
             });
         } catch (e) {
             console.error('[BOT-LAB] chat error:', e.message);

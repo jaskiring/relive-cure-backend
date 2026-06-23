@@ -1,8 +1,9 @@
 // CRM Operator — Gemini agent with function calling (tool playbooks).
 
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, ensureQuotaHydrated } from './agent-quota.js';
-import { OPERATOR_TEXT_MODELS, WHATSAPP_MODELS, modelIds } from './gemini-channels.js';
+import { OPERATOR_TEXT_MODELS, llmFallbackChain } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted } from './gemini-model-health.js';
+import { tickModelRequest, setChannelMode } from './gemini-model-tracker.js';
 import { getOperatorToolDeclarations, executeOperatorTool, suggestToolsForMessage } from './operator-playbooks.js';
 import {
     isDataQuestion,
@@ -140,6 +141,7 @@ async function tryModels(models, body, channel = 'operator') {
                 console.warn(`[OPERATOR] Gemini ${model} HTTP ${res.status}:`, lastErr.slice(0, 120));
                 continue;
             }
+            tickModelRequest(model, channel);
             return { ok: true, model, data };
         } catch (e) {
             tickFallback(channel);
@@ -166,16 +168,17 @@ function failFromGeminiError(err, dataQuery) {
 
 async function runPlainFallback({ message, role, designation, ctx }) {
     const system = buildPlainSystemPrompt({ role, designation, ctx });
-    const opModels = modelIds(OPERATOR_TEXT_MODELS).filter((id) => !isExhausted(id));
-    const waModels = modelIds(WHATSAPP_MODELS).filter((id) => !isExhausted(id) && !opModels.includes(id));
-    const models = [...opModels, ...waModels];
+    const models = llmFallbackChain('operator').filter((id) => !isExhausted(id));
     const body = {
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: 'user', parts: [{ text: message }] }],
         generationConfig: { temperature: 0.4, maxOutputTokens: 400 },
     };
     const result = await tryModels(models, body, 'operator');
-    if (!result.ok) return failFromGeminiError(result.error, false);
+    if (!result.ok) {
+        setChannelMode('operator', 'error', result.error);
+        return failFromGeminiError(result.error, false);
+    }
     const reply = extractText(result.data);
     if (!reply) return { ok: false, error: 'empty_reply', detail: 'no text in response', retryable: true };
     if (result.data?.usageMetadata) tickTokens(result.data.usageMetadata, 'operator');
@@ -194,6 +197,7 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
     if (msgKind === 'general') {
         const staticReply = staticGeneralReply(queryText, ctx);
         if (staticReply) {
+            setChannelMode('operator', 'static', 'static');
             return {
                 ok: true,
                 reply: staticReply,
@@ -217,6 +221,7 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
         }));
         const sqlReply = formatDataPlaybookReply(playbook);
         if (sqlReply && playbookHasUsableData(playbook)) {
+            setChannelMode('operator', 'sql', 'sql_playbook');
             return {
                 ok: true,
                 reply: sqlReply,
@@ -240,9 +245,7 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
     }
 
     const contents = [{ role: 'user', parts: [{ text: userIntro }] }];
-    const toolModels = modelIds(OPERATOR_TEXT_MODELS).filter(
-        (id) => !isExhausted(id) && !id.includes('gemma'),
-    );
+    const toolModels = llmFallbackChain('operator').filter((id) => !isExhausted(id) && !id.includes('gemma'));
 
     for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
         const body = {

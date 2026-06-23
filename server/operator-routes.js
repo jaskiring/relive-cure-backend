@@ -3,7 +3,7 @@
 import { transcribeOperatorAudio, operatorGeminiStatus } from './operator-gemini.js';
 import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
-import { quotaStatusAll, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
+import { quotaStatusAll, quotaStatusForClient, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
 import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
 
 function hasExportPermission(tabs, role) {
@@ -50,7 +50,7 @@ export function registerOperatorRoutes(app, deps) {
         await ensureQuotaHydrated();
         res.json({
             success: true,
-            quotas: quotaStatusAll(),
+            quotas: quotaStatusForClient(),
             quota_dashboard: quotaDashboard(),
             models: operatorGeminiStatus(),
         });
@@ -114,7 +114,7 @@ export function registerOperatorRoutes(app, deps) {
             success: true,
             transcript: result.transcript,
             model: result.model,
-            quotas: quotaStatusAll(),
+            quotas: quotaStatusForClient(),
         });
     });
 
@@ -201,7 +201,7 @@ export function registerOperatorRoutes(app, deps) {
             inbox_error: saved.error || null,
             kind,
             needs_founder: founderRoute.needsFounder,
-            quotas: quotaStatusAll(),
+            quotas: quotaStatusForClient(),
             model: agentResult?.model || null,
             tools_called: (agentResult?.toolsCalled || []).map((t) => t.name),
             retryable: !!agentResult?.retryable

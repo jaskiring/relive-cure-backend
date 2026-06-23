@@ -12,6 +12,7 @@ import {
     quotaRegistry,
 } from './gemini-channels.js';
 import { googleExhaustedModels } from './gemini-model-health.js';
+import { hydrateModelUsage, serializeModelUsage, modelStatusForClient } from './gemini-model-tracker.js';
 
 const LEGACY_DAILY_CAP = 1200;
 /** App caps derived from model RPD in gemini-channels.js (see docs/GEMINI_QUOTA.md). */
@@ -100,7 +101,7 @@ export async function hydrateQuota() {
         const db = await _db();
         const full = await db
             .from('agent_quota')
-            .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total, operator_request_count, operator_fallback_count, operator_tokens_total, transcribe_request_count, transcribe_tokens_total')
+            .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total, operator_request_count, operator_fallback_count, operator_tokens_total, transcribe_request_count, transcribe_tokens_total, model_usage_json')
             .eq('date', today)
             .maybeSingle();
 
@@ -153,6 +154,7 @@ export async function hydrateQuota() {
                 },
             };
             console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → WA ${_mem.whatsapp.count}/${_cap('whatsapp')} · OP ${_mem.operator.count}/${_cap('operator')} · TX ${_mem.operator_transcribe.count}`);
+            if (data.model_usage_json) hydrateModelUsage(data.model_usage_json);
         } else {
             _mem = { date: today, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
         }
@@ -244,6 +246,14 @@ export function quotaStatusAll() {
     };
 }
 
+/** Client payloads — per-model usage + active model per channel. */
+export function quotaStatusForClient() {
+    return {
+        ...quotaStatusAll(),
+        ...modelStatusForClient(),
+    };
+}
+
 /** Dashboard-friendly: two independent budgets + models per channel. */
 export function quotaDashboard() {
     const all = quotaStatusAll();
@@ -322,6 +332,7 @@ async function _flush() {
             operator_tokens_total: op.tokens_total,
             transcribe_request_count: tx.count,
             transcribe_tokens_total: tx.tokens_total,
+            model_usage_json: serializeModelUsage(),
             updated_at: new Date().toISOString(),
         };
         let { error } = await db.from('agent_quota').upsert(row, { onConflict: 'date' });
