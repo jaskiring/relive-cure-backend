@@ -98,13 +98,30 @@ export async function hydrateQuota() {
     try {
         const today = _today();
         const db = await _db();
-        const { data, error } = await db
+        const full = await db
             .from('agent_quota')
             .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total, operator_request_count, operator_fallback_count, operator_tokens_total, transcribe_request_count, transcribe_tokens_total')
             .eq('date', today)
             .maybeSingle();
+
+        let data = full.data;
+        let error = full.error;
+
+        if (error && /operator_request_count|column/i.test(error.message || '')) {
+            console.warn('[AGENT-QUOTA] channel columns missing — run alter_agent_quota_channels.sql');
+            const legacy = await db
+                .from('agent_quota')
+                .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total')
+                .eq('date', today)
+                .maybeSingle();
+            data = legacy.data;
+            error = legacy.error;
+        }
+
         if (error) {
-            console.warn('[AGENT-QUOTA] hydrate failed:', error.message, '— run migrations/alter_agent_quota_channels.sql if columns missing');
+            console.warn('[AGENT-QUOTA] hydrate failed:', error.message);
+            _mem.date = today;
+            _hydrateOk = true;
             return;
         }
         if (data) {
@@ -292,23 +309,35 @@ async function _flush() {
         const wa = _mem.whatsapp;
         const op = _mem.operator;
         const tx = _mem.operator_transcribe;
-        const { error } = await db
-            .from('agent_quota')
-            .upsert({
-                date: _mem.date,
-                request_count: wa.count,
-                fallback_count: wa.fallbacks,
-                tokens_prompt: wa.tokens_prompt,
-                tokens_output: wa.tokens_output,
-                tokens_thinking: wa.tokens_thinking,
-                tokens_total: wa.tokens_total,
-                operator_request_count: op.count,
-                operator_fallback_count: op.fallbacks,
-                operator_tokens_total: op.tokens_total,
-                transcribe_request_count: tx.count,
-                transcribe_tokens_total: tx.tokens_total,
-                updated_at: new Date().toISOString(),
+        const row = {
+            date: _mem.date,
+            request_count: wa.count,
+            fallback_count: wa.fallbacks,
+            tokens_prompt: wa.tokens_prompt,
+            tokens_output: wa.tokens_output,
+            tokens_thinking: wa.tokens_thinking,
+            tokens_total: wa.tokens_total,
+            operator_request_count: op.count,
+            operator_fallback_count: op.fallbacks,
+            operator_tokens_total: op.tokens_total,
+            transcribe_request_count: tx.count,
+            transcribe_tokens_total: tx.tokens_total,
+            updated_at: new Date().toISOString(),
+        };
+        let { error } = await db.from('agent_quota').upsert(row, { onConflict: 'date' });
+        if (error && /operator_request_count|column/i.test(error.message || '')) {
+            const { error: e2 } = await db.from('agent_quota').upsert({
+                date: row.date,
+                request_count: row.request_count,
+                fallback_count: row.fallback_count,
+                tokens_prompt: row.tokens_prompt,
+                tokens_output: row.tokens_output,
+                tokens_thinking: row.tokens_thinking,
+                tokens_total: row.tokens_total,
+                updated_at: row.updated_at,
             }, { onConflict: 'date' });
+            error = e2;
+        }
         if (error) console.warn('[AGENT-QUOTA] write failed:', error.message);
     } catch (e) {
         console.warn('[AGENT-QUOTA] write error:', e.message);

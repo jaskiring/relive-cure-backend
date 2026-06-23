@@ -167,7 +167,6 @@ async function runPlainFallback({ message, role, designation, ctx }) {
     if (!result.ok) return failFromGeminiError(result.error, false);
     const reply = extractText(result.data);
     if (!reply) return { ok: false, error: 'empty_reply', detail: 'no text in response', retryable: true };
-    tickRequest('operator');
     if (result.data?.usageMetadata) tickTokens(result.data.usageMetadata, 'operator');
     return { ok: true, reply, model: result.model, toolsCalled: [], plain_fallback: true };
 }
@@ -266,7 +265,6 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
                 const sqlReply = formatDataPlaybookReply(playbook);
                 if (sqlReply) return { ok: true, reply: sqlReply, model: 'sql_playbook', toolsCalled, sql_only: true };
             }
-            tickRequest('operator');
             if (geminiData?.usageMetadata) tickTokens(geminiData.usageMetadata, 'operator');
             return { ok: true, reply, model: lastModel, toolsCalled };
         }

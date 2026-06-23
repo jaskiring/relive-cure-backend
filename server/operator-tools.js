@@ -143,7 +143,7 @@ export function checkFounderRoute(message) {
 
 export function staticOperatorReply(kind, founderRoute, agentResult) {
     if (kind === 'bug' || kind === 'feature') {
-        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} in the Founder inbox (admin only). Open the Operator orb → inbox icon at top right to review, approve dev, or reject.`;
+        return `Thanks — logged as a ${kind === 'bug' ? 'bug report' : 'feature request'} in the Founder inbox. Open the Operator orb → inbox icon to review (admin or Settings tab) or see your submission status.`;
     }
     if (agentResult?.ok) return agentResult.reply;
     if (agentResult?.error === 'operator_quota_exhausted') {
