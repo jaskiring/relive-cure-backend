@@ -24,7 +24,7 @@ import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus, g
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
-import { hydrateQuota } from './agent-quota.js';
+import { hydrateQuota, isUnderQuota, quotaStatus } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
@@ -83,8 +83,9 @@ app.get('/api/agent/quota', async (req, res) => {
     try {
         await hydrateQuota();
         const status = agentStatus();
-        const q = status.quota || { count: 0, cap: 1200, fallbacks: 0, remaining: 1200, tokens: { prompt: 0, output: 0, thinking: 0, total: 0 }, date: new Date().toISOString().slice(0, 10) };
-        const remaining = q.remaining ?? Math.max(0, (q.cap || 1200) - (q.count || 0));
+        const q = status.quota || { count: 0, cap: 5600, fallbacks: 0, remaining: 5600, tokens: { prompt: 0, output: 0, thinking: 0, total: 0 }, date: new Date().toISOString().slice(0, 10) };
+        const remaining = q.remaining ?? Math.max(0, (q.cap || 5600) - (q.count || 0));
+        const agentPaused = status.enabled && remaining <= 0;
         const resetsAt = new Date();
         resetsAt.setUTCDate(resetsAt.getUTCDate() + 1);
         resetsAt.setUTCHours(0, 0, 0, 0);
@@ -92,6 +93,8 @@ app.get('/api/agent/quota', async (req, res) => {
             success: true,
             ...status,
             quota: { ...q, remaining },
+            agent_paused: agentPaused,
+            pause_reason: agentPaused ? 'daily_cap_reached' : null,
             resets_at: resetsAt.toISOString(),
             note: 'Each model in model_chain has its own ~1,500 RPD free pool (billing linked). App cap = sum across chain. Tokens = Gemini usageMetadata per success.',
         });
@@ -1071,6 +1074,11 @@ function isPlainGreeting(msgLow) {
     return /^(hi|hello|hey|hii|helo|hola|namaste|नमस्ते|हेलो|hello there|good (morning|afternoon|evening))[\s!.?]*$/iu.test(t);
 }
 
+/** In LIVE mode with quota, route through Gemini instead of greeting/short-message fast paths. */
+function preferAgentOverFastPaths() {
+    return isAgentEnabled() && agentMode() === 'live' && isUnderQuota();
+}
+
 function isAdCtaMessage(msgLow) {
     const t = msgLow.trim();
     if (t.includes('can i get more info') || t.includes('get more info') || t.includes('more info on this')) return true;
@@ -1840,15 +1848,16 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                 }
             }
             if (session.state === 'GREETING' && substantiveIntents.length === 0
-                && (isAdCtaMessage(msgLow) || (msgLow.length < 50 && !/[-+]?\d/.test(message)))) {
+                && (isAdCtaMessage(msgLow) || (msgLow.length < 50 && !/[-+]?\d/.test(message)))
+                && !preferAgentOverFastPaths()) {
                 session.state = 'CORE_CONSULT';
                 setReply(getGreetingReply(msgLow, lang));
                 return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
             }
         }
 
-        // Plain hi/hello — never call slow LLM (common in Bot Lab RETURNING/CORE_CONSULT sessions).
-        if (isPlainGreeting(msgLow)) {
+        // Plain hi/hello — skip slow LLM only when agent is off, shadow, or daily cap hit.
+        if (isPlainGreeting(msgLow) && !preferAgentOverFastPaths()) {
             if (session.state === 'RETURNING') {
                 const fn = safeFirstName(session);
                 const r = {
@@ -1863,8 +1872,8 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
             return finalizeWithIngest(phone, session, 'greeting', finalize, isTestChat);
         }
 
-        // Short messages with nothing to extract — skip LLM (saves 10–20s when Gemma is last resort).
-        if (substantiveIntents.length === 0 && msgLow.length < 12 && !/[-+]?\d/.test(message) && !isPlainGreeting(msgLow)) {
+        // Short messages with nothing to extract — skip LLM when not in live agent mode.
+        if (!preferAgentOverFastPaths() && substantiveIntents.length === 0 && msgLow.length < 12 && !/[-+]?\d/.test(message) && !isPlainGreeting(msgLow)) {
             const next = getNextQuestion(session);
             if (next.text) {
                 setReply(next.text);

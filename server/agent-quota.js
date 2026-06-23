@@ -11,6 +11,8 @@ const FREE_TIER_MODELS_IN_CHAIN = 4;
 const FREE_TIER_RPD = 1500;
 const FREE_TIER_BUFFER = 100;
 const DEFAULT_DAILY_CAP = FREE_TIER_MODELS_IN_CHAIN * (FREE_TIER_RPD - FREE_TIER_BUFFER);
+/** Old Railway default — too low once 4-model fallback chain shipped (6000 Google RPD). */
+const LEGACY_DAILY_CAP = 1200;
 
 let _mem = { date: null, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
 let _writeTimer = null;
@@ -23,7 +25,12 @@ function _today() { return new Date().toISOString().slice(0, 10); }
 function _cap() {
     if (_testCap !== null) return _testCap;
     const n = parseInt(process.env.GEMINI_DAILY_CAP || '', 10);
-    return Number.isFinite(n) && n > 0 ? n : DEFAULT_DAILY_CAP;
+    if (Number.isFinite(n) && n > 0) {
+        // GEMINI_DAILY_CAP=1200 predates the 4-model chain; it blocks the agent while Google still has quota.
+        if (n <= LEGACY_DAILY_CAP) return DEFAULT_DAILY_CAP;
+        return n;
+    }
+    return DEFAULT_DAILY_CAP;
 }
 
 // Lazy-load supabaseAdmin only when we actually need to read/write.

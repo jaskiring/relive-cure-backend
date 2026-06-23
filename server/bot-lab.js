@@ -269,6 +269,8 @@ export function registerBotLabRoutes(app, deps) {
                 else if (usedModel?.includes('2.0-flash')) replySource = 'flash-2.0';
                 else if (usedModel?.includes('flash')) replySource = 'gemini';
                 else replySource = 'gemini';
+            } else if (trigger === 'greeting') {
+                replySource = 'greeting';
             } else if (trigger) {
                 replySource = 'rule-based';
             }
