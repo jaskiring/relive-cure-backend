@@ -9,6 +9,7 @@ import {
     checkFounderRoute,
     staticGeneralReply,
     staticOperatorReply,
+    isMarketingDataQuestion,
 } from './operator-tools.js';
 import { suggestToolsForMessage, getOperatorToolDeclarations } from './operator-playbooks.js';
 import { buildOperatorContext } from './operator-tools.js';
@@ -113,6 +114,21 @@ test('staticOperatorReply uses sent-for-approval copy for features', () => {
 test('suggestToolsForMessage hints crm_overview for generic asks', () => {
     const hints = suggestToolsForMessage('what does this crm do?');
     assert.ok(hints.includes('crm_overview'));
+});
+
+test('classifyOperatorMessage treats marketing campaign performance as data', () => {
+    const msg = 'i want to know what marketing campaign is working best right now';
+    assert.equal(classifyOperatorMessage(msg), 'data');
+    assert.ok(isMarketingDataQuestion(msg));
+    const hints = suggestToolsForMessage(msg);
+    assert.ok(hints.includes('rank_marketing_campaigns'));
+});
+
+test('tool declarations respect marketing RBAC', () => {
+    const marketing = buildOperatorContext('limited', ['marketing'], {});
+    const noMkt = buildOperatorContext('limited', ['chatbot'], {});
+    assert.ok(getOperatorToolDeclarations(marketing).some((t) => t.name === 'rank_marketing_campaigns'));
+    assert.ok(!getOperatorToolDeclarations(noMkt).some((t) => t.name === 'rank_marketing_campaigns'));
 });
 
 test('tool declarations respect analytics RBAC', () => {

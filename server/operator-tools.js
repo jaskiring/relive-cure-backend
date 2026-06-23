@@ -60,6 +60,7 @@ export function classifyOperatorMessage(text) {
     if (FEATURE_PATTERNS.test(t)) return 'feature';
     if (FEEDBACK_PATTERNS.test(t)) return 'feature';
     if (CRM_TAB_WORDS.test(t) && /\b(more|better|improve|detail|analysis|recommend|change|update)\b/i.test(t)) return 'feature';
+    if (isMarketingDataQuestion(t)) return 'data';
     if (DATA_QUERY_PATTERNS.test(t)) return 'data';
     if (/\b(hot lead|today)\b/i.test(t) && /\b(how many|count|kitne)\b/i.test(t)) return 'data';
     if (/\b(assignee|assigned|hold|holds)\b/i.test(t) && /\b(how many|count|leads?|needs?)\b/i.test(t)) return 'data';
@@ -71,16 +72,27 @@ export function classifyOperatorMessage(text) {
 }
 
 export function buildOperatorContext(role, tabs, permissions = {}) {
+    const t = tabs || [];
     return {
         role: role || 'limited',
-        tabs: tabs || [],
+        tabs: t,
         canExport: !!permissions.canExport,
-        canAnalytics: (tabs || []).includes('analytics'),
-        canInbox: (tabs || []).includes('inbox'),
-        canChatbot: (tabs || []).includes('chatbot'),
-        canPulse: (tabs || []).includes('pulse'),
+        canAnalytics: t.includes('analytics'),
+        canInbox: t.includes('inbox'),
+        canChatbot: t.includes('chatbot'),
+        canPulse: t.includes('pulse'),
+        canMarketing: t.includes('marketing'),
         isAdmin: role === 'admin',
     };
+}
+
+/** Marketing / Meta Ads performance questions → SQL playbooks. */
+export function isMarketingDataQuestion(message) {
+    const m = String(message || '').toLowerCase();
+    if (!/\b(marketing|meta\s*ads?|facebook\s*ads?|ad\s*campaign|campaigns?|cpl|cost per lead|ad spend)\b/i.test(m)) {
+        return false;
+    }
+    return /\b(best|top|worst|working|perform|which|what|compare|rank|effective|leads?|spend|cpl|right now|currently|delivering)\b/i.test(m);
 }
 
 /** Pull assignee name from natural-language CRM questions. */
@@ -164,6 +176,9 @@ export function staticGeneralReply(message, ctx = {}) {
     ];
     if (ctx.canAnalytics || ctx.isAdmin) {
         lines.splice(2, 0, 'Refrens assignee, city, and status filters are supported.');
+    }
+    if (ctx.canMarketing || ctx.isAdmin) {
+        lines.splice(lines.length - 1, 0, 'Marketing: ask which campaign is working best, CPL, or spend (last 30 days).');
     }
     return lines.join(' ');
 }

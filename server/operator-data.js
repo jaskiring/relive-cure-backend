@@ -6,6 +6,7 @@ import {
     extractCityFromMessage,
     detectStatusFilter,
     normalizeDataQuestion,
+    isMarketingDataQuestion,
 } from './operator-tools.js';
 import { executeOperatorTool } from './operator-playbooks.js';
 
@@ -46,6 +47,26 @@ export async function runDataPlaybook(message, ctx, supabase, user) {
     const m = String(normalized || '').toLowerCase();
     const wantsCount = /\b(how many|count|tell me|total|number of|leads?\s+are|leads?\s+does)\b/i.test(m)
         || /\bhow many\s+needs?\b/i.test(m);
+
+    if (isMarketingDataQuestion(normalized)) {
+        const deliveringOnly = /\b(right now|currently|today|active|delivering)\b/i.test(m);
+        let metric = 'leads';
+        if (/\bcpl\b|cost per lead/i.test(m)) metric = 'cpl';
+        else if (/\bspend\b/i.test(m) && !/\bleads?\b/i.test(m)) metric = 'spend';
+        else if (/\befficien/i.test(m)) metric = 'efficiency';
+
+        const r = await executeOperatorTool(
+            'rank_marketing_campaigns',
+            { metric, limit: 5, delivering_only: deliveringOnly },
+            { ctx, supabase, user },
+        );
+        results.push({ tool: 'rank_marketing_campaigns', ...r });
+
+        if (!r.campaigns?.length && !r.error) {
+            const sum = await executeOperatorTool('marketing_account_summary', {}, { ctx, supabase, user });
+            results.push({ tool: 'marketing_account_summary', ...sum });
+        }
+    }
 
     const assigneeArgs = { assignee_name: assignee, status_filter: status };
     if (city) assigneeArgs.city = city;
@@ -141,13 +162,42 @@ export function formatDataPlaybookReply(playbook) {
                 lines.push(`Lead ${row.contact_name || '—'} | ${row.assignee || '—'} | ${row.status || '—'} | ${row.phone_number}`);
             }
         }
+        if (r.summary) {
+            const s = r.summary;
+            lines.push(`Meta Ads (${r.period || 'last 30 days'}): ${s.campaign_count} campaigns, ${s.delivering_count} delivering now.`);
+            lines.push(`Spend ₹${Math.round(s.spend).toLocaleString('en-IN')}, ${s.leads} leads, avg CPL ${s.avg_cpl != null ? `₹${s.avg_cpl}` : '—'}.`);
+        }
+        if (r.campaigns?.length) {
+            const label = {
+                leads: 'most leads',
+                cpl: 'lowest CPL (min 1 lead)',
+                spend: 'highest spend',
+                efficiency: 'best leads per ₹1000 spend',
+            }[r.metric] || r.metric;
+            const scope = r.delivering_only ? 'actively delivering campaigns' : 'all synced campaigns';
+            lines.push(`Top Meta campaigns by ${label} (${scope}, ${r.period || 'last 30 days'}):`);
+            r.campaigns.forEach((c, i) => {
+                const cplBit = c.cpl != null ? `, CPL ₹${c.cpl}` : '';
+                const del = c.delivering ? ' · delivering' : '';
+                lines.push(`${i + 1}. ${c.name} — ${c.leads} leads, ₹${Math.round(c.spend).toLocaleString('en-IN')} spend${cplBit}${del}`);
+            });
+        }
+        if (r.message && !r.error) {
+            lines.push(r.message);
+        }
     }
     if (!lines.length) return null;
     return lines.join('\n');
 }
 
 export function playbookHasUsableData(playbook) {
-    return (playbook.results || []).some(
-        (r) => !r.error && (r.count !== undefined || (r.matches && r.matches.length)),
-    );
+    return (playbook.results || []).some((r) => {
+        if (r.error && r.message) return true;
+        return !r.error && (
+            r.count !== undefined
+            || (r.matches && r.matches.length)
+            || (r.campaigns && r.campaigns.length)
+            || r.summary
+        );
+    });
 }

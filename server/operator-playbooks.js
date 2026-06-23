@@ -186,6 +186,34 @@ export function getOperatorToolDeclarations(ctx) {
         });
     }
 
+    if (ctx.canMarketing || ctx.isAdmin) {
+        decls.push({
+            name: 'marketing_account_summary',
+            description: 'Meta Ads account totals for last 30 days: spend, leads, impressions, average CPL across all synced campaigns.',
+            parameters: { type: 'object', properties: {}, required: [] },
+        });
+        decls.push({
+            name: 'rank_marketing_campaigns',
+            description: 'Rank Meta ad campaigns by performance (last 30 days). Use for "which campaign is working best", top CPL, most leads, etc.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    metric: {
+                        type: 'string',
+                        enum: ['leads', 'cpl', 'spend', 'efficiency'],
+                        description: 'leads = most leads; cpl = lowest cost per lead; spend = highest spend; efficiency = leads per ₹1000 spend',
+                    },
+                    limit: { type: 'number', description: 'How many campaigns to return (default 5)' },
+                    delivering_only: {
+                        type: 'boolean',
+                        description: 'If true, only campaigns with spend in last 4 days (actively delivering)',
+                    },
+                },
+                required: [],
+            },
+        });
+    }
+
     return decls;
 }
 
@@ -281,6 +309,78 @@ async function countChatbotByAssignee(supabase, assigneeName, statusFilter, city
     return count ?? 0;
 }
 
+async function loadCampaignTotals(supabase) {
+    const since = new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10);
+    const recentCutoff = new Date(Date.now() - 4 * 86400 * 1000).toISOString().slice(0, 10);
+
+    const { data: campaigns, error: cErr } = await supabase
+        .from('meta_campaigns')
+        .select('id, name, objective, status, daily_budget')
+        .order('name', { ascending: true });
+    if (cErr) throw new Error(cErr.message);
+
+    const { data: insights, error: iErr } = await supabase
+        .from('meta_ad_insights')
+        .select('campaign_id, spend, impressions, clicks, leads, date')
+        .gte('date', since);
+    if (iErr) throw new Error(iErr.message);
+
+    const totals = {};
+    for (const r of (insights || [])) {
+        const t = totals[r.campaign_id] = totals[r.campaign_id] || {
+            spend: 0, impressions: 0, clicks: 0, leads: 0, recentSpend: 0,
+        };
+        t.spend += Number(r.spend || 0);
+        t.impressions += Number(r.impressions || 0);
+        t.clicks += Number(r.clicks || 0);
+        t.leads += Number(r.leads || 0);
+        if (r.date >= recentCutoff) t.recentSpend += Number(r.spend || 0);
+    }
+
+    const rows = (campaigns || []).map((c) => {
+        const t = totals[c.id] || { spend: 0, impressions: 0, clicks: 0, leads: 0, recentSpend: 0 };
+        const delivering = (c.status === 'ACTIVE') && t.recentSpend > 0;
+        const cpl = t.leads > 0 ? Math.round((t.spend / t.leads) * 100) / 100 : null;
+        const efficiency = t.spend > 0 ? Math.round((t.leads / t.spend) * 1000 * 100) / 100 : null;
+        return {
+            id: c.id,
+            name: c.name,
+            status: c.status,
+            objective: c.objective,
+            spend: Math.round(t.spend * 100) / 100,
+            impressions: t.impressions,
+            clicks: t.clicks,
+            leads: t.leads,
+            cpl,
+            efficiency,
+            delivering,
+        };
+    });
+
+    return { rows, since, recentCutoff };
+}
+
+function rankCampaigns(rows, metric = 'leads', limit = 5, deliveringOnly = false) {
+    let pool = deliveringOnly ? rows.filter((c) => c.delivering) : rows.slice();
+    if (!pool.length) pool = rows.slice();
+
+    const sorters = {
+        leads: (a, b) => b.leads - a.leads || (a.cpl ?? 999999) - (b.cpl ?? 999999),
+        spend: (a, b) => b.spend - a.spend,
+        cpl: (a, b) => {
+            const ac = a.cpl ?? 999999;
+            const bc = b.cpl ?? 999999;
+            if (a.leads < 1 && b.leads < 1) return 0;
+            if (a.leads < 1) return 1;
+            if (b.leads < 1) return -1;
+            return ac - bc;
+        },
+        efficiency: (a, b) => (b.efficiency ?? 0) - (a.efficiency ?? 0),
+    };
+    const sortFn = sorters[metric] || sorters.leads;
+    return pool.sort(sortFn).slice(0, Math.min(limit, 10));
+}
+
 /**
  * Execute one Operator tool. Returns JSON-serializable object for Gemini functionResponse.
  * @param {string} name
@@ -302,6 +402,7 @@ export async function executeOperatorTool(name, args, { ctx, supabase, user }) {
                 can_analytics: ctx.canAnalytics,
                 can_chatbot: ctx.canChatbot,
                 can_pulse: ctx.canPulse,
+                can_marketing: ctx.canMarketing,
                 is_admin: ctx.isAdmin,
             };
 
@@ -427,6 +528,54 @@ export async function executeOperatorTool(name, args, { ctx, supabase, user }) {
             return { matches: rows || [] };
         }
 
+        case 'marketing_account_summary': {
+            if (!ctx.canMarketing && !ctx.isAdmin) {
+                return { error: 'permission_denied', message: 'Marketing tab access required for Meta Ads data.' };
+            }
+            const { rows, since } = await loadCampaignTotals(supabase);
+            const summary = rows.reduce((acc, c) => {
+                acc.spend += c.spend;
+                acc.leads += c.leads;
+                acc.impressions += c.impressions;
+                acc.clicks += c.clicks;
+                if (c.delivering) acc.delivering_count += 1;
+                return acc;
+            }, { spend: 0, leads: 0, impressions: 0, clicks: 0, delivering_count: 0, campaign_count: rows.length });
+            summary.avg_cpl = summary.leads > 0
+                ? Math.round((summary.spend / summary.leads) * 100) / 100
+                : null;
+            return {
+                source: 'meta_ad_insights',
+                period: `last 30 days since ${since}`,
+                summary,
+            };
+        }
+
+        case 'rank_marketing_campaigns': {
+            if (!ctx.canMarketing && !ctx.isAdmin) {
+                return { error: 'permission_denied', message: 'Marketing tab access required for campaign rankings.' };
+            }
+            const metric = a.metric || 'leads';
+            const limit = Math.min(parseInt(a.limit, 10) || 5, 10);
+            const deliveringOnly = !!a.delivering_only;
+            const { rows, since } = await loadCampaignTotals(supabase);
+            if (!rows.length) {
+                return {
+                    source: 'meta_campaigns',
+                    error: 'no_data',
+                    message: 'No synced Meta campaigns yet — open Marketing tab and click Sync now.',
+                };
+            }
+            const campaigns = rankCampaigns(rows, metric, limit, deliveringOnly);
+            return {
+                source: 'meta_ad_insights',
+                metric,
+                delivering_only: deliveringOnly,
+                period: `last 30 days since ${since}`,
+                campaigns,
+            };
+        }
+
         default:
             return { error: 'unknown_tool', name };
     }
@@ -451,6 +600,13 @@ export function suggestToolsForMessage(message) {
     if (phoneDigits(message)) hints.push('lookup_lead_by_phone');
     if (/\btoday\b/.test(m) && /\b(hot|urgent)\b/.test(m)) hints.push('count_hot_chatbot_leads_today');
     if (/\btoday\b/.test(m) && /\b(new|how many)\b/.test(m)) hints.push('count_new_chatbot_leads_today');
+    if (/\b(marketing|campaign|meta ads?|cpl|ad spend)\b/.test(m)
+        && /\b(best|top|which|working|perform|rank|compare|effective)\b/.test(m)) {
+        hints.push('rank_marketing_campaigns');
+    }
+    if (/\b(marketing|meta ads?)\b/.test(m) && /\b(total|summary|overall|account)\b/.test(m)) {
+        hints.push('marketing_account_summary');
+    }
     return [...new Set(hints)];
 }
 
