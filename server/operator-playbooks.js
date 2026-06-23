@@ -2,6 +2,7 @@
 
 import {
     extractAssigneeName,
+    extractCityFromMessage,
     detectStatusFilter,
     buildOperatorContext,
 } from './operator-tools.js';
@@ -39,6 +40,17 @@ function applyRefrensStatusFilter(q, filter) {
     if (filter === 'converted') return q.eq('status', 'Deal Done');
     if (filter === 'not_lost') return q.not('status', 'in', '("Lost","Not Serviceable")');
     return q;
+}
+
+function applyRefrensCityFilter(q, city) {
+    if (!city) return q;
+    const c = String(city).trim();
+    return q.or(`customer_city.ilike.%${c}%,city_preference.ilike.%${c}%`);
+}
+
+function applyChatbotCityFilter(q, city) {
+    if (!city) return q;
+    return q.ilike('city', `%${String(city).trim()}%`);
 }
 
 function phoneDigits(s) {
@@ -88,18 +100,34 @@ export function getOperatorToolDeclarations(ctx) {
     if (ctx.canAnalytics || ctx.isAdmin) {
         decls.push({
             name: 'count_refrens_by_assignee',
-            description: 'Count Refrens CRM leads (Analytics) for an assignee name. Matches assignee or last_comment_by.',
+            description: 'Count Refrens CRM leads (Analytics) for an assignee name. Optional city filter (customer_city). Matches assignee or last_comment_by.',
             parameters: {
                 type: 'object',
                 properties: {
-                    assignee_name: { type: 'string', description: 'Rep name e.g. Khushi, Khushi Tomar' },
+                    assignee_name: { type: 'string', description: 'Rep name e.g. Khushi, Nishikant' },
                     status_filter: {
                         type: 'string',
                         enum: ['all', 'open', 'not_lost', 'lost', 'converted'],
                         description: 'open | not_lost (active pipeline) | lost | converted (Deal Done) | all',
                     },
+                    city: { type: 'string', description: 'Optional city e.g. Mumbai, Delhi, Pune' },
                 },
                 required: ['assignee_name'],
+            },
+        });
+        decls.push({
+            name: 'count_refrens_by_city',
+            description: 'Count Refrens CRM leads in a city (customer_city or treatment city preference). All assignees.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    city: { type: 'string', description: 'City name e.g. Mumbai' },
+                    status_filter: {
+                        type: 'string',
+                        enum: ['all', 'open', 'not_lost', 'lost', 'converted'],
+                    },
+                },
+                required: ['city'],
             },
         });
         decls.push({
@@ -121,7 +149,7 @@ export function getOperatorToolDeclarations(ctx) {
     if (ctx.canChatbot || ctx.isAdmin) {
         decls.push({
             name: 'count_chatbot_by_assignee',
-            description: 'Count WhatsApp bot leads (leads_surgery) for an assignee.',
+            description: 'Count WhatsApp bot leads (leads_surgery) for an assignee. Optional city filter.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -130,6 +158,7 @@ export function getOperatorToolDeclarations(ctx) {
                         type: 'string',
                         enum: ['all', 'open', 'not_lost', 'lost', 'converted'],
                     },
+                    city: { type: 'string', description: 'Optional city e.g. Mumbai' },
                 },
                 required: ['assignee_name'],
             },
@@ -184,7 +213,7 @@ async function findMatchingAssignees(supabase, needle) {
     return [...names].slice(0, 10);
 }
 
-async function countRefrensByAssignee(supabase, assigneeName, statusFilter) {
+async function countRefrensByAssignee(supabase, assigneeName, statusFilter, city = null) {
     const needle = assigneeName.trim();
     const matched = await findMatchingAssignees(supabase, needle);
 
@@ -209,10 +238,22 @@ async function countRefrensByAssignee(supabase, assigneeName, statusFilter) {
             .select('id', { count: 'exact', head: true })
             .or([...clauses].join(','));
     }
+    q = applyRefrensCityFilter(q, city);
     q = applyRefrensStatusFilter(q, statusFilter === 'all' ? null : statusFilter);
     const { count, error } = await q;
     if (error) throw new Error(error.message);
-    return { count: count ?? 0, matched_assignees: matched, query_name: needle };
+    return { count: count ?? 0, matched_assignees: matched, query_name: needle, city: city || null };
+}
+
+async function countRefrensByCity(supabase, city, statusFilter) {
+    let q = supabase
+        .from('refrens_leads')
+        .select('id', { count: 'exact', head: true });
+    q = applyRefrensCityFilter(q, city);
+    q = applyRefrensStatusFilter(q, statusFilter === 'all' ? null : statusFilter);
+    const { count, error } = await q;
+    if (error) throw new Error(error.message);
+    return count ?? 0;
 }
 
 async function countRefrensPipeline(supabase, statusFilter) {
@@ -223,12 +264,13 @@ async function countRefrensPipeline(supabase, statusFilter) {
     return count ?? 0;
 }
 
-async function countChatbotByAssignee(supabase, assigneeName, statusFilter) {
+async function countChatbotByAssignee(supabase, assigneeName, statusFilter, city = null) {
     const needle = assigneeName.trim();
     let q = supabase
         .from('leads_surgery')
         .select('id', { count: 'exact', head: true })
         .ilike('assignee', `%${needle}%`);
+    q = applyChatbotCityFilter(q, city);
     const f = statusFilter === 'all' ? null : statusFilter;
     if (f === 'open') q = q.eq('status', 'Open');
     else if (f === 'lost') q = q.eq('status', 'Lost');
@@ -273,15 +315,36 @@ export async function executeOperatorTool(name, args, { ctx, supabase, user }) {
                 return { error: 'permission_denied', message: 'You can only query your own assignee stats.' };
             }
             const statusFilter = a.status_filter || 'all';
-            const { count, matched_assignees, query_name } = await countRefrensByAssignee(supabase, assignee, statusFilter);
+            const city = a.city ? String(a.city).trim() : null;
+            const { count, matched_assignees, query_name } = await countRefrensByAssignee(
+                supabase, assignee, statusFilter, city,
+            );
             return {
                 source: 'refrens_leads',
                 assignee_name: assignee,
                 query_name,
                 status_filter: statusFilter,
                 status_label: statusLabel(statusFilter === 'all' ? null : statusFilter),
+                city,
                 count,
                 matched_assignees,
+            };
+        }
+
+        case 'count_refrens_by_city': {
+            if (!ctx.canAnalytics && !ctx.isAdmin) {
+                return { error: 'permission_denied', message: 'Analytics tab required.' };
+            }
+            const city = String(a.city || '').trim();
+            if (!city) return { error: 'missing_city' };
+            const statusFilter = a.status_filter || 'all';
+            const count = await countRefrensByCity(supabase, city, statusFilter);
+            return {
+                source: 'refrens_leads',
+                city,
+                status_filter: statusFilter,
+                status_label: statusLabel(statusFilter === 'all' ? null : statusFilter),
+                count,
             };
         }
 
@@ -308,11 +371,13 @@ export async function executeOperatorTool(name, args, { ctx, supabase, user }) {
                 return { error: 'permission_denied', message: 'You can only query your own assignee stats.' };
             }
             const statusFilter = a.status_filter || 'all';
-            const count = await countChatbotByAssignee(supabase, assignee, statusFilter);
+            const city = a.city ? String(a.city).trim() : null;
+            const count = await countChatbotByAssignee(supabase, assignee, statusFilter, city);
             return {
                 source: 'leads_surgery',
                 assignee_name: assignee,
                 status_filter: statusFilter,
+                city,
                 count,
             };
         }
@@ -372,8 +437,15 @@ export function suggestToolsForMessage(message) {
     const m = String(message || '').toLowerCase();
     const hints = [];
     if (/\b(what is|what does|how does|explain|overview|purpose)\b/.test(m)) hints.push('crm_overview');
-    if (extractAssigneeName(message) && /\b(how many|count|total|tell me|leads?)\b/i.test(m)) {
+    if (extractAssigneeName(message) && /\b(how many|count|total|tell me|leads?|hold|holds)\b/i.test(m)) {
         hints.push('count_refrens_by_assignee', 'count_chatbot_by_assignee');
+    }
+    const city = extractCityFromMessage(message);
+    if (city && /\b(how many|count|total|leads?)\b/i.test(m)) {
+        hints.push('count_refrens_by_city');
+        if (extractAssigneeName(message)) {
+            hints.push('count_refrens_by_assignee', 'count_chatbot_by_assignee');
+        }
     }
     if (detectStatusFilter(message)) hints.push('count_refrens_pipeline');
     if (phoneDigits(message)) hints.push('lookup_lead_by_phone');

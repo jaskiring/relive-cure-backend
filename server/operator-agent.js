@@ -12,6 +12,7 @@ import {
     isGoogleDailyLimit,
     isGoogleTransientLimit,
 } from './operator-data.js';
+import { normalizeDataQuestion } from './operator-tools.js';
 
 const TIMEOUT_MS = 18000;
 const MAX_TOOL_TURNS = 4;
@@ -89,6 +90,7 @@ Staff role: ${role}${designation ? ` (${designation})` : ''}.
 Allowed tabs: ${(ctx.tabs || []).join(', ') || 'limited'}.
 
 You have tools to fetch live CRM data. ALWAYS use tools for counts, lookups, and pipeline questions — never guess numbers.
+Tools support filters: assignee name, status (open / not lost / lost), and city (customer_city in Refrens, city in bot leads).
 For general questions ("what does this CRM do", "what is Pulse", onboarding), call crm_overview or user_access_summary, then answer in plain language.
 
 Available tools: ${toolNames.join(', ') || 'none (permissions limited)'}.
@@ -173,15 +175,17 @@ async function runPlainFallback({ message, role, designation, ctx }) {
 export async function runOperatorAgent({ message, role, designation, ctx, supabase, user }) {
     await ensureQuotaHydrated();
 
+    const queryText = normalizeDataQuestion(message);
+
     if (!apiKey()) return { ok: false, error: 'no_api_key', retryable: false };
     if (!isUnderQuota('operator')) return { ok: false, error: 'operator_quota_exhausted', retryable: false };
 
-    const dataQuery = isDataQuestion(message);
+    const dataQuery = isDataQuestion(queryText);
     let playbook = null;
     let toolsCalled = [];
 
     if (dataQuery) {
-        playbook = await runDataPlaybook(message, ctx, supabase, user);
+        playbook = await runDataPlaybook(queryText, ctx, supabase, user);
         toolsCalled = (playbook.results || []).map((r) => ({
             name: r.tool,
             args: { assignee_name: playbook.assignee, status_filter: playbook.status },
@@ -201,12 +205,12 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
 
     const declarations = getOperatorToolDeclarations(ctx);
     const toolNames = declarations.map((d) => d.name);
-    const hints = suggestToolsForMessage(message);
+    const hints = suggestToolsForMessage(queryText);
     let system = buildSystemPrompt({ role, designation, ctx, toolNames });
 
     let userIntro = hints.length
-        ? `${message}\n\n(Hint: relevant tools may include ${hints.join(', ')})`
-        : message;
+        ? `${queryText}\n\n(Hint: relevant tools may include ${hints.join(', ')})`
+        : queryText;
     if (playbook?.results?.length) {
         userIntro += `\n\n(PRELOADED TOOL DATA — quote exactly, do not invent:\n${JSON.stringify(playbook.results)}\n)`;
     }
@@ -251,10 +255,14 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
             const reply = extractText(geminiData);
             if (!reply) {
                 if (dataQuery) return failFromGeminiError('empty tool response', true);
-                const plain = await runPlainFallback({ message, role, designation, ctx });
+                const plain = await runPlainFallback({ message: queryText, role, designation, ctx });
                 return { ...plain, toolsCalled };
             }
             if (dataQuery && /\b\d+\s+(open\s+)?leads?\b/i.test(reply) && !toolsCalled.length) {
+                const sqlReply = formatDataPlaybookReply(playbook);
+                if (sqlReply) return { ok: true, reply: sqlReply, model: 'sql_playbook', toolsCalled, sql_only: true };
+            }
+            if (dataQuery && /\b(cannot|can't|unable to)\s+filter\b/i.test(reply)) {
                 const sqlReply = formatDataPlaybookReply(playbook);
                 if (sqlReply) return { ok: true, reply: sqlReply, model: 'sql_playbook', toolsCalled, sql_only: true };
             }
@@ -298,6 +306,6 @@ export async function runOperatorAgent({ message, role, designation, ctx, supaba
         return { ok: false, error: 'operator_llm_failed', detail: 'max_tool_turns', retryable: true, toolsCalled };
     }
 
-    const plain = await runPlainFallback({ message, role, designation, ctx });
+    const plain = await runPlainFallback({ message: queryText, role, designation, ctx });
     return { ...plain, toolsCalled };
 }

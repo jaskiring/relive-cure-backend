@@ -3,7 +3,9 @@
 import {
     classifyOperatorMessage,
     extractAssigneeName,
+    extractCityFromMessage,
     detectStatusFilter,
+    normalizeDataQuestion,
 } from './operator-tools.js';
 import { executeOperatorTool } from './operator-playbooks.js';
 
@@ -36,17 +38,23 @@ export function isGoogleTransientLimit(detail) {
  * @returns {{ results: object[], assignee: string|null, status: string }}
  */
 export async function runDataPlaybook(message, ctx, supabase, user) {
+    const normalized = normalizeDataQuestion(message);
     const results = [];
-    const assignee = extractAssigneeName(message);
-    const status = inferStatusFilter(message);
-    const m = String(message || '').toLowerCase();
-    const wantsCount = /\b(how many|count|tell me|total|number of|leads?\s+are)\b/i.test(m);
+    const assignee = extractAssigneeName(normalized);
+    const city = extractCityFromMessage(normalized);
+    const status = inferStatusFilter(normalized);
+    const m = String(normalized || '').toLowerCase();
+    const wantsCount = /\b(how many|count|tell me|total|number of|leads?\s+are|leads?\s+does)\b/i.test(m)
+        || /\bhow many\s+needs?\b/i.test(m);
+
+    const assigneeArgs = { assignee_name: assignee, status_filter: status };
+    if (city) assigneeArgs.city = city;
 
     if (assignee && wantsCount) {
         if (ctx.canAnalytics || ctx.isAdmin) {
             const r = await executeOperatorTool(
                 'count_refrens_by_assignee',
-                { assignee_name: assignee, status_filter: status },
+                assigneeArgs,
                 { ctx, supabase, user },
             );
             results.push({ tool: 'count_refrens_by_assignee', ...r });
@@ -54,11 +62,20 @@ export async function runDataPlaybook(message, ctx, supabase, user) {
         if (ctx.canChatbot || ctx.isAdmin) {
             const r2 = await executeOperatorTool(
                 'count_chatbot_by_assignee',
-                { assignee_name: assignee, status_filter: status },
+                assigneeArgs,
                 { ctx, supabase, user },
             );
             results.push({ tool: 'count_chatbot_by_assignee', ...r2 });
         }
+    }
+
+    if (city && wantsCount && !assignee && (ctx.canAnalytics || ctx.isAdmin)) {
+        const r = await executeOperatorTool(
+            'count_refrens_by_city',
+            { city, status_filter: status },
+            { ctx, supabase, user },
+        );
+        results.push({ tool: 'count_refrens_by_city', ...r });
     }
 
     if (phoneDigits(message)) {
@@ -89,7 +106,7 @@ export async function runDataPlaybook(message, ctx, supabase, user) {
         results.push({ tool: 'count_refrens_pipeline', ...r });
     }
 
-    return { results, assignee, status };
+    return { results, assignee, city, status };
 }
 
 function phoneDigits(s) {
@@ -107,9 +124,11 @@ export function formatDataPlaybookReply(playbook) {
             continue;
         }
         if (r.count !== undefined && r.source) {
-            const who = r.query_name || r.assignee_name || 'pipeline';
+            const who = r.query_name || r.assignee_name || (r.city ? r.city : 'pipeline');
             const st = r.status_label || r.status_filter || 'filtered';
-            lines.push(`${r.source === 'refrens_leads' ? 'Refrens CRM (Analytics)' : 'WhatsApp bot'}: ${r.count} leads for "${who}" (${st}).`);
+            const cityBit = r.city ? ` in ${r.city}` : '';
+            const whoBit = r.assignee_name || r.query_name ? ` for "${who}"` : '';
+            lines.push(`${r.source === 'refrens_leads' ? 'Refrens CRM (Analytics)' : 'WhatsApp bot'}: ${r.count} leads${whoBit}${cityBit} (${st}).`);
             if (r.matched_assignees?.length) {
                 lines.push(`CRM assignee names matched: ${r.matched_assignees.join(', ')}.`);
             }

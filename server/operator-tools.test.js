@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     extractAssigneeName,
+    extractCityFromMessage,
+    normalizeDataQuestion,
     detectStatusFilter,
     classifyOperatorMessage,
     checkFounderRoute,
@@ -41,6 +43,38 @@ test('extractAssigneeName for NISHANT phrasing', () => {
         extractAssigneeName('how many open leads for nishant that are not lost'),
         'nishant',
     );
+});
+
+test('extractAssigneeName for hold/has phrasing', () => {
+    assert.equal(
+        extractAssigneeName('How many needs does Nishikant hold that are from Mumbai?'),
+        'Nishikant',
+    );
+    assert.equal(
+        extractAssigneeName('how many leads does Khushi have in Delhi'),
+        'Khushi',
+    );
+});
+
+test('extractCityFromMessage', () => {
+    assert.equal(
+        extractCityFromMessage('How many needs does Nishikant hold that are from Mumbai?'),
+        'Mumbai',
+    );
+    assert.equal(extractCityFromMessage('open leads in pune for khushi'), 'Pune');
+    assert.equal(extractCityFromMessage('how many leads in delhi'), 'Delhi');
+});
+
+test('normalizeDataQuestion fixes needs typo', () => {
+    assert.match(
+        normalizeDataQuestion('How many needs does Nishikant hold'),
+        /how many leads does Nishikant hold/i,
+    );
+});
+
+test('classifyOperatorMessage treats assignee+city counts as data', () => {
+    const msg = 'How many needs does Nishikant hold that are from Mumbai?';
+    assert.equal(classifyOperatorMessage(msg), 'data');
 });
 
 test('classifyOperatorMessage treats tell-me lead counts as data', () => {
