@@ -1,39 +1,72 @@
 // server/agent-quota.js
-// Persists the Gemini free-tier daily counter to Supabase so it survives
-// Railway redeploys and crashes. In-memory cache for speed; write-through
-// debounced like schedulePersist() in index.js.
-//
-// Uses a LAZY dynamic import for supabase-admin so the module loads (and unit
-// tests run) without SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in the env.
+// Persists Gemini daily counters to Supabase (survives Railway redeploys).
+// Channels: whatsapp (customer bot — highest priority), operator (CRM AI), operator_transcribe (voice).
 
-// App-side cap across all models in the fallback chain (4 × ~1.5k RPD − buffer).
-const FREE_TIER_MODELS_IN_CHAIN = 4;
-const FREE_TIER_RPD = 1500;
-const FREE_TIER_BUFFER = 100;
-const DEFAULT_DAILY_CAP = FREE_TIER_MODELS_IN_CHAIN * (FREE_TIER_RPD - FREE_TIER_BUFFER);
-/** Old Railway default — too low once 4-model fallback chain shipped (6000 Google RPD). */
+import {
+    CHANNEL_BUDGETS,
+    WHATSAPP_MODELS,
+    OPERATOR_TEXT_MODELS,
+    OPERATOR_TRANSCRIBE_MODELS,
+    modelIds,
+    appCapForModels,
+    quotaRegistry,
+} from './gemini-channels.js';
+import { googleExhaustedModels } from './gemini-model-health.js';
+
 const LEGACY_DAILY_CAP = 1200;
+/** App caps derived from model RPD in gemini-channels.js (see docs/GEMINI_QUOTA.md). */
+const DEFAULT_DAILY_CAP = appCapForModels(WHATSAPP_MODELS);
+const DEFAULT_OPERATOR_CAP = appCapForModels(OPERATOR_TEXT_MODELS);
+/** No app cap on transcribe by default — Google free-tier (incl. unlimited audio rows) is the limit. */
+const UNLIMITED_CAP = Number.MAX_SAFE_INTEGER;
 
-let _mem = { date: null, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+function isUnlimitedCap(cap) {
+    return cap >= UNLIMITED_CAP / 2;
+}
+
+const CHANNELS = ['whatsapp', 'operator', 'operator_transcribe'];
+
+function emptyBucket() {
+    return { count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+}
+
+let _mem = { date: null, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
 let _writeTimer = null;
 let _bootHydrated = false;
-let _testCap = null;  // test override; null in production
-let _supabase = null; // lazy-loaded
-let _dailyExhausted = false; // set true when quota exhausted; resets next day
+let _testCap = null;
+let _testCapByChannel = null;
+let _supabase = null;
+const _dailyExhausted = new Set();
 
 function _today() { return new Date().toISOString().slice(0, 10); }
-function _cap() {
-    if (_testCap !== null) return _testCap;
+
+function _normChannel(channel) {
+    return CHANNELS.includes(channel) ? channel : 'whatsapp';
+}
+
+function _cap(channel = 'whatsapp') {
+    const ch = _normChannel(channel);
+    if (_testCapByChannel?.[ch] != null) return _testCapByChannel[ch];
+    if (_testCap !== null && ch === 'whatsapp') return _testCap;
+    if (ch === 'operator') {
+        const n = parseInt(process.env.GEMINI_OPERATOR_DAILY_CAP || '', 10);
+        return Number.isFinite(n) && n > 0 ? n : DEFAULT_OPERATOR_CAP;
+    }
+    if (ch === 'operator_transcribe') {
+        const raw = (process.env.GEMINI_TRANSCRIBE_DAILY_CAP || '').trim().toLowerCase();
+        if (raw === '0' || raw === 'unlimited' || raw === 'off') return UNLIMITED_CAP;
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n > 0) return n;
+        return UNLIMITED_CAP;
+    }
     const n = parseInt(process.env.GEMINI_DAILY_CAP || '', 10);
     if (Number.isFinite(n) && n > 0) {
-        // GEMINI_DAILY_CAP=1200 predates the 4-model chain; it blocks the agent while Google still has quota.
         if (n <= LEGACY_DAILY_CAP) return DEFAULT_DAILY_CAP;
         return n;
     }
     return DEFAULT_DAILY_CAP;
 }
 
-// Lazy-load supabaseAdmin only when we actually need to read/write.
 async function _db() {
     if (_supabase) return _supabase;
     const mod = await import('./supabase-admin.js');
@@ -41,16 +74,33 @@ async function _db() {
     return _supabase;
 }
 
-// Test-only helpers.
 function _setCapForTest(n) { _testCap = n; }
-function resetForTest() {
-    _mem = { date: _today(), count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
-    _writeTimer = null;
-    _bootHydrated = true; // skip Supabase hydrate in tests
-    _dailyExhausted = false;
+function _setCapForChannelTest(channel, n) {
+    if (!_testCapByChannel) _testCapByChannel = {};
+    _testCapByChannel[_normChannel(channel)] = n;
 }
 
-// Called once on boot to read today's row from Supabase.
+function resetForTest() {
+    _mem = { date: _today(), whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
+    _writeTimer = null;
+    _bootHydrated = true;
+    _dailyExhausted.clear();
+}
+
+function _bucket(channel) {
+    const ch = _normChannel(channel);
+    if (!_mem[ch]) _mem[ch] = emptyBucket();
+    return _mem[ch];
+}
+
+function _rollDateIfNeeded() {
+    const d = _today();
+    if (_mem.date !== d) {
+        _mem = { date: d, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
+        _dailyExhausted.clear();
+    }
+}
+
 export async function hydrateQuota() {
     if (_bootHydrated) return;
     _bootHydrated = true;
@@ -59,7 +109,7 @@ export async function hydrateQuota() {
         const db = await _db();
         const { data, error } = await db
             .from('agent_quota')
-            .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total')
+            .select('date, request_count, fallback_count, tokens_prompt, tokens_output, tokens_thinking, tokens_total, operator_request_count, operator_fallback_count, operator_tokens_total, transcribe_request_count, transcribe_tokens_total')
             .eq('date', today)
             .maybeSingle();
         if (error) {
@@ -69,118 +119,187 @@ export async function hydrateQuota() {
         if (data) {
             _mem = {
                 date: data.date,
-                count: data.request_count || 0,
-                fallbacks: data.fallback_count || 0,
-                tokens_prompt: data.tokens_prompt || 0,
-                tokens_output: data.tokens_output || 0,
-                tokens_thinking: data.tokens_thinking || 0,
-                tokens_total: data.tokens_total || 0,
+                whatsapp: {
+                    count: data.request_count || 0,
+                    fallbacks: data.fallback_count || 0,
+                    tokens_prompt: data.tokens_prompt || 0,
+                    tokens_output: data.tokens_output || 0,
+                    tokens_thinking: data.tokens_thinking || 0,
+                    tokens_total: data.tokens_total || 0,
+                },
+                operator: {
+                    count: data.operator_request_count || 0,
+                    fallbacks: data.operator_fallback_count || 0,
+                    tokens_prompt: 0,
+                    tokens_output: 0,
+                    tokens_thinking: 0,
+                    tokens_total: data.operator_tokens_total || 0,
+                },
+                operator_transcribe: {
+                    count: data.transcribe_request_count || 0,
+                    fallbacks: 0,
+                    tokens_prompt: 0,
+                    tokens_output: 0,
+                    tokens_thinking: 0,
+                    tokens_total: data.transcribe_tokens_total || 0,
+                },
             };
-            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → ${_mem.count}/${_cap()} calls, ${_mem.tokens_total} tokens`);
+            console.log(`[AGENT-QUOTA] hydrated ${_mem.date} → WA ${_mem.whatsapp.count}/${_cap('whatsapp')} · OP ${_mem.operator.count}/${_cap('operator')} · TX ${_mem.operator_transcribe.count}/${_cap('operator_transcribe')}`);
         } else {
-            _mem = { date: today, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+            _mem = { date: today, whatsapp: emptyBucket(), operator: emptyBucket(), operator_transcribe: emptyBucket() };
         }
     } catch (e) {
         console.warn('[AGENT-QUOTA] hydrate error:', e.message);
     }
 }
 
-export function isUnderQuota() {
-    const d = _today();
-    if (_mem.date !== d) {
-        _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
-        _dailyExhausted = false;
-    }
-    if (_dailyExhausted) return false;
-    const under = _mem.count < _cap();
-    if (!under) _dailyExhausted = true; // persist for rest of day
+export function isUnderQuota(channel = 'whatsapp') {
+    _rollDateIfNeeded();
+    const ch = _normChannel(channel);
+    if (_dailyExhausted.has(ch)) return false;
+    const b = _bucket(ch);
+    const under = b.count < _cap(ch);
+    if (!under) _dailyExhausted.add(ch);
     return under;
 }
 
-export function tickRequest() {
-    const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
-    _mem.count += 1;
+export function tickRequest(channel = 'whatsapp') {
+    _rollDateIfNeeded();
+    _bucket(channel).count += 1;
     _scheduleWrite();
 }
 
-/** Accumulate token counts from Gemini usageMetadata (Google-reported). */
-export function tickTokens(usage = {}) {
-    const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
+export function tickTokens(usage = {}, channel = 'whatsapp') {
+    _rollDateIfNeeded();
+    const b = _bucket(channel);
     const prompt = Number(usage.promptTokenCount) || 0;
     const output = Number(usage.candidatesTokenCount) || 0;
     const thinking = Number(usage.thoughtsTokenCount) || 0;
     const total = Number(usage.totalTokenCount) || (prompt + output + thinking);
-    _mem.tokens_prompt += prompt;
-    _mem.tokens_output += output;
-    _mem.tokens_thinking += thinking;
-    _mem.tokens_total += total;
+    b.tokens_prompt += prompt;
+    b.tokens_output += output;
+    b.tokens_thinking += thinking;
+    b.tokens_total += total;
     _scheduleWrite();
 }
 
-export function tickFallback() {
-    const d = _today();
-    if (_mem.date !== d) _mem = { date: d, count: 0, fallbacks: 0, tokens_prompt: 0, tokens_output: 0, tokens_thinking: 0, tokens_total: 0 };
-    _mem.fallbacks += 1;
+export function tickFallback(channel = 'whatsapp') {
+    _rollDateIfNeeded();
+    _bucket(channel).fallbacks += 1;
     _scheduleWrite();
 }
 
-export function quotaStatus() {
-    const d = _today();
-    const count = _mem.date === d ? _mem.count : 0;
-    const tokens = _mem.date === d ? {
-        prompt: _mem.tokens_prompt,
-        output: _mem.tokens_output,
-        thinking: _mem.tokens_thinking,
-        total: _mem.tokens_total,
-    } : { prompt: 0, output: 0, thinking: 0, total: 0 };
+export function quotaStatus(channel = 'whatsapp') {
+    _rollDateIfNeeded();
+    const ch = _normChannel(channel);
+    const b = _bucket(ch);
+    const cap = _cap(ch);
+    const unlimited = isUnlimitedCap(cap);
     return {
-        date: d,
-        count,
-        cap: _cap(),
-        fallbacks: _mem.date === d ? _mem.fallbacks : 0,
-        remaining: Math.max(0, _cap() - count),
-        tokens,
+        channel: ch,
+        date: _mem.date || _today(),
+        count: b.count,
+        cap: unlimited ? null : cap,
+        unlimited,
+        fallbacks: b.fallbacks,
+        remaining: unlimited ? null : Math.max(0, cap - b.count),
+        tokens: {
+            prompt: b.tokens_prompt,
+            output: b.tokens_output,
+            thinking: b.tokens_thinking,
+            total: b.tokens_total,
+        },
+    };
+}
+
+export function quotaStatusAll() {
+    return {
+        whatsapp: quotaStatus('whatsapp'),
+        operator: quotaStatus('operator'),
+        operator_transcribe: quotaStatus('operator_transcribe'),
+    };
+}
+
+/** Dashboard-friendly: two independent budgets + models per channel. */
+export function quotaDashboard() {
+    const all = quotaStatusAll();
+    const registry = quotaRegistry();
+    return {
+        independent_budgets: true,
+        registry_version: registry.version,
+        verify_url: registry.verify_url,
+        docs: registry.docs,
+        google_exhausted_models: googleExhaustedModels(),
+        channels: {
+            whatsapp: {
+                ...CHANNEL_BUDGETS.whatsapp,
+                defaultCap: CHANNEL_BUDGETS.whatsapp.defaultCap,
+                google_rpd_max: CHANNEL_BUDGETS.whatsapp.googleRpdMax(),
+                ...all.whatsapp,
+                models: WHATSAPP_MODELS,
+            },
+            operator: {
+                ...CHANNEL_BUDGETS.operator,
+                defaultCap: CHANNEL_BUDGETS.operator.defaultCap,
+                google_rpd_max: CHANNEL_BUDGETS.operator.googleRpdMax(),
+                ...all.operator,
+                models: OPERATOR_TEXT_MODELS,
+            },
+            operator_transcribe: {
+                ...CHANNEL_BUDGETS.operator_transcribe,
+                google_rpd_max: CHANNEL_BUDGETS.operator_transcribe.googleRpdMax(),
+                ...all.operator_transcribe,
+                models: OPERATOR_TRANSCRIBE_MODELS,
+            },
+        },
+        live_audio_models: registry.live_audio_models,
+        grounding: registry.grounding,
     };
 }
 
 function _scheduleWrite() {
-    if (_testCap !== null) return;  // don't touch Supabase in tests
+    if (_testCap !== null || _testCapByChannel) return;
     clearTimeout(_writeTimer);
     _writeTimer = setTimeout(_flush, 500);
 }
 
-// Flush immediately on process exit so Railway deploys don't lose counts.
 async function flushQuota() {
     clearTimeout(_writeTimer);
-    if (_testCap !== null) return;
-    if (_mem.count === 0 && _mem.fallbacks === 0) return; // nothing to write
+    if (_testCap !== null || _testCapByChannel) return;
+    const total = CHANNELS.reduce((n, ch) => n + _bucket(ch).count, 0);
+    if (total === 0 && _mem.whatsapp.fallbacks === 0 && _mem.operator.fallbacks === 0) return;
     await _flush();
 }
 
-// Register shutdown handler once
 if (typeof process !== 'undefined' && !process._quotaShutdownRegistered) {
     process._quotaShutdownRegistered = true;
     const shutdown = async () => { await flushQuota(); process.exit(0); };
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
-    process.on('beforeExit', () => { _flush(); }); // best-effort
+    process.on('beforeExit', () => { _flush(); });
 }
 
 async function _flush() {
     try {
         const db = await _db();
+        const wa = _mem.whatsapp;
+        const op = _mem.operator;
+        const tx = _mem.operator_transcribe;
         const { error } = await db
             .from('agent_quota')
             .upsert({
                 date: _mem.date,
-                request_count: _mem.count,
-                fallback_count: _mem.fallbacks,
-                tokens_prompt: _mem.tokens_prompt,
-                tokens_output: _mem.tokens_output,
-                tokens_thinking: _mem.tokens_thinking,
-                tokens_total: _mem.tokens_total,
+                request_count: wa.count,
+                fallback_count: wa.fallbacks,
+                tokens_prompt: wa.tokens_prompt,
+                tokens_output: wa.tokens_output,
+                tokens_thinking: wa.tokens_thinking,
+                tokens_total: wa.tokens_total,
+                operator_request_count: op.count,
+                operator_fallback_count: op.fallbacks,
+                operator_tokens_total: op.tokens_total,
+                transcribe_request_count: tx.count,
+                transcribe_tokens_total: tx.tokens_total,
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'date' });
         if (error) console.warn('[AGENT-QUOTA] write failed:', error.message);
@@ -189,4 +308,4 @@ async function _flush() {
     }
 }
 
-export { _setCapForTest, resetForTest };
+export { _setCapForTest, _setCapForChannelTest, resetForTest };

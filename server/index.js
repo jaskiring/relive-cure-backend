@@ -23,8 +23,9 @@ import { saveWhatsAppMessage } from './whatsapp-store.js';
 import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus, getLastAgentFailReason } from './llm-agent.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
+import { registerOperatorRoutes } from './operator-routes.js';
 import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
-import { hydrateQuota, isUnderQuota, quotaStatus } from './agent-quota.js';
+import { hydrateQuota, isUnderQuota, quotaStatus, quotaStatusAll, quotaDashboard } from './agent-quota.js';
 import { saveSubscription, removeSubscription, fanout, isPushConfigured, VAPID_PUBLIC_KEY } from './push.js';
 import { REFRENS_LABELS, REFRENS_STATUS } from '../src/lib/enums.js';
 import multer from 'multer';
@@ -83,7 +84,8 @@ app.get('/api/agent/quota', async (req, res) => {
     try {
         await hydrateQuota();
         const status = agentStatus();
-        const q = status.quota || { count: 0, cap: 5600, fallbacks: 0, remaining: 5600, tokens: { prompt: 0, output: 0, thinking: 0, total: 0 }, date: new Date().toISOString().slice(0, 10) };
+        const dashboard = quotaDashboard();
+        const q = dashboard.channels.whatsapp;
         const remaining = q.remaining ?? Math.max(0, (q.cap || 5600) - (q.count || 0));
         const agentPaused = status.enabled && remaining <= 0;
         const resetsAt = new Date();
@@ -93,10 +95,14 @@ app.get('/api/agent/quota', async (req, res) => {
             success: true,
             ...status,
             quota: { ...q, remaining },
+            quotas: quotaStatusAll(),
+            quota_dashboard: dashboard,
+            operator_quota: dashboard.channels.operator,
+            operator_transcribe_quota: dashboard.channels.operator_transcribe,
             agent_paused: agentPaused,
-            pause_reason: agentPaused ? 'daily_cap_reached' : null,
+            pause_reason: agentPaused ? 'whatsapp_daily_cap_reached' : null,
             resets_at: resetsAt.toISOString(),
-            note: 'Each model in model_chain has its own ~1,500 RPD free pool (billing linked). App cap = sum across chain. Tokens = Gemini usageMetadata per success.',
+            note: 'Independent budgets: whatsapp (customer models) vs operator (CRM models). Shared google_exhausted_models only when Google 429s a model.',
         });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
@@ -1103,7 +1109,7 @@ function isPlainGreeting(msgLow) {
 
 /** In LIVE mode with quota, route through Gemini instead of greeting/short-message fast paths. */
 function preferAgentOverFastPaths() {
-    return isAgentEnabled() && agentMode() === 'live' && isUnderQuota();
+    return isAgentEnabled() && agentMode() === 'live' && isUnderQuota('whatsapp');
 }
 
 function isAdCtaMessage(msgLow) {
@@ -2183,6 +2189,15 @@ registerBotLabRoutes(app, {
     schedulePersist,
     supabaseAdmin,
     sendToAPI,
+});
+
+registerOperatorRoutes(app, {
+    requireCrmKey,
+    supabaseAdmin,
+    getAllowedTabsForUser,
+    fanout,
+    isPushConfigured,
+    upload,
 });
 
 // ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────

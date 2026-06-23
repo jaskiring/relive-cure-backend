@@ -15,15 +15,12 @@
 // AI Studio free tier when billing is linked (see ai.google.dev/rate-limits).
 // LLM only extracts fields — WhatsApp replies are composed rule-based in index.js.
 
-import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus } from './agent-quota.js';
+import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus, quotaStatusAll } from './agent-quota.js';
+import { WHATSAPP_MODELS } from './gemini-channels.js';
+import { markGoogleModelExhausted, isGoogleModelExhausted, googleExhaustedModels } from './gemini-model-health.js';
 
-/** Free-tier models ordered fastest-first. Each has a separate daily request pool. */
-export const FREE_TIER_MODELS = [
-    { id: 'gemini-2.5-flash-lite', rpd: 1500, provider: 'gemini', label: 'Flash-Lite' },
-    { id: 'gemini-2.5-flash', rpd: 1500, provider: 'gemini', label: 'Flash' },
-    { id: 'gemini-2.0-flash', rpd: 1500, provider: 'gemini', label: 'Flash 2.0' },
-    { id: 'gemma-4-26b-a4b-it', rpd: 1500, provider: 'gemma', label: 'Gemma' },
-];
+/** @deprecated use WHATSAPP_MODELS from gemini-channels.js */
+export const FREE_TIER_MODELS = WHATSAPP_MODELS;
 
 const PRIMARY_MODEL = FREE_TIER_MODELS[0].id;
 const DEFAULT_MODEL = PRIMARY_MODEL;
@@ -33,24 +30,13 @@ const GEMMA_TIMEOUT_MS = 12000;
 const RATE_LIMIT_RETRY_MS = 1500;
 const RATE_LIMIT_BACKOFF_MS = 5000;
 
-/** Skip models that already hit Google daily quota today (avoids 3× dead calls before Gemma). */
-let _exhaustedDate = null;
-const _exhaustedModels = new Set();
-
-function _todayKey() { return new Date().toISOString().slice(0, 10); }
-
+/** Skip models Google marked daily-exhausted (shared across WhatsApp + Operator). */
 function markModelDailyExhausted(model) {
-    const d = _todayKey();
-    if (_exhaustedDate !== d) {
-        _exhaustedDate = d;
-        _exhaustedModels.clear();
-    }
-    _exhaustedModels.add(model);
+    markGoogleModelExhausted(model);
 }
 
 function isModelDailyExhausted(model) {
-    if (_exhaustedDate !== _todayKey()) return false;
-    return _exhaustedModels.has(model);
+    return isGoogleModelExhausted(model);
 }
 
 function activeModelChain() {
@@ -75,7 +61,7 @@ export function freeTierCapacity() {
     const chain = modelChain();
     const models = chain.map((id) => {
         const meta = FREE_TIER_MODELS.find((m) => m.id === id);
-        return { id, rpd: meta?.rpd ?? FREE_TIER_RPD_PER_MODEL, provider: meta?.provider ?? 'gemini', label: meta?.label ?? id };
+        return { id, rpd: meta?.generate_rpd ?? meta?.rpd ?? FREE_TIER_RPD_PER_MODEL, provider: meta?.provider ?? 'gemini', label: meta?.label ?? id };
     });
     return {
         models,
@@ -154,9 +140,10 @@ export function agentStatus() {
         fallback_model: chain[1] || null,
         fallback_chain: chain.slice(1),
         free_tier: capacity,
-        exhausted_models: [..._exhaustedModels],
+        exhausted_models: googleExhaustedModels(),
+        whatsapp_models: modelChain(),
         last_model: _lastModelUsed,
-        quota: quotaStatus(),
+        quota: quotaStatus('whatsapp'),
     };
 }
 
@@ -352,8 +339,8 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
         console.warn('[AGENT] circuit breaker open (post-429 backoff) → fallback');
         return _fail('gemini_rate_limited');
     }
-    if (!isUnderQuota()) {
-        console.warn('[AGENT] daily free cap reached → fallback');
+    if (!isUnderQuota('whatsapp')) {
+        console.warn('[AGENT] WhatsApp daily cap reached → fallback');
         return _fail('gemini_quota_exhausted');
     }
 
@@ -413,7 +400,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 });
             } catch (e) {
                 clearTimeout(timer);
-                tickFallback();
+                tickFallback('whatsapp');
                 const reason = e.name === 'AbortError' ? `${prefix}_timeout` : `${prefix}_network_error`;
                 console.error(`[AGENT:${model}] ${reason} → fallback:`, e.message);
                 if (mi < chain.length - 1) break;
@@ -435,7 +422,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                     await _sleep(RATE_LIMIT_RETRY_MS);
                     continue;
                 }
-                tickFallback();
+                tickFallback('whatsapp');
                 _backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
                 console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s`);
                 if (mi < chain.length - 1) break;
@@ -444,7 +431,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
 
             if (!res.ok) {
                 const txt = await res.text().catch(() => '');
-                tickFallback();
+                tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
                 if (mi < chain.length - 1 && (res.status >= 500 || res.status === 404)) break;
                 return _fail(`${prefix}_http_error`);
@@ -453,7 +440,7 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             let data;
             try { data = await res.json(); }
             catch (e) {
-                tickFallback();
+                tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] bad JSON envelope → fallback`);
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_bad_response`);
@@ -461,14 +448,14 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
 
             const cand = data?.candidates?.[0];
             if (data?.promptFeedback?.blockReason || !cand) {
-                tickFallback();
+                tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] blocked/empty → fallback`);
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_blocked`);
             }
             const raw = extractCandidateText(cand);
             if (!raw) {
-                tickFallback();
+                tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] empty text → fallback`);
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_empty`);
@@ -478,22 +465,22 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
             try {
                 parsed = parseAgentJson(raw);
             } catch (e) {
-                tickFallback();
+                tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] could not parse model JSON → fallback:`, raw.slice(0, 120));
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_bad_json`);
             }
             if (!parsed) {
-                tickFallback();
+                tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] empty parse → fallback`);
                 if (mi < chain.length - 1) break;
                 return _fail(`${prefix}_bad_json`);
             }
 
-            tickRequest();
+            tickRequest('whatsapp');
             _lastModelUsed = model;
             if (data?.usageMetadata) {
-                tickTokens(data.usageMetadata);
+                tickTokens(data.usageMetadata, 'whatsapp');
                 console.log(`[AGENT:${model}] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
             }
             return parsed;
