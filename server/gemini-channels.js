@@ -37,33 +37,42 @@ export const LLM_FALLBACK_ORDER = [
     'gemma-4-26b-a4b-it',
 ];
 
-/** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js */
+/** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js
+ *  generate_rpd = REAL free-tier daily caps (verified in AI Studio 2026-06-23):
+ *  Gemini 2.5 Flash / Flash-Lite are only ~20 RPD each; the Gemma pool (1.5k) is
+ *  the volume workhorse. Do NOT flat-set 1500 — that hid real exhaustion. */
 export const WHATSAPP_MODELS = LLM_FALLBACK_ORDER.map((id) => {
     const specs = {
         'gemini-2.5-flash-lite': {
             label: 'Flash-Lite',
             provider: 'gemini',
-            notes: 'Primary — fastest Gemini. Free tier ~1.5k RPD per model.',
+            generate_rpd: 20,
+            rpm: 10,
+            notes: 'Quick quality replies but only ~20 RPD free — exhausts fast, cascades to Gemma.',
         },
         'gemma-4-26b-a4b-it': {
             label: 'Gemma 4 26B',
             provider: 'gemma',
-            notes: 'Last LLM resort before rule-based — slow; separate free-tier pool.',
+            generate_rpd: 1500,
+            rpm: 15,
+            notes: 'Volume workhorse — 1.5k RPD free pool. Extraction-only; reply composed rule-based in index.js.',
         },
         'gemini-2.5-flash': {
             label: 'Flash',
             provider: 'gemini',
-            notes: 'Second fallback after Flash-Lite — before Gemma.',
+            generate_rpd: 20,
+            rpm: 5,
+            notes: 'Only ~20 RPD free — second quality tier before Gemma volume pool.',
         },
     };
-    const s = specs[id] || { label: id, provider: 'gemini' };
+    const s = specs[id] || { label: id, provider: 'gemini', generate_rpd: 1500, rpm: 15 };
     return {
         id,
         label: s.label,
         provider: s.provider,
         api: 'generateContent',
-        generate_rpd: 1500,
-        rpm: 15,
+        generate_rpd: s.generate_rpd ?? 1500,
+        rpm: s.rpm ?? 15,
         tpm_in: 1_000_000,
         notes: s.notes,
     };

@@ -67,7 +67,7 @@ export function freeTierCapacity() {
     return {
         models,
         rpd_per_model: FREE_TIER_RPD_PER_MODEL,
-        total_rpd: models.length * FREE_TIER_RPD_PER_MODEL,
+        total_rpd: models.reduce((s, m) => s + (m.rpd || 0), 0),
     };
 }
 
