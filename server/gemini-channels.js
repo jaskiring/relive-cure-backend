@@ -30,11 +30,16 @@ export const QUOTA_BUFFER_PER_MODEL = 100;
  * @property {string} [notes]
  */
 
-/** Ordered LLM fallback: fast Gemini → full Flash → Gemma (last LLM) → rule-based. */
+/** Ordered LLM fallback — quality-first, then high-volume pools, then rule-based.
+ *  Each is a SEPARATE free-tier quota pool, so cascading multiplies daily capacity.
+ *  Unknown/renamed ids just 404 and skip to the next model (safe). New-model ids
+ *  (3.x) are best-effort — verify exact strings at https://aistudio.google.com/rate-limit. */
 export const LLM_FALLBACK_ORDER = [
-    'gemini-2.5-flash-lite',
-    'gemini-2.5-flash',
-    'gemma-4-26b-a4b-it',
+    'gemini-2.5-flash-lite',  // ~20 RPD — fast, good quality
+    'gemini-2.5-flash',       // ~20 RPD — quality
+    'gemini-3.5-flash',       // ~20 RPD — near-Pro quality (verify id)
+    'gemini-3.1-flash-lite',  // ~500 RPD — high-volume workhorse (verify id)
+    'gemma-4-26b-a4b-it',     // ~1500 RPD — volume pool (extract-only; reply rule-based)
 ];
 
 /** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js
@@ -63,6 +68,20 @@ export const WHATSAPP_MODELS = LLM_FALLBACK_ORDER.map((id) => {
             generate_rpd: 20,
             rpm: 5,
             notes: 'Only ~20 RPD free — second quality tier before Gemma volume pool.',
+        },
+        'gemini-3.5-flash': {
+            label: 'Flash 3.5',
+            provider: 'gemini',
+            generate_rpd: 20,
+            rpm: 5,
+            notes: 'Near-Pro quality, ~20 RPD free. Verify exact id in AI Studio.',
+        },
+        'gemini-3.1-flash-lite': {
+            label: 'Flash-Lite 3.1',
+            provider: 'gemini',
+            generate_rpd: 500,
+            rpm: 15,
+            notes: 'High-volume workhorse — ~500 RPD free, low latency. Verify exact id in AI Studio.',
         },
     };
     const s = specs[id] || { label: id, provider: 'gemini', generate_rpd: 1500, rpm: 15 };

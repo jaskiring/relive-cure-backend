@@ -41,7 +41,11 @@ function isModelDailyExhausted(model) {
 }
 
 function activeModelChain() {
-    return modelChain().filter((m) => !isModelDailyExhausted(m));
+    const now = Date.now();
+    // Skip models that are daily-exhausted OR in a short per-model rate-limit backoff.
+    // Per-model (not global) so one model's RPM-429 never pauses the whole agent —
+    // critical for serving 5-10 chats in parallel.
+    return modelChain().filter((m) => !isModelDailyExhausted(m) && (_modelBackoff.get(m) || 0) <= now);
 }
 
 function isGemmaModel(model) {
@@ -84,7 +88,7 @@ function isGoogleDailyQuota429(status, errText) {
 }
 
 // Circuit breaker: after repeated 429s, back off briefly (Gemini free tier ~5 RPM).
-let _backoffUntil = 0;  // epoch ms — short backoff for 429
+const _modelBackoff = new Map();  // model id → epoch ms until retry (PER-MODEL, not global)
 let _lastFailReason = null;
 let _lastModelUsed = null;
 
@@ -353,10 +357,8 @@ export async function runGeminiAgentDetailed({ message, history = [], sessionDat
         return { fields: null, model: null, failReason: 'agent_off', chain: chainTried };
     }
 
-    if (Date.now() < _backoffUntil) {
-        console.warn('[AGENT] circuit breaker open (post-429 backoff) → fallback');
-        return { fields: null, model: null, failReason: 'gemini_rate_limited', chain: chainTried };
-    }
+    // No global backoff gate — per-model backoff is applied inside activeModelChain()
+    // so a single model's rate-limit never blocks the whole agent for other chats.
     if (!isUnderQuota('whatsapp')) {
         console.warn('[AGENT] WhatsApp daily cap reached → fallback');
         return { fields: null, model: null, failReason: 'gemini_quota_exhausted', chain: chainTried };
@@ -451,8 +453,8 @@ export async function runGeminiAgentDetailed({ message, history = [], sessionDat
                     continue;
                 }
                 tickFallback('whatsapp');
-                _backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
-                console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s`);
+                _modelBackoff.set(model, Date.now() + RATE_LIMIT_BACKOFF_MS);  // back off THIS model only
+                console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s (this model only)`);
                 if (mi < chain.length - 1) break;
                 _lastFailReason = `${prefix}_rate_limited`;
                 setChannelMode('whatsapp', 'rule-based', _lastFailReason);
