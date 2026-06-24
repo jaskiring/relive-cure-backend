@@ -5,7 +5,10 @@ import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
 import { quotaStatusAll, quotaStatusForClient, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
 import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
-import { recordWorkerHeartbeat, isOperatorWorkerOnline, workerLastSeen, workerMeta, operatorDevUsername } from './operator-dev-state.js';
+import { recordWorkerHeartbeat, isOperatorWorkerOnline, workerLastSeen, workerMeta, operatorDevUsername, workersOnlineStatus } from './operator-dev-state.js';
+import { pickDevRoute, devRouteLabel } from './operator-dev-router.js';
+import { runValidateGate } from './operator-validate-gate.js';
+import { resolve } from 'path';
 
 function hasExportPermission(tabs, role) {
     return role === 'admin' || (tabs || []).includes('export_leads');
@@ -91,9 +94,9 @@ export function registerOperatorRoutes(app, deps) {
         if (devOnly) {
             q = supabaseAdmin
                 .from('operator_inbox')
-                .select('id, username, kind, message, transcript, edited_prompt, status, dev_status, dev_result, approved_by, created_at, updated_at')
+                .select('id, username, kind, message, transcript, edited_prompt, status, dev_status, dev_route, dev_result, approved_by, created_at, updated_at')
                 .eq('status', 'approved')
-                .in('dev_status', ['queued', 'running', 'ready'])
+                .in('dev_status', ['queued', 'running', 'ready', 'failed'])
                 .order('updated_at', { ascending: false })
                 .limit(20);
         }
@@ -254,13 +257,18 @@ export function registerOperatorRoutes(app, deps) {
         if (!row) return res.status(404).json({ success: false, error: 'not found' });
         const prompt = edited || row.transcript || row.message;
         const approver = req.dashboardUser?.username || null;
+        const rowWithPrompt = { ...row, edited_prompt: prompt };
+        const override = req.body?.dev_route || req.body?.route || null;
+        const dev_route = pickDevRoute(rowWithPrompt, override === 'auto' ? null : override);
         const { data, error } = await supabaseAdmin
             .from('operator_inbox')
             .update({
                 edited_prompt: prompt,
                 status: 'approved',
                 dev_status: 'queued',
+                dev_route,
                 approved_by: approver,
+                dev_result: { route: dev_route, queued_at: new Date().toISOString() },
                 updated_at: new Date().toISOString(),
             })
             .eq('id', id)
@@ -270,6 +278,7 @@ export function registerOperatorRoutes(app, deps) {
 
         const devUser = operatorDevUsername();
         const youAreDevUser = approver === devUser;
+        const workers = workersOnlineStatus();
         let founderOnline = false;
         try {
             const since = new Date(Date.now() - 120_000).toISOString();
@@ -283,25 +292,34 @@ export function registerOperatorRoutes(app, deps) {
             founderOnline = !!pres;
         } catch { /* table may not exist yet */ }
 
-        const workerOn = isOperatorWorkerOnline();
+        const routeLabel = devRouteLabel(dev_route);
+        const workerOn = dev_route === 'opencode' ? workers.opencode : workers.cursor;
         let message;
-        if (youAreDevUser && founderOnline && workerOn) {
-            message = 'Approved — Cursor bridge will open the task on your Mac shortly.';
+        if (dev_route === 'opencode') {
+            if (workerOn) {
+                message = `Approved (${routeLabel}) — OpenCode worker will implement on your Mac.`;
+            } else {
+                message = `Approved (${routeLabel}). Run: cd relive-cure-backend && npm run operator-opencode`;
+            }
+        } else if (youAreDevUser && founderOnline && workerOn) {
+            message = `Approved (${routeLabel}) — Cursor bridge will open the task on your Mac shortly.`;
         } else if (youAreDevUser && founderOnline) {
-            message = 'Approved. Run on your Mac: cd relive-cure-backend && npm run operator-cursor';
+            message = `Approved (${routeLabel}). Run: cd relive-cure-backend && npm run operator-cursor`;
         } else if (youAreDevUser) {
-            message = 'Approved. Log into CRM on your Mac, then run: npm run operator-cursor';
+            message = `Approved (${routeLabel}). Log into CRM on your Mac, then run: npm run operator-cursor`;
         } else {
-            message = `Approved for ${devUser}. They need CRM open on their Mac + npm run operator-cursor.`;
+            message = `Approved for ${devUser} (${routeLabel}). They need CRM + npm run operator-cursor on their Mac.`;
         }
 
         res.json({
             success: true,
             item: data,
             dev_user: devUser,
-            dev_engine: 'cursor',
+            dev_route,
+            dev_engine: dev_route,
             founder_online: founderOnline,
             worker_online: workerOn,
+            workers,
             message,
         });
     });
@@ -311,16 +329,46 @@ export function registerOperatorRoutes(app, deps) {
         const id = parseInt(req.params.id, 10);
         if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'invalid id' });
         const note = String(req.body?.note || '').trim();
+        const skipValidate = req.body?.skip_validate === true;
+
+        const { data: existing, error: fetchErr } = await supabaseAdmin
+            .from('operator_inbox')
+            .select('id, dev_status, dev_route, dev_result')
+            .eq('id', id)
+            .maybeSingle();
+        if (fetchErr) return res.status(500).json({ success: false, error: fetchErr.message });
+        if (!existing) return res.status(404).json({ success: false, error: 'not found' });
+        if (!['ready', 'running', 'queued'].includes(existing.dev_status)) {
+            return res.status(400).json({ success: false, error: `cannot mark done from dev_status=${existing.dev_status}` });
+        }
+
+        const workspace = process.env.OPERATOR_DEV_WORKSPACE
+            || resolve(process.cwd(), '..');
+        let validation = null;
+        if (!skipValidate) {
+            validation = await runValidateGate(workspace);
+            if (!validation.ok) {
+                return res.status(422).json({
+                    success: false,
+                    error: 'validate gate failed — fix errors before marking dev done',
+                    validation,
+                });
+            }
+        }
+
+        const route = existing.dev_route || existing.dev_result?.route || 'cursor';
         const { data, error } = await supabaseAdmin
             .from('operator_inbox')
             .update({
                 dev_status: 'done',
                 dev_result: {
-                    engine: 'cursor',
+                    ...(existing.dev_result || {}),
+                    engine: route,
                     completed_by: req.dashboardUser?.username || null,
                     completed_at: new Date().toISOString(),
                     note: note || null,
                     summary: note || 'Marked done in CRM after implementing in Cursor.',
+                    validation: validation ? { ok: true, at: new Date().toISOString() } : null,
                 },
                 updated_at: new Date().toISOString(),
             })
@@ -330,7 +378,7 @@ export function registerOperatorRoutes(app, deps) {
             .maybeSingle();
         if (error) return res.status(500).json({ success: false, error: error.message });
         if (!data) return res.status(404).json({ success: false, error: 'not found or already done' });
-        res.json({ success: true, item: data });
+        res.json({ success: true, item: data, validation });
     });
 
     app.post('/api/operator/inbox/:id/reject', async (req, res) => {
@@ -422,11 +470,12 @@ export function registerOperatorRoutes(app, deps) {
             success: true,
             enabled: true,
             inbox_ready: inboxReady,
-            dev_engine: 'cursor',
+            dev_engine: 'cursor+opencode',
             dev_user: devUser,
             founder_online: founderOnline,
             founder_last_seen: founderLastSeen,
             worker_online: isOperatorWorkerOnline(),
+            workers: workersOnlineStatus(),
             worker_last_seen: workerLastSeen() ? new Date(workerLastSeen()).toISOString() : null,
             worker_meta: workerMeta(),
             docs: 'docs/OPERATOR_DEV.md',

@@ -30,3 +30,23 @@ When finished in Cursor, mark **Dev done** in CRM Operator inbox (or tell the te
 Files changed, how to verify in the CRM.
 `;
 }
+
+/** Compact prompt for OpenCode CLI (mechanical tasks only). */
+export function buildOperatorOpencodePrompt(row, { workspace, devUser }) {
+    const body = row.edited_prompt || row.transcript || row.message || '';
+    return `Operator inbox #${row.id} — mechanical CRM fix (minimal diff only).
+
+Reporter: ${row.username} · Kind: ${row.kind} · Approved by: ${row.approved_by || devUser}
+Workspace root: ${workspace}
+
+Rules:
+- Fix ONLY what is described. No refactors, no unrelated files.
+- Primary repos: relive-cure-backend/server, relive-cure-dashboard/src
+- Match existing Relive Cure style.
+- Do NOT git commit or push.
+
+Request:
+${body}
+
+When done, list files changed and how to verify in the CRM.`;
+}

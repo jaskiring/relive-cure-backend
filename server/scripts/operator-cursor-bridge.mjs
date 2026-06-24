@@ -110,14 +110,18 @@ async function isFounderLoggedIn() {
 async function claimNextJob() {
     const { data: rows, error } = await supabase
         .from('operator_inbox')
-        .select('id, username, kind, message, transcript, edited_prompt, status, dev_status, approved_by')
+        .select('id, username, kind, message, transcript, edited_prompt, status, dev_status, dev_route, approved_by')
         .eq('status', 'approved')
         .eq('dev_status', 'queued')
         .order('created_at', { ascending: true })
-        .limit(5);
+        .limit(10);
     if (error) throw new Error(error.message);
 
-    const row = (rows || []).find((r) => !r.approved_by || r.approved_by === DEV_USER);
+    const row = (rows || []).find((r) => {
+        if (r.approved_by && r.approved_by !== DEV_USER) return false;
+        const route = r.dev_route || 'cursor';
+        return route === 'cursor';
+    });
     if (!row) return null;
 
     const { data: claimed, error: uErr } = await supabase
