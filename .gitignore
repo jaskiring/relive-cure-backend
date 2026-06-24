@@ -12,6 +12,8 @@ dist/
 
 puppeteer-session/
 puppeteer-session-v2/
+server/sessions.json
+sessions.json
 bundle.js
 *.js.map
 lasik-whatsapp-bot/
