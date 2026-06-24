@@ -35,6 +35,11 @@ function _labelFor(id, fallback = id) {
     return modelSpecById(id)?.label || fallback;
 }
 
+export function getModelUsageCount(modelId) {
+    _roll();
+    return _usage.get(modelId) || 0;
+}
+
 /**
  * Record a successful LLM call on a model.
  * @param {string} modelId

@@ -18,7 +18,7 @@
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, quotaStatus, quotaStatusAll } from './agent-quota.js';
 import { WHATSAPP_MODELS, llmFallbackChain } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted, googleExhaustedModels } from './gemini-model-health.js';
-import { tickModelRequest, setChannelMode, modelStatusForClient } from './gemini-model-tracker.js';
+import { tickModelRequest, setChannelMode, modelStatusForClient, getModelUsageCount } from './gemini-model-tracker.js';
 
 /** @deprecated use WHATSAPP_MODELS from gemini-channels.js */
 export const FREE_TIER_MODELS = WHATSAPP_MODELS;
@@ -26,14 +26,14 @@ export const FREE_TIER_MODELS = WHATSAPP_MODELS;
 const PRIMARY_MODEL = FREE_TIER_MODELS[0].id;
 const DEFAULT_MODEL = PRIMARY_MODEL;
 const FREE_TIER_RPD_PER_MODEL = 1500;
-const GEMINI_TIMEOUT_MS = 10000;
-const GEMMA_TIMEOUT_MS = 22000;
+const GEMINI_TIMEOUT_MS = 12000;
+const GEMMA_TIMEOUT_MS = 18000;
 const RATE_LIMIT_RETRY_MS = 1500;
 const RATE_LIMIT_BACKOFF_MS = 5000;
 
 /** Skip models Google marked daily-exhausted (shared across WhatsApp + Operator). */
 function markModelDailyExhausted(model) {
-    markGoogleModelExhausted(model);
+    markGoogleModelExhausted(model, { usedToday: getModelUsageCount(model) });
 }
 
 function isModelDailyExhausted(model) {
@@ -78,8 +78,9 @@ function requestTimeoutMs(model) {
 function isGoogleDailyQuota429(status, errText) {
     if (status !== 429) return false;
     const t = errText || '';
-    // Per-model daily pool exhausted — try next model in chain (not transient RPM).
-    return /GenerateRequestsPerDay|free_tier_requests|PerDayPerProjectPerModel/i.test(t);
+    // Strict: per-model DAILY cap only — not RPM / generic free-tier 429s.
+    if (/PerMinute|RPM|requests per minute/i.test(t)) return false;
+    return /GenerateRequestsPerDay|PerDayPerProjectPerModel|quota.*per.*day/i.test(t);
 }
 
 // Circuit breaker: after repeated 429s, back off briefly (Gemini free tier ~5 RPM).
@@ -333,23 +334,32 @@ function failReasonPrefix(model) {
 
 /**
  * Run the Gemini agent for one inbound message.
- * @param {{ message: string, history?: Array<{role:'user'|'model', text:string}>, sessionData?: object }} args
- * @returns {Promise<object|null>} structured result or null to fall back.
- *   Caller MUST treat null as "use the rule-based reply".
+ * @returns {Promise<object|null>} structured fields or null → rule-based fallback.
  */
-export async function runGeminiAgent({ message, history = [], sessionData = null }) {
+export async function runGeminiAgent(args) {
+    const out = await runGeminiAgentDetailed(args);
+    return out.fields;
+}
+
+/**
+ * Same as runGeminiAgent but returns per-call metadata (safe for parallel sessions).
+ * @returns {Promise<{ fields: object|null, model: string|null, failReason: string|null, chain: string[] }>}
+ */
+export async function runGeminiAgentDetailed({ message, history = [], sessionData = null }) {
+    const chainTried = [];
     _lastFailReason = null;
     _lastModelUsed = null;
-    if (!isAgentEnabled()) return null;
+    if (!isAgentEnabled()) {
+        return { fields: null, model: null, failReason: 'agent_off', chain: chainTried };
+    }
 
-    // Circuit breaker: skip if backing off from a recent 429.
     if (Date.now() < _backoffUntil) {
         console.warn('[AGENT] circuit breaker open (post-429 backoff) → fallback');
-        return _fail('gemini_rate_limited');
+        return { fields: null, model: null, failReason: 'gemini_rate_limited', chain: chainTried };
     }
     if (!isUnderQuota('whatsapp')) {
         console.warn('[AGENT] WhatsApp daily cap reached → fallback');
-        return _fail('gemini_quota_exhausted');
+        return { fields: null, model: null, failReason: 'gemini_quota_exhausted', chain: chainTried };
     }
 
     // Build context line from session data so the agent NEVER re-asks collected info
@@ -379,10 +389,11 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
     const chain = activeModelChain();
     if (!chain.length) {
         console.warn('[AGENT] all models daily-exhausted → fallback');
-        return _fail('agent_quota_exhausted');
+        return { fields: null, model: null, failReason: 'agent_quota_exhausted', chain: chainTried };
     }
     for (let mi = 0; mi < chain.length; mi++) {
         const model = chain[mi];
+        chainTried.push(model);
         const histSlice = isGemmaModel(model) ? -4 : -8;
         const modelContents = [
             ...history
@@ -411,15 +422,17 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback('whatsapp');
                 const reason = e.name === 'AbortError' ? `${prefix}_timeout` : `${prefix}_network_error`;
                 console.error(`[AGENT:${model}] ${reason} →`, e.message);
-                if (mi < chain.length - 1) {
-                    console.warn(`[AGENT:${model}] trying next model ${chain[mi + 1]}`);
-                    break;
-                }
                 if (reason.endsWith('_timeout') && attempt < 2) {
                     console.warn(`[AGENT:${model}] timeout — retry once`);
                     continue;
                 }
-                return _fail(reason);
+                if (mi < chain.length - 1) {
+                    console.warn(`[AGENT:${model}] trying next model ${chain[mi + 1]}`);
+                    break;
+                }
+                _lastFailReason = reason;
+                setChannelMode('whatsapp', 'rule-based', reason);
+                return { fields: null, model, failReason: reason, chain: chainTried };
             }
             clearTimeout(timer);
 
@@ -441,7 +454,9 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 _backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
                 console.warn(`[AGENT:${model}] 429 after retry → backing off ${RATE_LIMIT_BACKOFF_MS / 1000}s`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_rate_limited`);
+                _lastFailReason = `${prefix}_rate_limited`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
 
             if (!res.ok) {
@@ -449,7 +464,9 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] HTTP ${res.status} → fallback:`, txt.slice(0, 200));
                 if (mi < chain.length - 1 && (res.status >= 500 || res.status === 404)) break;
-                return _fail(`${prefix}_http_error`);
+                _lastFailReason = `${prefix}_http_error`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
 
             let data;
@@ -458,7 +475,9 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] bad JSON envelope → fallback`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_bad_response`);
+                _lastFailReason = `${prefix}_bad_response`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
 
             const cand = data?.candidates?.[0];
@@ -466,14 +485,18 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] blocked/empty → fallback`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_blocked`);
+                _lastFailReason = `${prefix}_blocked`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
             const raw = extractCandidateText(cand);
             if (!raw) {
                 tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] empty text → fallback`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_empty`);
+                _lastFailReason = `${prefix}_empty`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
 
             let parsed;
@@ -483,13 +506,17 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickFallback('whatsapp');
                 console.error(`[AGENT:${model}] could not parse model JSON → fallback:`, raw.slice(0, 120));
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_bad_json`);
+                _lastFailReason = `${prefix}_bad_json`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
             if (!parsed) {
                 tickFallback('whatsapp');
                 console.warn(`[AGENT:${model}] empty parse → fallback`);
                 if (mi < chain.length - 1) break;
-                return _fail(`${prefix}_bad_json`);
+                _lastFailReason = `${prefix}_bad_json`;
+                setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+                return { fields: null, model, failReason: _lastFailReason, chain: chainTried };
             }
 
             tickRequest('whatsapp');
@@ -499,10 +526,12 @@ export async function runGeminiAgent({ message, history = [], sessionData = null
                 tickTokens(data.usageMetadata, 'whatsapp');
                 console.log(`[AGENT:${model}] tokens +${data.usageMetadata.totalTokenCount || 0} (in ${data.usageMetadata.promptTokenCount || 0}, out ${data.usageMetadata.candidatesTokenCount || 0}, think ${data.usageMetadata.thoughtsTokenCount || 0})`);
             }
-            return parsed;
+            return { fields: parsed, model, failReason: null, chain: chainTried };
         }
     }
 
-    return _fail('agent_quota_exhausted');
+    _lastFailReason = 'agent_quota_exhausted';
+    setChannelMode('whatsapp', 'rule-based', _lastFailReason);
+    return { fields: null, model: null, failReason: _lastFailReason, chain: chainTried };
 }
 

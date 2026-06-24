@@ -262,7 +262,8 @@ export function registerBotLabRoutes(app, deps) {
             }
             const trigger = sess?._lastTrigger || null;
             const agentFail = sess?._lastAgentFail || null;
-            const usedModel = getLastAgentModel();
+            const usedModel = sess?._lastAgentModel || getLastAgentModel();
+            const agentChain = sess?._lastAgentChain || [];
             let replySource = 'unknown';
             if (trigger === 'agent') {
                 if (usedModel?.includes('gemma')) replySource = 'gemma';
@@ -283,6 +284,8 @@ export function registerBotLabRoutes(app, deps) {
                 reply: reply || '',
                 reply_source: replySource,
                 agent_fail: agentFail,
+                agent_chain: agentChain,
+                model: usedModel,
                 trigger,
                 session: labMeta[phone],
                 bot: snapshotSession(sess),

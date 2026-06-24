@@ -3,13 +3,14 @@
 import { isUnderQuota, tickRequest, tickFallback, tickTokens } from './agent-quota.js';
 import { OPERATOR_TEXT_MODELS, OPERATOR_TRANSCRIBE_MODELS, modelIds } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted, googleExhaustedModels } from './gemini-model-health.js';
+import { getModelUsageCount } from './gemini-model-tracker.js';
 
 export { OPERATOR_TEXT_MODELS, OPERATOR_TRANSCRIBE_MODELS };
 
 const TIMEOUT_MS = 12000;
 
 function markExhausted(model) {
-    markGoogleModelExhausted(model);
+    markGoogleModelExhausted(model, { usedToday: getModelUsageCount(model) });
 }
 
 function isExhausted(model) {
@@ -18,7 +19,9 @@ function isExhausted(model) {
 
 function isDaily429(status, errText) {
     if (status !== 429) return false;
-    return /GenerateRequestsPerDay|free_tier_requests|PerDayPerProjectPerModel/i.test(errText || '');
+    const t = errText || '';
+    if (/PerMinute|RPM|requests per minute/i.test(t)) return false;
+    return /GenerateRequestsPerDay|PerDayPerProjectPerModel|quota.*per.*day/i.test(t);
 }
 
 function apiKey() {

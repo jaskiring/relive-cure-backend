@@ -20,7 +20,8 @@ import { processQueue } from './crm-automation.js';
 import { supabaseAdmin } from './supabase-admin.js';
 import { syncRefrensLeads } from './refrens-sync.js';
 import { saveWhatsAppMessage } from './whatsapp-store.js';
-import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgent, agentStatus, getLastAgentFailReason } from './llm-agent.js';
+import { isAgentEnabled, agentMode, setAgentMode, runGeminiAgentDetailed, agentStatus, getLastAgentFailReason, getLastAgentModel } from './llm-agent.js';
+import { clearAllGoogleModelExhausted, googleExhaustedModels } from './gemini-model-health.js';
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { registerOperatorRoutes } from './operator-routes.js';
@@ -78,6 +79,19 @@ app.post('/api/agent/mode', async (req, res) => {
     }
     setAgentMode(mode);
     res.json({ success: true, ...agentStatus() });
+});
+
+/** Clear false-positive "Google daily exhausted" flags (e.g. after RPM 429). Admin only. */
+app.post('/api/agent/clear-exhausted', async (req, res) => {
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
+    const before = googleExhaustedModels();
+    clearAllGoogleModelExhausted();
+    res.json({
+        success: true,
+        cleared: before,
+        message: before.length ? `Cleared ${before.length} exhausted model flag(s). Refresh Bot Lab.` : 'No exhausted flags were set.',
+        ...agentStatus(),
+    });
 });
 
 // Persisted Gemini credit counter (Supabase agent_quota) — source of truth for the dashboard.
@@ -633,6 +647,17 @@ app.delete('/api/leads/:id', async (req, res) => {
 
 const INACTIVITY_MS = 10 * 60 * 1000;
 const SESSION_FILE = path.join(__dirname, 'sessions.json');
+
+/** One LLM call at a time per phone — parallel customers OK, no shared fail-reason races. */
+const _agentPhoneQueues = new Map();
+function runAgentForPhone(phone, fn) {
+    const prev = _agentPhoneQueues.get(phone) || Promise.resolve();
+    const job = prev.then(fn, fn);
+    _agentPhoneQueues.set(phone, job.finally(() => {
+        if (_agentPhoneQueues.get(phone) === job) _agentPhoneQueues.delete(phone);
+    }));
+    return job;
+}
 
 function detectLanguageWithConfidence(message) {
     if (!message) return { lang: 'EN', confidence: 'low' };
@@ -1919,10 +1944,20 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         // ─── LLM AGENT — extraction + rule-based reply ───
         if (isAgentEnabled()) {
             let agentResult = null;
+            let agentRun = null;
             try {
-                agentResult = await runGeminiAgent({ message, history: session._agentHistory || [], sessionData: session.data });
+                agentRun = await runAgentForPhone(phone, () => runGeminiAgentDetailed({
+                    message,
+                    history: session._agentHistory || [],
+                    sessionData: session.data,
+                }));
+                agentResult = agentRun?.fields ?? null;
+                session._lastAgentModel = agentRun?.model ?? null;
+                session._lastAgentFail = agentRun?.failReason ?? null;
+                session._lastAgentChain = agentRun?.chain ?? [];
             } catch (e) {
                 console.error('[AGENT] error → rule-based fallback:', e.message);
+                session._lastAgentFail = e.message;
             }
 
             if (agentResult) {
@@ -1961,7 +1996,7 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
                     console.log(`[AGENT:shadow] phone=${phone} inbound="${message.slice(0, 80)}" agent_reply="${(shadowReply || '').slice(0, 120)}"`);
                 }
             } else {
-                session._lastAgentFail = getLastAgentFailReason() || (isAgentEnabled() ? 'gemini_unavailable' : 'agent_off');
+                session._lastAgentFail = session._lastAgentFail || getLastAgentFailReason() || (isAgentEnabled() ? 'gemini_unavailable' : 'agent_off');
                 const hasRealName = session.data.contactName && session.data.contactName !== 'WhatsApp Lead'
                     && !COMMON_WORD_BLACKLIST.has(session.data.contactName.toLowerCase());
                 const hasData = session.data.city || session.data.eyePower || hasRealName;
@@ -2187,7 +2222,18 @@ function finalizeWithIngest(phone, session, trigger, finalizeFn, isTestChat = fa
 // ═════════════════════════════════════════════════════════════════════════════
 
 app.post('/chat', async (req, res) => {
-    try { const reply = await handleIncomingMessage(req.body, true); res.json({ reply }); }
+    try {
+        const reply = await handleIncomingMessage(req.body, true);
+        const phone = req.body?.phone;
+        const sess = phone ? botSessions[phone] : null;
+        res.json({
+            reply,
+            trigger: sess?._lastTrigger || null,
+            agent_fail: sess?._lastAgentFail || null,
+            model: sess?._lastAgentModel || getLastAgentModel(),
+            agent_chain: sess?._lastAgentChain || [],
+        });
+    }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 

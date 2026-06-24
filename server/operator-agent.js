@@ -3,7 +3,7 @@
 import { isUnderQuota, tickRequest, tickFallback, tickTokens, ensureQuotaHydrated } from './agent-quota.js';
 import { OPERATOR_TEXT_MODELS, llmFallbackChain } from './gemini-channels.js';
 import { markGoogleModelExhausted, isGoogleModelExhausted } from './gemini-model-health.js';
-import { tickModelRequest, setChannelMode } from './gemini-model-tracker.js';
+import { tickModelRequest, setChannelMode, getModelUsageCount } from './gemini-model-tracker.js';
 import { getOperatorToolDeclarations, executeOperatorTool, suggestToolsForMessage } from './operator-playbooks.js';
 import {
     isDataQuestion,
@@ -29,7 +29,7 @@ export function operatorLastGeminiError() {
 }
 
 function markExhausted(model) {
-    markGoogleModelExhausted(model);
+    markGoogleModelExhausted(model, { usedToday: getModelUsageCount(model) });
 }
 
 function isExhausted(model) {

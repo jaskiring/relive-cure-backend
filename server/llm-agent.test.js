@@ -235,7 +235,6 @@ test('modelChain: primary first then all free-tier fallbacks', withEnv({
     assert.deepEqual(modelChain(), [
         'gemini-2.5-flash-lite',
         'gemini-2.5-flash',
-        'gemini-2.0-flash',
         'gemma-4-26b-a4b-it',
     ]);
 }));

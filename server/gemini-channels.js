@@ -30,11 +30,11 @@ export const QUOTA_BUFFER_PER_MODEL = 100;
  * @property {string} [notes]
  */
 
-/** Ordered LLM fallback: fast Gemini → Gemma → full Gemini → (caller: rule-based). No billing required. */
+/** Ordered LLM fallback: fast Gemini → full Flash → Gemma (last LLM) → rule-based. */
 export const LLM_FALLBACK_ORDER = [
     'gemini-2.5-flash-lite',
-    'gemma-4-26b-a4b-it',
     'gemini-2.5-flash',
+    'gemma-4-26b-a4b-it',
 ];
 
 /** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js */
@@ -48,12 +48,12 @@ export const WHATSAPP_MODELS = LLM_FALLBACK_ORDER.map((id) => {
         'gemma-4-26b-a4b-it': {
             label: 'Gemma 4 26B',
             provider: 'gemma',
-            notes: 'Fast fallback before full Flash — separate free-tier pool.',
+            notes: 'Last LLM resort before rule-based — slow; separate free-tier pool.',
         },
         'gemini-2.5-flash': {
             label: 'Flash',
             provider: 'gemini',
-            notes: 'Full Gemini fallback before rule-based bot.',
+            notes: 'Second fallback after Flash-Lite — before Gemma.',
         },
     };
     const s = specs[id] || { label: id, provider: 'gemini' };
@@ -176,7 +176,7 @@ export function modelIds(list) {
     return list.map((m) => m.id);
 }
 
-/** Shared fallback chain — fast → Gemma → full Gemini. */
+/** Shared fallback chain — Flash-Lite → Flash → Gemma (last). */
 export function llmFallbackChain(channel = 'whatsapp') {
     if (channel === 'operator') return modelIds(OPERATOR_TEXT_MODELS);
     return modelIds(WHATSAPP_MODELS);
