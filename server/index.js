@@ -250,6 +250,31 @@ app.get('/api/diag/crm-form', async (req, res) => {
     }
 });
 
+// Diagnostic: list which Gemini/Gemma models THIS API key can call + free-tier
+// methods. Read-only, returns only public model ids (never the key). Open so the
+// real available ids can be verified without dashboard auth.
+app.get('/api/diag/gemini-models', async (req, res) => {
+    if (!process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY not set' });
+    try {
+        const r = await globalThis.fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${process.env.GEMINI_API_KEY}`);
+        const j = await r.json();
+        const models = (j.models || [])
+            .map(m => ({
+                id: (m.name || '').replace(/^models\//, ''),
+                methods: m.supportedGenerationMethods || [],
+            }))
+            .filter(m => m.methods.includes('generateContent'))
+            .map(m => m.id)
+            .sort();
+        const want = ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemma-4-31b', 'gemini-2.5-pro'];
+        const matches = {};
+        for (const w of want) matches[w] = models.filter(id => id.includes(w.replace('gemini-', '').replace('gemma-', '')) || id === w);
+        res.json({ success: true, generateContent_models: models, lookups: matches });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // ─── Sanity check ─────────────────────────────────────────────────────────────
 async function runSanityCheck() {
     const [labelsRes, statusRes] = await Promise.all([
