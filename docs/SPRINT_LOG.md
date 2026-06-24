@@ -7,4 +7,4 @@ Canonical workspace checklist: `../docs/RELIVE_CURE_DEV.md` §5–§9.
 - Activation: `../docs/ACTIVATION.md`, `npm run activation-check`
 - Audit: `capIntentScore`, funnel null-safe stages, `REP_FLEET_ENABLED` gate
 - Validation: `node --check server/*.js` ✅
-- Signature: Auto · Claude · 2026-06-23 · commit=TBD
+- Signature: Auto · Claude · 2026-06-23 · commit=02a8392
