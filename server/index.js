@@ -659,17 +659,41 @@ function runAgentForPhone(phone, fn) {
     return job;
 }
 
+// Strong Hinglish markers \u2014 words that essentially only appear in a Hindi
+// sentence (pronouns/verbs/question-words). One is enough to call HI.
+const HINGLISH_STRONG = new Set(['mujhe', 'mera', 'meri', 'mere', 'mereko', 'apna', 'apni', 'nahi', 'nahin', 'haan', 'kya', 'kyun', 'kyon', 'kaise', 'kaisa', 'kitna', 'kitne', 'kahan', 'chahiye', 'karwana', 'karwani', 'karana', 'karna', 'karni', 'karenge', 'batao', 'bata', 'bataye', 'theek', 'thik', 'achha', 'acha', 'sahi', 'matlab', 'shayad', 'shaayad', 'lagta', 'lagti', 'hoga', 'hogi', 'hoon', 'hun', 'raha', 'rahi', 'rahe', 'wala', 'wali']);
+// Weak/ambiguous markers \u2014 common but short; need 2+ to lean HI.
+const HINGLISH_WEAK = new Set(['hai', 'hain', 'ho', 'ka', 'ki', 'ke', 'ko', 'se', 'par', 'bhi', 'ji', 'aap', 'hum', 'tum', 'ye', 'wo', 'vo', 'na', 'to', 'toh', 'hu']);
+// Clear English structure words.
+const ENGLISH_MARKERS = new Set(['i', 'you', 'the', 'is', 'are', 'was', 'were', 'have', 'has', 'had', 'my', 'your', 'want', 'need', 'can', 'will', 'what', 'how', 'where', 'when', 'please', 'yes', 'no', 'price', 'cost', 'eye', 'power', 'glasses', 'both', 'me', 'might', 'about', 'this', 'that']);
+
 function detectLanguageWithConfidence(message) {
     if (!message) return { lang: 'EN', confidence: 'low' };
+    // Any Devanagari \u2192 definitively Hindi.
     if (/[\u0900-\u097F]/.test(message)) return { lang: 'HI', confidence: 'high' };
-    const hinglishWords = ['kya', 'hai', 'haan', 'nahi', 'mujhe', 'mera', 'meri', 'aap', 'karo', 'chahiye', 'bata', 'batao', 'theek', 'achha', 'bolna', 'kuch', 'kaisa', 'kaise', 'kitna', 'kitne', 'kab', 'kahan', 'kyun', 'kaun', 'lagta', 'lagti', 'hoga', 'hogi', 'karwana', 'karwani', 'hun', 'hoon', 'hu', 'matlab', 'acha', 'sahi', 'shyad', 'shayad', 'motia', 'motiyabind', 'se', 'par', 'bhi', 'ji'];
-    const m = message.toLowerCase();
-    const count = hinglishWords.filter(w => m.includes(w)).length;
-    if (count >= 2) return { lang: 'HI', confidence: 'high' };
-    if (count === 1 && /\b(mujhe|mera|hai|hu|hun|hoon|nahi|haan)\b/.test(m)) return { lang: 'HI', confidence: 'high' };
-    if (count === 1) return { lang: 'HI', confidence: 'medium' };
-    if (/\b(the|is|are|was|what|how|can|will|my|i am|you are|your|when|where|does|did)\b/i.test(m)) return { lang: 'EN', confidence: 'high' };
+    // Whole-word tokens only \u2014 NEVER substring (so 'motia' won't fire on 'motiabind'
+    // inside an English sentence, 'se'/'par' won't fire inside 'please'/'park').
+    const tokens = message.toLowerCase().match(/[a-z]+/g) || [];
+    let strong = 0, weak = 0, eng = 0;
+    for (const tkn of tokens) {
+        if (HINGLISH_STRONG.has(tkn)) strong++;
+        else if (HINGLISH_WEAK.has(tkn)) weak++;
+        if (ENGLISH_MARKERS.has(tkn)) eng++;
+    }
+    if (strong >= 1) return { lang: 'HI', confidence: 'high' };
+    if (weak >= 2 && weak > eng) return { lang: 'HI', confidence: 'high' };
+    if (weak === 1 && eng === 0 && tokens.length <= 3) return { lang: 'HI', confidence: 'medium' };
+    if (eng >= 1) return { lang: 'EN', confidence: 'high' };
     return { lang: 'EN', confidence: 'low' };
+}
+
+// Explicit user request to switch reply language. Returns 'EN' | 'HI' | null.
+// Must run BEFORE field capture so "english" isn't swallowed as an answer.
+function explicitLangSwitch(message) {
+    const m = message.trim().toLowerCase().replace(/[!.?,]+$/g, '');
+    if (/^(english|angrezi|angreji|englsh|inglish|in english|english me(in)?|english please|please english|talk in english|speak (in )?english|reply in english|switch to english)$/.test(m)) return 'EN';
+    if (/^(hindi|in hindi|hindi me(in)?|hindi please|please hindi|talk in hindi|speak (in )?hindi|reply in hindi|switch to hindi)$/.test(m)) return 'HI';
+    return null;
 }
 
 function resolveReplyLang(session, message) {
@@ -1358,8 +1382,10 @@ function passiveExtract(message, session) {
             d.eyePower = parsedPower;
             d.concern_power = true;
             d.lastAskedField = null;
-        } else if (justAskedPower && message.trim().length >= 1 && message.trim().length <= 60) {
+        } else if (justAskedPower && message.trim().length >= 1 && message.trim().length <= 60
+            && !explicitLangSwitch(message)) {
             // Unparseable reply after eye-power ask — accept and move on (avoid rule-based loop).
+            // Guard: never store a language-switch word ("english"/"hindi") as eye power.
             d.eyePower = { raw: message.trim(), parsed: message.trim(), numeric: null, confidence: 'user_stated' };
             d.lastAskedField = null;
         }
@@ -1880,6 +1906,21 @@ async function handleIncomingMessage(reqBody, isTestChat = false) {
         if (!session.data.first_message_at) session.data.first_message_at = session.last_activity_at;
         session.data.message_count = (session.data.message_count || 0) + 1;
         session.data.lastMessage = message;
+
+        // ─── Explicit language switch (e.g. user types "english") ───
+        // Runs BEFORE field capture so the switch word is never stored as an
+        // answer (e.g. eye power). Forces session.lang and re-asks in new lang.
+        const langSwitch = explicitLangSwitch(message);
+        if (langSwitch) {
+            session.lang = langSwitch;
+            if (session.state === 'GREETING') session.state = 'CORE_CONSULT';
+            const ack = langSwitch === 'EN' ? "Sure, I'll continue in English 😊" : 'ठीक है, मैं हिंदी में बात करूँगा 😊';
+            const next = getNextQuestion(session);
+            setReply(next && next.text ? `${ack}\n\n${next.text}` : ack);
+            resetInactivityTimer(phone);
+            return finalizeWithIngest(phone, session, 'rule-based', finalize, isTestChat);
+        }
+
         passiveExtract(message, session);
         sanitizeSessionFields(session);
         resetInactivityTimer(phone);
