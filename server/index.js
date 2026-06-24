@@ -844,6 +844,12 @@ function parseEyePower(message) {
         return pairResult(m, parseFloat(numRightLeftMatch[1]), parseFloat(numRightLeftMatch[2]));
     }
 
+    // Handle "5 and 7" / "power is -5 and -7" (common WhatsApp shorthand)
+    const andPairMatch = m.match(/(?:power\s+is\s+)?([+-]?\d+(?:\.\d+)?)\s+and\s+([+-]?\d+(?:\.\d+)?)/i);
+    if (andPairMatch) {
+        return pairResult(m, parseFloat(andPairMatch[1]), parseFloat(andPairMatch[2]));
+    }
+
     // Handle "both eyes same" or just a single number
     const match = m.match(/[-+]?\d+(\.\d+)?/);
     if (!match) {
@@ -858,6 +864,24 @@ function parseEyePower(message) {
 }
 function getEyePowerNumeric(ep) { if (!ep) return null; if (typeof ep === 'string') return parseFloat(ep) || null; return ep.numeric || null; }
 function getEyePowerString(ep) { if (!ep) return null; if (typeof ep === 'string') return ep; return ep.parsed || ep.raw || null; }
+
+/** True when a new parse should replace a junk or weaker stored eye power. */
+function shouldReplaceEyePower(existing, parsed, justAsked) {
+    if (!parsed) return false;
+    if (!existing) return true;
+    const hasBoth = parsed.right != null && parsed.left != null;
+    if (hasBoth) return true;
+    if (parsed.numeric != null && (existing.numeric == null || justAsked)) return true;
+    if (existing.confidence === 'user_stated' && existing.numeric == null && parsed.numeric != null) return true;
+    return false;
+}
+
+function isGarbageEyePowerCatchAll(ep) {
+    if (!ep || ep.numeric != null) return false;
+    if (ep.confidence !== 'user_stated') return false;
+    const t = String(ep.parsed || ep.raw || '').toLowerCase();
+    return t.length > 0 && !/[-+]?\d/.test(t);
+}
 
 function getMissingQualField(session) {
     sanitizeSessionFields(session);
@@ -1393,7 +1417,9 @@ function passiveExtract(message, session) {
     const powerMatch = message.match(/[-+]?\d+(\.\d+)?/);
     const powerContext = ['power', 'number', 'minus', 'plus', 'diopter', 'aankhein', 'eye', 'vision', 'right', 'left'];
     const hasContext = powerContext.some(w => m.includes(w)) || /[-+]\d/.test(message);
-    if (!d.eyePower || hasBothEyes || justAskedPower) {
+    const mayTakePower = shouldReplaceEyePower(d.eyePower, parsedPower, justAskedPower)
+        || isGarbageEyePowerCatchAll(d.eyePower);
+    if (mayTakePower || justAskedPower) {
         // ─── SAFETY: "No glasses/lens" handler ───
         const noGlassesStrong = /\b(no glass|no lens|bina chashma|chashma nahi|chasma nahi|nahi pehanta|nahi pehnta|nahi lagata|without glass)\b/i.test(m);
         const noLensOnly = /^no\s*lens(es)?$/i.test(message.trim()) || /^no$/i.test(message.trim());
@@ -1403,16 +1429,17 @@ function passiveExtract(message, session) {
         } else if (justAskedPower && noLensOnly) {
             d._noLensStated = true;
         } else if (parsedPower && (parsedPower.numeric != null || hasBothEyes)
-            && (hasContext || /both\s+eyes?/i.test(m) || justAskedPower || hasBothEyes)) {
+            && (hasContext || /both\s+eyes?/i.test(m) || justAskedPower || hasBothEyes || mayTakePower)) {
             d.eyePower = parsedPower;
             d.concern_power = true;
             d.lastAskedField = null;
         } else if (justAskedPower && message.trim().length >= 1 && message.trim().length <= 60
-            && !explicitLangSwitch(message)) {
-            // Unparseable reply after eye-power ask — accept and move on (avoid rule-based loop).
-            // Guard: never store a language-switch word ("english"/"hindi") as eye power.
-            d.eyePower = { raw: message.trim(), parsed: message.trim(), numeric: null, confidence: 'user_stated' };
-            d.lastAskedField = null;
+            && !explicitLangSwitch(message) && !powerMatch) {
+            // Non-numeric reply after eye-power ask — do NOT store garbage text as power.
+            // Keep lastAskedField so a follow-up like "5 and 7" can still land.
+            if (/\b(wear|wearing|clothes|clother|lens|lenses|glass|glasses|chashma|specs|spectacle)\b/i.test(m)) {
+                d._wearsCorrection = true;
+            }
         }
     } else if (justAskedPower) {
         d.lastAskedField = null;
@@ -1807,9 +1834,9 @@ function applyAgentExtract(session, ag) {
     if (ag.eye_power && typeof ag.eye_power === 'string') {
         const p = parseEyePower(ag.eye_power);
         const hasBoth = p?.right != null && p?.left != null;
-        if (!d.eyePower || hasBoth) {
+        if (shouldReplaceEyePower(d.eyePower, p, false) || isGarbageEyePowerCatchAll(d.eyePower)) {
             if (p && (p.numeric != null || hasBoth)) { d.eyePower = p; d.concern_power = true; }
-            else if (p?.raw) { d.eyePower = p; d.concern_power = true; }
+            else if (p?.raw && p.numeric != null) { d.eyePower = p; d.concern_power = true; }
         }
     }
     if (ag.timeline && typeof ag.timeline === 'string' && !d.timeline) d.timeline = ag.timeline.trim();
