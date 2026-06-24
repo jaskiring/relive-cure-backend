@@ -940,11 +940,20 @@ export async function getCampaignLeads(campaignId) {
   if (error) throw new Error(error.message);
 
   if (!metaLeads || metaLeads.length === 0) {
+    const accountBenchmark = await getAccountBenchmark();
+    const funnel = { total: 0, matched: 0, hot: 0, consulted: 0, booked: 0, won: 0, lost: 0, pending: 0 };
+    const { recommendations, analytics } = await buildCampaignLeadExtras(campaignId, {
+      breakdowns: null,
+      funnel,
+      accountBenchmark,
+    });
     return {
       leads: [],
-      funnel: { total: 0, matched: 0, hot: 0, consulted: 0, won: 0, lost: 0, pending: 0 },
+      funnel,
       breakdowns: null,
-      accountBenchmark: await getAccountBenchmark()
+      accountBenchmark,
+      recommendations,
+      analytics,
     };
   }
 
@@ -1019,7 +1028,7 @@ export async function getCampaignLeads(campaignId) {
     return 'Unknown'; // unmatched: no data at all
   }
   function stageOf(lead, refrens, bot) {
-    const status = refrens?.status || bot?.status || '';
+    const status = String(refrens?.status ?? bot?.status ?? '').toLowerCase();
     if (/deal done|won|surgery done|surgery booked/i.test(status)) return 'done';
     if (/booked|appointment|consultation booked/i.test(status))    return 'booked';
     if (/consult|consulted|interested/i.test(status))              return 'consulted';
@@ -1074,8 +1083,9 @@ export async function getCampaignLeads(campaignId) {
     const status  = refrens?.status || bot?.status || (l.matched_source ? 'matched' : 'pending');
     const intent  = intentOf(l, refrens, bot);
     const stage   = stageOf(l, refrens, bot);
-    const isWon   = stage === 'done';
-    const isLost  = stage === 'lost';
+    const safeStage = STAGES.includes(stage) ? stage : 'captured';
+    const isWon   = safeStage === 'done';
+    const isLost  = safeStage === 'lost';
     const isHot   = intent === 'HOT';
     const platform = platformOf(l);
     const city     = cityOf(l, refrens);
@@ -1083,7 +1093,7 @@ export async function getCampaignLeads(campaignId) {
     // Aggregations
     byIntent[intent].count++;
     if (isWon) byIntent[intent].surgeries++;
-    byStage[stage] = (byStage[stage] || 0) + 1;
+    byStage[safeStage] = (byStage[safeStage] || 0) + 1;
     if (l.ad_id) {
       const k = l.ad_id;
       const e = byAdMap[k] = byAdMap[k] || { ad_id: k, ad_name: adNameById[k] || k, count: 0, surgeries: 0 };
@@ -1093,7 +1103,7 @@ export async function getCampaignLeads(campaignId) {
     ce.count++; if (isWon) ce.surgeries++;
     const pe = byPlatformMap[platform] = byPlatformMap[platform] || { platform, count: 0, surgeries: 0 };
     pe.count++; if (isWon) pe.surgeries++;
-    intentByStage[intent][stage] = (intentByStage[intent][stage] || 0) + 1;
+    intentByStage[intent][safeStage] = (intentByStage[intent][safeStage] || 0) + 1;
     if (l.created_time) {
       const d = String(l.created_time).slice(0, 10);
       timelineMap[d] = (timelineMap[d] || 0) + 1;
@@ -1130,7 +1140,7 @@ export async function getCampaignLeads(campaignId) {
       bot,
       status,
       intent,
-      stage,
+      stage: safeStage,
       isWon, isLost, isHot,
       // flattened qualification fields for export + filtering
       insurance,
@@ -1234,28 +1244,43 @@ export async function getCampaignLeads(campaignId) {
   };
 
   const accountBenchmark = await getAccountBenchmark();
+  const { recommendations, analytics } = await buildCampaignLeadExtras(campaignId, {
+    breakdowns,
+    funnel,
+    accountBenchmark,
+  });
 
-  // Compute recommendations inline so the Leads tab can render them without
-  // a second round-trip. We need the kpis to do this — fetch the campaign
-  // detail once and cache it locally.
+  return { leads, funnel, breakdowns, accountBenchmark, recommendations, analytics };
+}
+
+// Shared helper — one getCampaignDetail() call powers both recommendations
+// and the deeper analytics payload for the Leads tab.
+async function buildCampaignLeadExtras(campaignId, { breakdowns, funnel, accountBenchmark }) {
   let recommendations = [];
+  let analytics = null;
   try {
     const det = await getCampaignDetail(campaignId);
+    analytics = computeCampaignLeadAnalytics({
+      kpis30: det.kpis30,
+      kpis7: det.kpis7,
+      wow: det.wow,
+      breakdowns: breakdowns || {},
+      funnel: funnel || {},
+      accountBenchmark,
+    });
     recommendations = computeRecommendations({
       kpis30: det.kpis30,
       kpis7: det.kpis7,
       wow: det.wow,
-      breakdowns,
-      funnel,
+      breakdowns: breakdowns || {},
+      funnel: funnel || {},
       accountBenchmark,
-      campaign: det.campaign
+      campaign: det.campaign,
     });
   } catch (e) {
-    // Non-fatal — Leads tab still renders without the recs strip.
-    console.warn(`[META] recommendations skipped for ${campaignId}: ${e.message}`);
+    console.warn(`[META] campaign lead extras skipped for ${campaignId}: ${e.message}`);
   }
-
-  return { leads, funnel, breakdowns, accountBenchmark, recommendations };
+  return { recommendations, analytics };
 }
 
 // ─── Single-campaign drill-down (used by GET /api/meta/campaign/:id) ─────────
@@ -1415,6 +1440,244 @@ export async function importAllCampaignLeads({ since } = {}) {
   };
 }
 
+// ─── Campaign lead analytics (structured insights for the Leads tab) ─────────
+// Pure function — all numbers come from getCampaignLeads() aggregations +
+// getCampaignDetail() KPIs + the cached account benchmark (real SQL counts).
+export function computeCampaignLeadAnalytics({ kpis30, kpis7, wow, breakdowns, funnel, accountBenchmark }) {
+  const b = breakdowns || {};
+  const f = funnel || {};
+  const bench = accountBenchmark || {};
+  const k30 = kpis30 || {};
+  const k7 = kpis7 || {};
+
+  const matchRate = f.total > 0 ? f.matched / f.total : null;
+  const surgeryRate = f.matched > 0 ? f.won / f.matched : null;
+  const hotPct = f.matched > 0 ? f.hot / f.matched : null;
+  const captureToSurgery = f.total > 0 ? f.won / f.total : null;
+  const spend = Number(k30.spend || 0);
+  const cplCaptured = f.total > 0 && spend > 0 ? spend / f.total : null;
+  const cps = f.won > 0 && spend > 0 ? spend / f.won : null;
+  const metaCpl = k30.cpl != null ? k30.cpl : (k30.leads > 0 && spend > 0 ? spend / k30.leads : null);
+
+  function pctDelta(cur, avg, asPp = false) {
+    if (cur == null || avg == null) return null;
+    if (asPp) return Math.round((cur - avg) * 1000) / 10;
+    if (avg === 0) return null;
+    return Math.round(((cur - avg) / avg) * 1000) / 10;
+  }
+
+  const benchmarkComparisons = [
+    { key: 'matchRate', label: 'CRM match rate', campaign: matchRate, account: bench.matchRate, format: 'pct', lowerBetter: false },
+    { key: 'surgeryRate', label: 'Surgery rate (matched)', campaign: surgeryRate, account: bench.surgeryRate, format: 'pct', lowerBetter: false },
+    { key: 'hotPct', label: 'HOT share (matched)', campaign: hotPct, account: bench.hotPct, format: 'pct', lowerBetter: false },
+    { key: 'captureToSurgery', label: 'Captured → surgery', campaign: captureToSurgery, account: bench.surgeryRate != null && bench.matchRate != null ? bench.surgeryRate * bench.matchRate : null, format: 'pct', lowerBetter: false },
+    { key: 'metaCpl', label: 'Meta CPL (platform)', campaign: metaCpl, account: bench.cpl, format: 'rs', lowerBetter: true },
+    { key: 'cplCaptured', label: 'Cost / captured lead', campaign: cplCaptured, account: bench.cpl, format: 'rs', lowerBetter: true },
+    { key: 'costPerSurgery', label: 'Cost / surgery', campaign: cps, account: bench.costPerSurgery, format: 'rs', lowerBetter: true },
+  ].map((row) => {
+    const delta = row.format === 'pct'
+      ? pctDelta(row.campaign, row.account, true)
+      : pctDelta(row.campaign, row.account, false);
+    const better = row.campaign != null && row.account != null
+      ? (row.lowerBetter ? row.campaign < row.account : row.campaign > row.account)
+      : null;
+    return { ...row, delta, better };
+  });
+
+  const contacted = (b.byStage?.contacted || 0) + (b.byStage?.consulted || 0) + (b.byStage?.booked || 0) + (b.byStage?.done || 0);
+  const consulted = (b.byStage?.consulted || 0) + (b.byStage?.booked || 0) + (b.byStage?.done || 0);
+  const booked = (b.byStage?.booked || 0) + (b.byStage?.done || 0);
+  const funnelSteps = [
+    { stage: 'Captured', count: f.total || 0 },
+    { stage: 'Matched', count: f.matched || 0 },
+    { stage: 'Contacted', count: contacted },
+    { stage: 'Consulted', count: consulted },
+    { stage: 'Booked', count: booked },
+    { stage: 'Surgery done', count: f.won || 0 },
+  ].map((step, i, arr) => {
+    const prev = i > 0 ? arr[i - 1].count : null;
+    const rateFromPrev = prev > 0 ? Math.round((step.count / prev) * 1000) / 10 : null;
+    const dropFromPrev = prev != null ? prev - step.count : null;
+    return { ...step, rateFromPrev, dropFromPrev };
+  });
+
+  let maxDrop = 0;
+  let bottleneck = null;
+  for (let i = 1; i < funnelSteps.length; i++) {
+    const drop = funnelSteps[i].dropFromPrev || 0;
+    if (drop > maxDrop) {
+      maxDrop = drop;
+      bottleneck = {
+        from: funnelSteps[i - 1].stage,
+        to: funnelSteps[i].stage,
+        drop,
+        dropPct: funnelSteps[i - 1].count > 0 ? Math.round((drop / funnelSteps[i - 1].count) * 1000) / 10 : null,
+      };
+    }
+  }
+
+  const timeline = b.timeline || [];
+  const last7 = timeline.slice(-7).reduce((s, d) => s + d.count, 0);
+  const prior7 = timeline.slice(-14, -7).reduce((s, d) => s + d.count, 0);
+  const velocityWow = prior7 > 0 ? Math.round(((last7 - prior7) / prior7) * 1000) / 10 : (last7 > 0 ? null : 0);
+  const avgPerDay30 = timeline.length > 0
+    ? Math.round((timeline.reduce((s, d) => s + d.count, 0) / timeline.length) * 10) / 10
+    : 0;
+  const peakDay = timeline.reduce((best, d) => (d.count > (best?.count || 0) ? d : best), null);
+
+  const sla = b.refrensSla || {};
+  const slaTotal = (sla.onTime || 0) + (sla.breached || 0) + (sla.dnp || 0);
+  const lostCount = Object.values(b.intentByStage || {}).reduce((s, stg) => s + (stg.lost || 0), 0);
+  const insuranceYes = (b.byInsurance || []).find((x) => /^yes$/i.test(x.value))?.count || 0;
+  const insuranceTotal = (b.byInsurance || []).reduce((s, x) => s + x.count, 0);
+
+  const quality = {
+    matchRate,
+    surgeryRate,
+    hotPct,
+    captureToSurgery,
+    lossRate: f.matched > 0 ? lostCount / f.matched : null,
+    slaBreachPct: slaTotal > 0 ? (sla.breached || 0) / slaTotal : null,
+    dnpPct: slaTotal > 0 ? (sla.dnp || 0) / slaTotal : null,
+    insuranceYesPct: insuranceTotal > 0 ? insuranceYes / insuranceTotal : null,
+    unmatched: f.pending,
+  };
+
+  function bestSegment(items, labelKey) {
+    const eligible = (items || []).filter((x) => x.count >= 5);
+    if (!eligible.length) return null;
+    const best = [...eligible].sort((a, c) => (c.surgeries / c.count) - (a.surgeries / a.count))[0];
+    return {
+      label: best[labelKey] || best.ad_name,
+      count: best.count,
+      surgeries: best.surgeries,
+      surgeryRate: Math.round((best.surgeries / best.count) * 1000) / 10,
+    };
+  }
+
+  const topSegments = {
+    city: bestSegment(b.byCity, 'city'),
+    ad: bestSegment(b.byAd, 'ad_name'),
+    platform: bestSegment(b.byPlatform, 'platform'),
+  };
+
+  const insights = [];
+  if (f.total === 0 && spend > 500) {
+    insights.push({
+      type: 'critical',
+      title: 'Spend without attributed leads',
+      detail: `₹${Math.round(spend).toLocaleString('en-IN')} spent in 30d but 0 form leads in CRM — verify Lead Ads setup or import historical submissions.`,
+    });
+  }
+  if (bottleneck && maxDrop >= 3) {
+    insights.push({
+      type: 'warn',
+      title: `Largest funnel drop: ${bottleneck.from} → ${bottleneck.to}`,
+      detail: `${bottleneck.drop} leads lost (${bottleneck.dropPct}% of ${bottleneck.from}) — sales effort here has the highest leverage.`,
+    });
+  }
+  if (matchRate != null && bench.matchRate != null && matchRate < bench.matchRate * 0.75) {
+    insights.push({
+      type: 'warn',
+      title: 'Below-average phone match rate',
+      detail: `${Math.round(matchRate * 100)}% vs account ${Math.round(bench.matchRate * 100)}% — run backfill-links after Refrens sync or check form phone quality.`,
+    });
+  }
+  if (surgeryRate != null && bench.surgeryRate != null) {
+    const diff = (surgeryRate - bench.surgeryRate) * 100;
+    if (Math.abs(diff) >= 2) {
+      insights.push({
+        type: surgeryRate > bench.surgeryRate ? 'good' : 'warn',
+        title: surgeryRate > bench.surgeryRate ? 'Outperforming on surgery rate' : 'Underperforming on surgery rate',
+        detail: `${(surgeryRate * 100).toFixed(1)}% matched→surgery vs account ${(bench.surgeryRate * 100).toFixed(1)}% (${diff > 0 ? '+' : ''}${diff.toFixed(1)} pp).`,
+      });
+    }
+  }
+  if (velocityWow != null && Math.abs(velocityWow) >= 20) {
+    insights.push({
+      type: velocityWow > 0 ? 'good' : 'warn',
+      title: velocityWow > 0 ? 'Lead volume accelerating' : 'Lead volume slowing',
+      detail: `${last7} leads in last 7d vs ${prior7} prior week (${velocityWow > 0 ? '+' : ''}${velocityWow}%).`,
+    });
+  }
+  if (topSegments.city) {
+    insights.push({
+      type: 'info',
+      title: `Best-converting city: ${topSegments.city.label}`,
+      detail: `${topSegments.city.surgeryRate}% surgery rate across ${topSegments.city.count} leads (${topSegments.city.surgeries} closed).`,
+    });
+  }
+  if (topSegments.ad) {
+    insights.push({
+      type: 'info',
+      title: `Best-converting ad: ${topSegments.ad.label}`,
+      detail: `${topSegments.ad.surgeryRate}% surgery rate across ${topSegments.ad.count} attributed leads.`,
+    });
+  }
+  if (slaTotal >= 10 && quality.slaBreachPct > 0.2) {
+    insights.push({
+      type: 'critical',
+      title: 'SLA breaches on matched leads',
+      detail: `${Math.round(quality.slaBreachPct * 100)}% of matched leads breached response SLA — first-call speed is hurting conversion.`,
+    });
+  }
+  if (f.pending >= 10) {
+    insights.push({
+      type: 'info',
+      title: `${f.pending} unmatched leads`,
+      detail: 'Form submissions with no CRM phone match — run backfill-links after Refrens sync or re-import.',
+    });
+  }
+  if (k30.frequency != null && k30.frequency > 3) {
+    insights.push({
+      type: 'info',
+      title: 'Ad frequency elevated',
+      detail: `Avg user saw the ad ${k30.frequency.toFixed(1)}× in 30d — watch CTR and refresh creative if CPL rises.`,
+    });
+  }
+  if (wow?.cpl != null && Math.abs(wow.cpl) >= 15) {
+    insights.push({
+      type: wow.cpl < 0 ? 'good' : 'warn',
+      title: wow.cpl < 0 ? 'CPL improving week-over-week' : 'CPL rising week-over-week',
+      detail: `Platform CPL ${wow.cpl > 0 ? '+' : ''}${wow.cpl.toFixed(0)}% vs prior 7d (₹${Math.round(k7.cpl || 0)} now).`,
+    });
+  }
+
+  const adEfficiency = (b.byAd || []).map((ad) => {
+    const share = f.total > 0 ? ad.count / f.total : 0;
+    const estSpend = spend > 0 && share > 0 ? spend * share : null;
+    const estCpl = estSpend != null && ad.count > 0 ? Math.round(estSpend / ad.count) : null;
+    return {
+      ad_id: ad.ad_id,
+      ad_name: ad.ad_name,
+      leads: ad.count,
+      surgeries: ad.surgeries,
+      sharePct: Math.round(share * 1000) / 10,
+      estSpend: estSpend != null ? Math.round(estSpend) : null,
+      estCpl,
+      surgeryRate: ad.count > 0 ? Math.round((ad.surgeries / ad.count) * 1000) / 10 : 0,
+    };
+  }).sort((a, c) => c.leads - a.leads).slice(0, 8);
+
+  return {
+    benchmarkComparisons,
+    funnelSteps,
+    bottleneck,
+    velocity: {
+      last7,
+      prior7,
+      wowPct: velocityWow,
+      avgPerDay30,
+      peakDay: peakDay ? { date: peakDay.date, count: peakDay.count } : null,
+    },
+    quality,
+    topSegments,
+    adEfficiency,
+    insights: insights.slice(0, 12),
+    computedAt: new Date().toISOString(),
+  };
+}
+
 // ─── Campaign recommendations engine ──────────────────────────────────────────
 // Given the kpis30 + breakdowns + accountBenchmark for a single campaign,
 // produce a ranked list of actionable suggestions. Each suggestion has:
@@ -1559,6 +1822,68 @@ export function computeRecommendations({ kpis30, kpis7, wow, breakdowns, funnel,
     rec.push({ severity: 'critical', title: '⚠️ Spending without leads',
       detail: `${fmtRs(k30.spend)} spent in 30 days with 0 attributed Lead Form submissions. Either the form is broken, or this campaign drives traffic (not Lead Ads) — confirm in Ads Manager.`,
       metric: { spend: k30.spend, leads: 0 } });
+  }
+
+  // 11) SLA / DNP on matched leads
+  const sla = b.refrensSla || {};
+  const slaTotal = (sla.onTime || 0) + (sla.breached || 0) + (sla.dnp || 0);
+  if (slaTotal >= 10) {
+    const breachPct = (sla.breached || 0) / slaTotal;
+    const dnpPct = (sla.dnp || 0) / slaTotal;
+    if (breachPct > 0.25) {
+      rec.push({ severity: 'critical', title: '⏱ SLA breach rate is high',
+        detail: `${Math.round(breachPct * 100)}% of ${slaTotal} matched leads breached first-response SLA. Route new leads to faster assignees or tighten call-back SOP.`,
+        metric: { breachPct, slaTotal } });
+    } else if (dnpPct > 0.35) {
+      rec.push({ severity: 'warn', title: '📵 DNP rate is high on matched leads',
+        detail: `${Math.round(dnpPct * 100)}% DNP among matched leads — verify phone numbers at form capture and retry cadence before marking lost.`,
+        metric: { dnpPct, slaTotal } });
+    }
+  }
+
+  // 12) Lead capture velocity (from timeline)
+  const timeline = b.timeline || [];
+  const last7 = timeline.slice(-7).reduce((s, d) => s + d.count, 0);
+  const prior7 = timeline.slice(-14, -7).reduce((s, d) => s + d.count, 0);
+  if (prior7 >= 5 && last7 < prior7 * 0.6) {
+    rec.push({ severity: 'warn', title: '📉 Lead capture slowing',
+      detail: `Only ${last7} leads captured in the last 7 days vs ${prior7} the week before (${Math.round(((last7 - prior7) / prior7) * 100)}%). Check delivery status, budget, or creative fatigue.`,
+      metric: { last7, prior7 } });
+  } else if (prior7 >= 3 && last7 > prior7 * 1.5) {
+    rec.push({ severity: 'good', title: '📈 Lead capture accelerating',
+      detail: `${last7} leads in the last 7 days vs ${prior7} prior week — keep budget stable while CPL holds.`,
+      metric: { last7, prior7 } });
+  }
+
+  // 13) Sales contact bottleneck (matched → contacted)
+  if (f.matched >= 15 && b.byStage) {
+    const contacted = (b.byStage.contacted || 0) + (b.byStage.consulted || 0) + (b.byStage.booked || 0) + (b.byStage.done || 0);
+    const contactRate = contacted / f.matched;
+    if (contactRate < 0.4) {
+      rec.push({ severity: 'warn', title: '📞 Low contact rate on matched leads',
+        detail: `Only ${contacted}/${f.matched} matched leads (${Math.round(contactRate * 100)}%) reached Contacted — first-call speed or assignee capacity is the bottleneck.`,
+        metric: { contacted, matched: f.matched } });
+    }
+  }
+
+  // 14) Assignee load imbalance
+  const assignees = b.refrensAssignee || [];
+  if (assignees.length >= 2 && f.matched >= 20) {
+    const top = assignees[0];
+    const topShare = top.count / f.matched;
+    if (topShare > 0.55) {
+      rec.push({ severity: 'info', title: `👤 ${top.assignee} carries most leads`,
+        detail: `${Math.round(topShare * 100)}% of matched leads assigned to ${top.assignee} (${top.count}/${f.matched}). Rebalance routing to spread follow-up load.`,
+        metric: { assignee: top.assignee, share: topShare } });
+    }
+  }
+
+  // 15) Unmatched backlog — backfill opportunity
+  if (f.pending >= 15 && f.total >= 20) {
+    const unmatchPct = f.pending / f.total;
+    rec.push({ severity: 'warn', title: '🔗 Large unmatched backlog',
+      detail: `${f.pending} of ${f.total} leads (${Math.round(unmatchPct * 100)}%) have no CRM match. Click backfill-links after Refrens sync to recover attribution.`,
+      metric: { pending: f.pending, total: f.total } });
   }
 
   // Severity ranking

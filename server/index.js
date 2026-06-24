@@ -25,6 +25,8 @@ import { clearAllGoogleModelExhausted, googleExhaustedModels } from './gemini-mo
 import { INDIAN_CITIES, isIndianCity, titleCaseCity, isInventedAgentClaim } from './bot-guard.js';
 import { registerBotLabRoutes, isLabPhone } from './bot-lab.js';
 import { registerOperatorRoutes } from './operator-routes.js';
+import { registerOrganicWaRoutes } from './organic-wa-routes.js';
+import { registerRepDeviceRoutes } from './rep-devices-routes.js';
 import { issueDashboardSession, parseDashboardSession, requireDashboardAuth } from './dashboard-auth.js';
 import { hydrateQuota, ensureQuotaHydrated, isUnderQuota, quotaStatus, quotaStatusAll, quotaStatusForClient, quotaDashboard } from './agent-quota.js';
 import { setChannelMode } from './gemini-model-tracker.js';
@@ -1474,6 +1476,12 @@ function passiveExtract(message, session) {
     if (/motia|motiyabind|मोतियाबिंद|cataract/i.test(m)) d.is_cataract = true;
 }
 
+function capIntentScore(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return Math.min(100, Math.max(0, Math.round(n)));
+}
+
 function scoreSession(session) {
     const d = session.data;
     // Count the same fields that parameters_completed tracks
@@ -1488,7 +1496,7 @@ function scoreSession(session) {
     // WARM: 3+ params (name + city + eyePower = completed bot flow)
     // COLD: <3 params (still in early stages)
     const band = (params >= 4 && urgency === 'high') ? 'HOT' : (params >= 3) ? 'WARM' : 'COLD';
-    return { intent_score: params, intent_band: band, interest_cost: !!d.interest_cost, interest_recovery: !!d.interest_recovery, concern_pain: !!d.concern_pain, concern_safety: !!d.concern_safety, urgency_level: urgency || (params >= 4 ? 'medium' : 'low'), is_returning: !!d.is_returning };
+    return { intent_score: capIntentScore(params), intent_band: band, interest_cost: !!d.interest_cost, interest_recovery: !!d.interest_recovery, concern_pain: !!d.concern_pain, concern_safety: !!d.concern_safety, urgency_level: urgency || (params >= 4 ? 'medium' : 'low'), is_returning: !!d.is_returning };
 }
 
 // ─── DIRECT DB INGEST — no HTTP ───────────────────────────────────────────────
@@ -2348,6 +2356,19 @@ registerOperatorRoutes(app, {
     upload,
 });
 
+registerOrganicWaRoutes(app, {
+    CRM_API_KEY,
+    supabaseAdmin,
+    saveWhatsAppMessage,
+});
+
+if (process.env.REP_FLEET_ENABLED === 'true') {
+    registerRepDeviceRoutes(app, { CRM_API_KEY, supabaseAdmin });
+    console.log('[BOOT] Rep fleet routes ON (REP_FLEET_ENABLED)');
+} else {
+    console.log('[BOOT] Rep fleet routes OFF — set REP_FLEET_ENABLED=true after create_rep_devices.sql');
+}
+
 // ─── WhatsApp Inbox: send a message from the dashboard ───────────────────────
 app.post('/api/whatsapp/send', async (req, res) => {
     if (!(await requireCrmKey(req, res, { tab: 'inbox' }))) return;
@@ -3081,7 +3102,7 @@ app.post('/api/upload-refrens-csv', express.text({ type: 'text/csv', limit: '10m
                 labels: gf(row,'Labels'), duplicate: gf(row,'Duplicate'),
                 call_outcome: gf(row,'Call Outcome'), consultation_status: gf(row,'Consultation Status'),
                 lead_state: gf(row,'Lead State'), intent_band: gf(row,'Intent Band'),
-                intent_score: gf(row,'Intent Score'), objection_type: gf(row,'Objection Type'),
+                intent_score: capIntentScore(gf(row,'Intent Score')), objection_type: gf(row,'Objection Type'),
                 eye_power: gf(row,"what_is_your_current_eye_power?","what\'s_your_eye_power?"),
                 insurance: gf(row,"do_you_have_medical_insurance_","do_you_have_medical_insurance?","do_you_have_health_insurance_","do_you_have_insurance?"),
                 timeline: gf(row,"when_would_you_prefer_to_undergo_the_lasik_treatment?","when_are_you_planning_for_lasik?","when_are_you_looking_to_get_lasik_consultation?"),
