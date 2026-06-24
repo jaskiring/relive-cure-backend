@@ -5,7 +5,7 @@ import { runOperatorAgent, operatorLastGeminiError } from './operator-agent.js';
 import { staticOperatorReply, checkFounderRoute, buildOperatorContext } from './operator-tools.js';
 import { quotaStatusAll, quotaStatusForClient, quotaDashboard, ensureQuotaHydrated, tickRequest, flushQuota } from './agent-quota.js';
 import { warnIfOperatorInboxMissing, checkOperatorInboxTable, OPERATOR_MIGRATION_SQL } from './operator-schema.js';
-import { recordWorkerHeartbeat, isOperatorWorkerOnline, workerLastSeen, workerMeta } from './operator-worker-state.js';
+import { recordWorkerHeartbeat, isOperatorWorkerOnline, workerLastSeen, workerMeta, operatorDevUsername } from './operator-dev-state.js';
 
 function hasExportPermission(tabs, role) {
     return role === 'admin' || (tabs || []).includes('export_leads');
@@ -87,6 +87,16 @@ export function registerOperatorRoutes(app, deps) {
             .order('created_at', { ascending: false })
             .limit(80);
         if (pendingOnly) q = q.in('status', ['queued', 'pending']);
+        const devOnly = req.query.dev === '1';
+        if (devOnly) {
+            q = supabaseAdmin
+                .from('operator_inbox')
+                .select('id, username, kind, message, transcript, edited_prompt, status, dev_status, dev_result, approved_by, created_at, updated_at')
+                .eq('status', 'approved')
+                .in('dev_status', ['queued', 'running', 'ready'])
+                .order('updated_at', { ascending: false })
+                .limit(20);
+        }
         const { data, error } = await q;
         if (error) {
             const missing = /operator_inbox|does not exist|schema cache/i.test(error.message || '');
@@ -243,25 +253,84 @@ export function registerOperatorRoutes(app, deps) {
         if (fetchErr) return res.status(500).json({ success: false, error: fetchErr.message });
         if (!row) return res.status(404).json({ success: false, error: 'not found' });
         const prompt = edited || row.transcript || row.message;
+        const approver = req.dashboardUser?.username || null;
         const { data, error } = await supabaseAdmin
             .from('operator_inbox')
             .update({
                 edited_prompt: prompt,
                 status: 'approved',
                 dev_status: 'queued',
+                approved_by: approver,
                 updated_at: new Date().toISOString(),
             })
             .eq('id', id)
             .select()
             .maybeSingle();
         if (error) return res.status(500).json({ success: false, error: error.message });
+
+        const devUser = operatorDevUsername();
+        const youAreDevUser = approver === devUser;
+        let founderOnline = false;
+        try {
+            const since = new Date(Date.now() - 120_000).toISOString();
+            const { data: pres } = await supabaseAdmin
+                .from('operator_dev_presence')
+                .select('last_seen')
+                .eq('username', devUser)
+                .eq('source', 'crm')
+                .gte('last_seen', since)
+                .maybeSingle();
+            founderOnline = !!pres;
+        } catch { /* table may not exist yet */ }
+
+        const workerOn = isOperatorWorkerOnline();
+        let message;
+        if (youAreDevUser && founderOnline && workerOn) {
+            message = 'Approved — Cursor bridge will open the task on your Mac shortly.';
+        } else if (youAreDevUser && founderOnline) {
+            message = 'Approved. Run on your Mac: cd relive-cure-backend && npm run operator-cursor';
+        } else if (youAreDevUser) {
+            message = 'Approved. Log into CRM on your Mac, then run: npm run operator-cursor';
+        } else {
+            message = `Approved for ${devUser}. They need CRM open on their Mac + npm run operator-cursor.`;
+        }
+
         res.json({
             success: true,
             item: data,
-            message: isOperatorWorkerOnline()
-                ? 'Approved — M4 worker will pick this up shortly.'
-                : 'Approved and queued. Start the worker on your Mac: npm run operator-worker (see docs/OPERATOR_DEV.md).',
+            dev_user: devUser,
+            dev_engine: 'cursor',
+            founder_online: founderOnline,
+            worker_online: workerOn,
+            message,
         });
+    });
+
+    app.post('/api/operator/inbox/:id/dev-done', async (req, res) => {
+        if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'invalid id' });
+        const note = String(req.body?.note || '').trim();
+        const { data, error } = await supabaseAdmin
+            .from('operator_inbox')
+            .update({
+                dev_status: 'done',
+                dev_result: {
+                    engine: 'cursor',
+                    completed_by: req.dashboardUser?.username || null,
+                    completed_at: new Date().toISOString(),
+                    note: note || null,
+                    summary: note || 'Marked done in CRM after implementing in Cursor.',
+                },
+                updated_at: new Date().toISOString(),
+            })
+            .eq('id', id)
+            .in('dev_status', ['ready', 'running', 'queued'])
+            .select()
+            .maybeSingle();
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        if (!data) return res.status(404).json({ success: false, error: 'not found or already done' });
+        res.json({ success: true, item: data });
     });
 
     app.post('/api/operator/inbox/:id/reject', async (req, res) => {
@@ -284,6 +353,43 @@ export function registerOperatorRoutes(app, deps) {
         res.json({ success: true, item: data });
     });
 
+    app.post('/api/operator/dev/presence', async (req, res) => {
+        if (!(await requireCrmKey(req, res))) return;
+        const user = req.dashboardUser;
+        const devUser = operatorDevUsername();
+        if (user.username !== devUser && user.role !== 'admin') {
+            return res.json({ success: true, recorded: false, reason: 'not_dev_user' });
+        }
+        const at = new Date().toISOString();
+        const meta = {
+            role: user.role,
+            page: req.body?.page || null,
+        };
+        const { error } = await supabaseAdmin
+            .from('operator_dev_presence')
+            .upsert({
+                username: devUser,
+                source: 'crm',
+                last_seen: at,
+                meta,
+            }, { onConflict: 'username,source' });
+        if (error) {
+            const missing = /operator_dev_presence|does not exist/i.test(error.message || '');
+            return res.status(missing ? 503 : 500).json({
+                success: false,
+                error: error.message,
+                migration: missing ? 'server/migrations/alter_operator_dev_presence.sql' : null,
+            });
+        }
+        res.json({
+            success: true,
+            recorded: true,
+            dev_user: devUser,
+            at,
+            worker_online: isOperatorWorkerOnline(),
+        });
+    });
+
     app.post('/api/operator/worker/heartbeat', async (req, res) => {
         const secret = process.env.OPERATOR_WORKER_SECRET || '';
         if (!secret || req.headers['x-worker-secret'] !== secret) {
@@ -297,10 +403,29 @@ export function registerOperatorRoutes(app, deps) {
         if (!(await requireCrmKey(req, res))) return;
         await ensureQuotaHydrated();
         const inboxReady = await inboxTableOk(supabaseAdmin);
+        const devUser = operatorDevUsername();
+        let founderOnline = false;
+        let founderLastSeen = null;
+        try {
+            const since = new Date(Date.now() - 120_000).toISOString();
+            const { data: pres } = await supabaseAdmin
+                .from('operator_dev_presence')
+                .select('last_seen, meta')
+                .eq('username', devUser)
+                .eq('source', 'crm')
+                .gte('last_seen', since)
+                .maybeSingle();
+            founderOnline = !!pres;
+            founderLastSeen = pres?.last_seen || null;
+        } catch { /* ignore */ }
         res.json({
             success: true,
             enabled: true,
             inbox_ready: inboxReady,
+            dev_engine: 'cursor',
+            dev_user: devUser,
+            founder_online: founderOnline,
+            founder_last_seen: founderLastSeen,
             worker_online: isOperatorWorkerOnline(),
             worker_last_seen: workerLastSeen() ? new Date(workerLastSeen()).toISOString() : null,
             worker_meta: workerMeta(),
