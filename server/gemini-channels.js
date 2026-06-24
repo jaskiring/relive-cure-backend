@@ -30,16 +30,18 @@ export const QUOTA_BUFFER_PER_MODEL = 100;
  * @property {string} [notes]
  */
 
-/** Ordered LLM fallback — quality-first, then high-volume pools, then rule-based.
- *  Each is a SEPARATE free-tier quota pool, so cascading multiplies daily capacity.
- *  Unknown/renamed ids just 404 and skip to the next model (safe). New-model ids
- *  (3.x) are best-effort — verify exact strings at https://aistudio.google.com/rate-limit. */
+/** Ordered LLM fallback — FAST Gemini pools first (use every free fast token),
+ *  then the SLOW Gemma pools as deep fallback, then rule-based. Each id is a
+ *  SEPARATE free-tier quota pool, so cascading multiplies daily capacity.
+ *  Ids verified callable via Google ListModels (2026-06-24). A daily-exhausted or
+ *  rate-limited pool is skipped automatically; only after ALL are spent → rule-based. */
 export const LLM_FALLBACK_ORDER = [
-    'gemini-2.5-flash-lite',  // ~20 RPD — fast, good quality
-    'gemini-2.5-flash',       // ~20 RPD — quality
-    'gemini-3.5-flash',       // ~20 RPD — near-Pro quality (verify id)
-    'gemini-3.1-flash-lite',  // ~500 RPD — high-volume workhorse (verify id)
-    'gemma-4-26b-a4b-it',     // ~1500 RPD — volume pool (extract-only; reply rule-based)
+    'gemini-3.1-flash-lite',  // ~500 RPD — fast, low-latency PRIMARY workhorse
+    'gemini-2.5-flash-lite',  // ~20 RPD — fast
+    'gemini-2.5-flash',       // ~20 RPD — fast, higher quality
+    'gemini-3.5-flash',       // ~20 RPD — fast, near-Pro quality
+    'gemma-4-26b-a4b-it',     // ~1500 RPD — SLOW volume pool (extract-only; reply rule-based)
+    'gemma-4-31b-it',         // ~1500 RPD — SLOW deepest LLM pool before rule-based
 ];
 
 /** @type {GeminiModelSpec[]} Customer WhatsApp bot — llm-agent.js
@@ -60,7 +62,14 @@ export const WHATSAPP_MODELS = LLM_FALLBACK_ORDER.map((id) => {
             provider: 'gemma',
             generate_rpd: 1500,
             rpm: 15,
-            notes: 'Volume workhorse — 1.5k RPD free pool. Extraction-only; reply composed rule-based in index.js.',
+            notes: 'SLOW volume pool — 1.5k RPD free. Extraction-only; reply composed rule-based in index.js.',
+        },
+        'gemma-4-31b-it': {
+            label: 'Gemma 4 31B',
+            provider: 'gemma',
+            generate_rpd: 1500,
+            rpm: 15,
+            notes: 'SLOW deepest LLM pool — 1.5k RPD free. Last resort before rule-based.',
         },
         'gemini-2.5-flash': {
             label: 'Flash',
