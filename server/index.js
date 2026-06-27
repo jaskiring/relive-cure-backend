@@ -272,6 +272,67 @@ app.get('/api/auth/verify', async (req, res) => {
     res.json({ valid: true, username: session.username, role: session.role, allowed_tabs });
 });
 
+// ─── Authenticated DB proxy ───────────────────────────────────────────────────
+// The dashboard has NO direct Supabase access (anon key locked by RLS). Every
+// read/write goes through here: session-authenticated + per-table permission-gated,
+// executed with the server-side service-role client. DEFAULT-DENY — only the tables
+// listed here are reachable, and only by users whose allowed_tabs include one of
+// the table's tabs (admins always pass). A "limited" user hitting an HR table = 403.
+const DB_PROXY_ALLOW = {
+    leads_surgery:          { tabs: ['chatbot', 'pulse', 'analytics'], write: true },
+    unified_leads:          { tabs: ['analytics', 'hr', 'chatbot', 'pulse'], write: false },
+    whatsapp_conversations: { tabs: ['inbox', 'chatbot'], write: true },
+    employees:              { tabs: ['hr'], write: true },
+    hr_salary:              { tabs: ['hr'], write: true },
+    leaves:                 { tabs: ['hr'], write: true },
+    documents:              { tabs: ['hr'], write: true },
+    attendance:             { tabs: ['hr'], write: true },
+};
+const DB_PROXY_WRITE_OPS = new Set(['insert', 'update', 'upsert', 'delete']);
+
+app.post('/api/db', async (req, res) => {
+    if (!(await requireCrmKey(req, res))) return;   // valid signed session → sets req.dashboardUser
+    const { table, op = 'select', select = '*', filters = [], order, limit, values, onConflict, single } = req.body || {};
+    const rule = DB_PROXY_ALLOW[table];
+    if (!rule) return res.status(403).json({ error: 'Table not allowed' });
+
+    const tabs = await getAllowedTabsForUser(req.dashboardUser);
+    const permitted = req.dashboardUser.role === 'admin' || rule.tabs.some(t => tabs.includes(t));
+    if (!permitted) return res.status(403).json({ error: 'Access denied' });
+
+    if (op !== 'select' && !DB_PROXY_WRITE_OPS.has(op)) return res.status(400).json({ error: 'Bad op' });
+    if (DB_PROXY_WRITE_OPS.has(op) && !rule.write) return res.status(403).json({ error: 'Read-only' });
+
+    try {
+        let q = supabaseAdmin.from(table);
+        if (op === 'select')      q = q.select(select);
+        else if (op === 'insert') q = q.insert(values).select();
+        else if (op === 'upsert') q = q.upsert(values, onConflict ? { onConflict } : undefined).select();
+        else if (op === 'update') q = q.update(values);
+        else if (op === 'delete') q = q.delete();
+
+        for (const f of (Array.isArray(filters) ? filters : [])) {
+            if (f.type === 'eq')        q = q.eq(f.col, f.val);
+            else if (f.type === 'in')   q = q.in(f.col, f.val);
+            else if (f.type === 'gte')  q = q.gte(f.col, f.val);
+            else if (f.type === 'lte')  q = q.lte(f.col, f.val);
+            else if (f.type === 'gt')   q = q.gt(f.col, f.val);
+            else if (f.type === 'lt')   q = q.lt(f.col, f.val);
+            else if (f.type === 'match' && f.val && typeof f.val === 'object') q = q.match(f.val);
+        }
+        if (order && order.col) q = q.order(order.col, { ascending: order.ascending !== false });
+        if (limit) q = q.limit(limit);
+        if (single === 'single')          q = q.single();
+        else if (single === 'maybeSingle') q = q.maybeSingle();
+
+        const { data, error } = await q;
+        if (error) return res.status(400).json({ data: null, error: { message: error.message } });
+        return res.json({ data, error: null });
+    } catch (e) {
+        return res.status(500).json({ data: null, error: { message: e.message } });
+    }
+});
+
 // ─── Refrens cookies ──────────────────────────────────────────────────────────
 app.get('/api/export-refrens-cookies', async (req, res) => {
     if (req.headers['x-crm-key'] !== CRM_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
