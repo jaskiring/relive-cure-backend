@@ -3,8 +3,20 @@ import crypto from 'crypto';
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Dedicated session-signing secret. Prefer DASHBOARD_SESSION_SECRET (so a leak of
+// the machine CRM_API_KEY can't forge admin sessions). Fall back to CRM_API_KEY to
+// avoid breaking existing prod. NEVER the literal 'fallback' — if neither env is
+// set, mint a random per-boot secret (unforgeable; only cost is sessions reset on
+// restart) and shout about it, instead of shipping a guessable signing key.
+let _bootSecret = null;
 function signingSecret() {
-    return process.env.CRM_API_KEY || 'fallback';
+    const s = process.env.DASHBOARD_SESSION_SECRET || process.env.CRM_API_KEY;
+    if (s) return s;
+    if (!_bootSecret) {
+        _bootSecret = crypto.randomBytes(32).toString('hex');
+        console.error('[AUTH] CRITICAL: no DASHBOARD_SESSION_SECRET / CRM_API_KEY set — using a random per-boot secret. Set DASHBOARD_SESSION_SECRET in env.');
+    }
+    return _bootSecret;
 }
 
 export function issueDashboardSession(username, role) {

@@ -184,13 +184,42 @@ function getSessionToken() {
     return crypto.createHmac('sha256', CRM_API_KEY || 'fallback').update(`${u}:${p}`).digest('hex');
 }
 
+// ── Login brute-force throttle (in-memory, per IP+username) ──
+const _loginAttempts = new Map();
+const LOGIN_MAX_FAILS = 8;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_BLOCK_MS = 15 * 60 * 1000;
+function _loginKey(req, username) {
+    const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+    return `${ip}|${String(username || '').toLowerCase()}`;
+}
+function loginBlockedSecs(key) {
+    const e = _loginAttempts.get(key);
+    if (e?.blockedUntil && e.blockedUntil > Date.now()) return Math.ceil((e.blockedUntil - Date.now()) / 1000);
+    return 0;
+}
+function loginFail(key) {
+    const now = Date.now();
+    let e = _loginAttempts.get(key);
+    if (!e || now - e.first > LOGIN_WINDOW_MS) e = { count: 0, first: now, blockedUntil: 0 };
+    e.count++;
+    if (e.count >= LOGIN_MAX_FAILS) e.blockedUntil = now + LOGIN_BLOCK_MS;
+    _loginAttempts.set(key, e);
+}
+function loginOk(key) { _loginAttempts.delete(key); }
+
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
+    const rlKey = _loginKey(req, username);
+    const wait = loginBlockedSecs(rlKey);
+    if (wait) return res.status(429).json({ success: false, message: `Too many attempts. Try again in ${Math.ceil(wait / 60)} min.` });
+
     const validUsername = process.env.VITE_ADMIN_USERNAME || 'admin';
     const validPassword = process.env.VITE_ADMIN_PASSWORD;
     if (!validPassword) return res.status(503).json({ success: false, message: 'Auth not configured' });
     // Built-in admin check
     if (username === validUsername && password === validPassword) {
+        loginOk(rlKey);
         return res.json({
             success: true,
             token: issueDashboardSession(validUsername, 'admin'),
@@ -208,7 +237,16 @@ app.post('/api/auth/login', async (req, res) => {
             .select('username, password_hash, role, designation, allowed_tabs')
             .eq('username', username)
             .maybeSingle();
-        if (data && data.password_hash === crypto.createHash('sha256').update(`rc_user:${password}:relive_cure`).digest('hex')) {
+        const check = data ? verifyPassword(password, data.password_hash) : { ok: false };
+        if (data && check.ok) {
+            loginOk(rlKey);
+            // Transparently migrate legacy SHA-256 rows to salted scrypt.
+            if (check.needsUpgrade) {
+                supabaseAdmin.from('dashboard_users')
+                    .update({ password_hash: hashPassword(password) })
+                    .eq('username', data.username)
+                    .then(() => {}, () => {});
+            }
             const role = data.role || 'limited';
             const allowedTabs = normalizeTabs(data.allowed_tabs, role);
             return res.json({
@@ -222,6 +260,7 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
     } catch { /* table may not exist yet — fall through */ }
+    loginFail(rlKey);
     return res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
 
@@ -256,6 +295,7 @@ app.get('/api/diag/crm-form', async (req, res) => {
 // methods. Read-only, returns only public model ids (never the key). Open so the
 // real available ids can be verified without dashboard auth.
 app.get('/api/diag/gemini-models', async (req, res) => {
+    if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
     if (!process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY not set' });
     try {
         const r = await globalThis.fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${process.env.GEMINI_API_KEY}`);
@@ -627,6 +667,24 @@ app.post('/api/push/test', async (req, res) => {
       lead_id: null,
       intent: '',
       phone: '',
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Agent Console / orchestrator — fan out a custom notification to all push subscribers.
+app.post('/api/push/broadcast', async (req, res) => {
+  if (!(await requireCrmKey(req, res, { adminOnly: true }))) return;
+  const { title, body, url, kind } = req.body || {};
+  if (!title || !body) return res.status(400).json({ error: 'title and body required' });
+  try {
+    const result = await fanout(supabaseAdmin, {
+      title: String(title).slice(0, 80),
+      body: String(body).slice(0, 200),
+      url: url || '/',
+      kind: kind || 'broadcast',
     });
     res.json({ ok: true, ...result });
   } catch (e) {
@@ -2818,10 +2876,30 @@ app.get('/api/meta/leads/export', async (req, res) => {
 // VITE_ADMIN_USERNAME/VITE_ADMIN_PASSWORD env vars) always has role 'admin' and
 // cannot be managed through this API.
 
+// Salted scrypt password hashing. Format: "scrypt$<saltHex>$<hashHex>".
 function hashPassword(password) {
-    return crypto.createHash('sha256')
-        .update(`rc_user:${password}:relive_cure`)
-        .digest('hex');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    return `scrypt$${salt}$${hash}`;
+}
+// Legacy (unsalted SHA-256) — kept ONLY to verify + transparently upgrade old rows.
+function legacyHashPassword(password) {
+    return crypto.createHash('sha256').update(`rc_user:${password}:relive_cure`).digest('hex');
+}
+// Verify a password against a stored hash. Returns { ok, needsUpgrade }.
+function verifyPassword(password, stored) {
+    if (!stored) return { ok: false, needsUpgrade: false };
+    if (stored.startsWith('scrypt$')) {
+        const [, salt, hash] = stored.split('$');
+        if (!salt || !hash) return { ok: false, needsUpgrade: false };
+        const calc = crypto.scryptSync(password, salt, 64);
+        const want = Buffer.from(hash, 'hex');
+        const ok = calc.length === want.length && crypto.timingSafeEqual(calc, want);
+        return { ok, needsUpgrade: false };
+    }
+    // Legacy SHA-256 — upgrade to scrypt on next successful login.
+    const ok = stored === legacyHashPassword(password);
+    return { ok, needsUpgrade: ok };
 }
 
 // dashboard_users table created via migrations/create_dashboard_users.sql
@@ -2911,8 +2989,8 @@ app.patch('/api/admin/users/:username', async (req, res) => {
 
 app.get('/api/auth/tab-requests', async (req, res) => {
     if (!(await requireCrmKey(req, res))) return;
-    const username = String(req.query.username || '').trim();
-    if (!username) return res.status(400).json({ success: false, error: 'username required' });
+    // Authenticated identity only — never trust a client-supplied username.
+    const username = req.dashboardUser.username;
     try {
         const { data, error } = await supabaseAdmin
             .from('dashboard_tab_requests')
@@ -2928,7 +3006,8 @@ app.get('/api/auth/tab-requests', async (req, res) => {
 
 app.post('/api/auth/tab-requests', async (req, res) => {
     if (!(await requireCrmKey(req, res))) return;
-    const username = String(req.body?.username || '').trim();
+    // Bind the request to the authenticated user — can't file requests as someone else.
+    const username = req.dashboardUser.username;
     const tab = String(req.body?.tab || '').trim();
     if (!username || !tab) return res.status(400).json({ success: false, error: 'username and tab required' });
     if (!VALID_TABS.includes(tab)) return res.status(400).json({ success: false, error: 'invalid tab' });
